@@ -139,7 +139,9 @@ class HiDreamBaseDataLoader(
                       or not config.train_text_encoder_4_or_embedding(),
         )
 
-    def _output_modules(self, config: TrainConfig, model: HiDreamModel, model_setup: BaseHiDreamSetup):
+    def _output_modules(
+        self, config: TrainConfig, model: HiDreamModel, model_setup: BaseHiDreamSetup, is_validation: bool = False
+    ):
         output_names = [
             'image_path', 'latent_image',
             'prompt_1', 'prompt_2', 'prompt_3', 'prompt_4',
@@ -174,6 +176,7 @@ class HiDreamBaseDataLoader(
             vae=model.vae,
             autocast_context=[model.autocast_context],
             train_dtype=model.train_dtype,
+            is_validation=is_validation,
         )
 
     def _debug_modules(self, config: TrainConfig, model: HiDreamModel):
