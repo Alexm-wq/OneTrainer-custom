@@ -312,7 +312,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             before_cache_image_fun = prepare_vae
 
         if config.rlhf_enabled:
-            output_names = output_names + ['latent_image_rejected']
+            output_names = output_names + ['latent_image_rejected', 'dpo_is_paired', 'dpo_pair_key', 'dpo_cache_mode', 'image_path_rejected']
 
         resolved_output_names = [self.__as_output_mapping(name) for name in output_names]
 
@@ -376,6 +376,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     ):
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
+        if config.rlhf_enabled:
+            image_cache_dir = os.path.join(config.cache_dir, "image-rlhf-mixed-working")
+            text_cache_dir = os.path.join(config.cache_dir, "text-rlhf-mixed-working")
 
         if before_cache_image_fun is None:
             def prepare_vae():
@@ -388,8 +391,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         def before_cache_text_fun():
             model_setup.prepare_text_caching(model, config)
 
+
         if config.rlhf_enabled:
             image_split_names = image_split_names + ['latent_image_rejected']
+            for _dpo_name in ['dpo_is_paired', 'dpo_pair_key', 'dpo_cache_mode', 'image_path_rejected']:
+                if _dpo_name not in image_aggregate_names:
+                    image_aggregate_names = image_aggregate_names + [_dpo_name]
+                if _dpo_name not in sort_names:
+                    sort_names = sort_names + [_dpo_name]
 
         # The DPO patterns change which rows a concept produces, so they are part
         # of the cache group key.

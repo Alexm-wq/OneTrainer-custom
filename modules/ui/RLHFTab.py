@@ -43,7 +43,7 @@ class RLHFTab:
         self.scroll_frame.grid_columnconfigure(3, weight=0)
         self.scroll_frame.grid_columnconfigure(4, weight=1)
 
-        training_type = "DPO (Existing Adapter)" if self.train_config.lora_model_name else "DPO (New Adapter)"
+        training_type = "DPO (New Adapter)"
 
         mode_options = [
             ("DPO", RLHFMode.DPO),

@@ -38,3 +38,23 @@ pixi.toml
 train.bat
 debug_report.log
 config_diff.txt
+
+# local notebook junk
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# model weights / artifacts
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.onnx
+*.gguf
+
+# local notes / generated metadata
+model_metakeys.txt
+
+# backup patch files
+*.bak*
+*.backup*

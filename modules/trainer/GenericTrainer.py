@@ -187,7 +187,7 @@ class GenericTrainer(BaseTrainer):
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text'] or filename.startswith('image-rlhf-') or filename.startswith('text-rlhf-')):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
@@ -380,8 +380,13 @@ class GenericTrainer(BaseTrainer):
                     if self.__needs_gc(train_progress):
                         torch_gc()
 
+                    dpo_indices = self.__rlhf_dpo_indices(validation_batch)
+                    if not dpo_indices:
+                        continue
+                    validation_batch = self.__subbatch(validation_batch, dpo_indices)
                     with torch.no_grad():
                         self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
+                        self.__log_dpo_chosen_crash(batch, self.model_setup.get_last_dpo_metrics(), train_progress)
                     dpo_metrics = self.model_setup.get_last_dpo_metrics()
                     dpo_val_accuracy.append(dpo_metrics["accuracy"])
                     dpo_val_chosen_reward.append(dpo_metrics["chosen_reward"])
@@ -549,6 +554,23 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.__save_backup_config(backup_path)
+
+            # AVG_LOSS_TENSORBOARD_PATCH: save average-loss state with this backup.
+            _avg_loss_state_path = os.path.join(backup_path, "onetrainer_config", "avg_loss_state.json")
+            with open(_avg_loss_state_path, "w") as _avg_loss_state_file:
+                json.dump(
+                    {
+                        "epoch": train_progress.epoch,
+                        "epoch_step": getattr(train_progress, "epoch_step", None),
+                        "global_step": train_progress.global_step,
+                        "avg_loss_total": getattr(self, "_avg_loss_total", 0.0),
+                        "avg_loss_steps": getattr(self, "_avg_loss_steps", 0),
+                        "epoch_loss_total": getattr(self, "_avg_loss_epoch_total", 0.0),
+                        "epoch_loss_steps": getattr(self, "_avg_loss_epoch_steps", 0),
+                    },
+                    _avg_loss_state_file,
+                    indent=4,
+                )
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -704,6 +726,483 @@ class GenericTrainer(BaseTrainer):
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
 
+
+    def __batch_len(self, batch: dict) -> int:
+        for value in batch.values():
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+            if isinstance(value, (list, tuple)):
+                return len(value)
+        return int(self.config.batch_size)
+
+    @staticmethod
+    def __as_bool(value) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            value = value.detach().cpu().flatten()[0].item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "dpo", "paired"}
+        return bool(value)
+
+    def __rlhf_dpo_indices(self, batch: dict) -> list[int]:
+        batch_len = self.__batch_len(batch)
+
+        if "dpo_is_paired" not in batch:
+            if self.config.rlhf_enabled and "latent_image_rejected" in batch:
+                return list(range(batch_len))
+            return []
+
+        flags = batch["dpo_is_paired"]
+        if isinstance(flags, torch.Tensor):
+            values = flags.detach().cpu().flatten().tolist()
+        elif isinstance(flags, (list, tuple)):
+            values = list(flags)
+        else:
+            values = [flags] * batch_len
+
+        return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
+
+    def __normal_indices(self, batch: dict) -> list[int]:
+        dpo = set(self.__rlhf_dpo_indices(batch))
+        return [i for i in range(self.__batch_len(batch)) if i not in dpo]
+
+    def __subbatch(self, batch: dict, indices: list[int]) -> dict:
+        batch_len = self.__batch_len(batch)
+        out = {}
+        tensor_indices = None
+
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_len:
+                if tensor_indices is None:
+                    tensor_indices = torch.tensor(indices, device=value.device, dtype=torch.long)
+                out[key] = value.index_select(0, tensor_indices)
+            elif isinstance(value, list) and len(value) == batch_len:
+                out[key] = [value[i] for i in indices]
+            elif isinstance(value, tuple) and len(value) == batch_len:
+                out[key] = tuple(value[i] for i in indices)
+            else:
+                out[key] = value
+
+        return out
+
+    def __concept_type_at(self, batch: dict, index: int) -> ConceptType:
+        raw = batch["concept_type"][index]
+        if isinstance(raw, torch.Tensor):
+            raw = raw.detach().cpu().item()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, ConceptType):
+            return raw
+        return ConceptType(raw)
+
+    def __calculate_standard_training_loss(
+        self,
+        batch: dict,
+        train_progress: TrainProgress,
+    ) -> Tensor:
+        batch_len = self.__batch_len(batch)
+
+        prior_pred_indices = [
+            i for i in range(batch_len)
+            if self.__concept_type_at(batch, i) == ConceptType.PRIOR_PREDICTION
+        ]
+
+        if len(prior_pred_indices) > 0 or (
+            self.config.masked_training
+            and self.config.masked_prior_preservation_weight > 0
+            and self.config.training_method == TrainingMethod.LORA
+        ):
+            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                prior_model_output_data = self.model_setup.predict(
+                    self.model,
+                    batch,
+                    self.config,
+                    train_progress,
+                )
+
+            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+            prior_model_prediction = prior_model_output_data["predicted"].to(
+                dtype=model_output_data["target"].dtype
+            )
+            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+            model_output_data["prior_target"] = prior_model_prediction
+        else:
+            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+        return self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+
+
+    # DPO_CHOSEN_CRASH_HELPER_PATCH
+    def __log_dpo_chosen_crash(self, batch, dpo_metrics, train_progress):
+        """
+        Chosen-only DPO crash logger.
+
+        Logs only when chosen_reward suddenly goes hard negative or drops hard
+        from its own EMA. Rejected reward is logged only as context.
+        """
+        try:
+            import csv as _csv
+            import math as _math
+            from pathlib import Path as _Path
+
+            if not dpo_metrics:
+                return
+
+            chosen = float(dpo_metrics.get("chosen_reward", 0.0))
+            rejected = float(dpo_metrics.get("rejected_reward", 0.0))
+            margin = float(dpo_metrics.get("reward_margin", chosen - rejected))
+            dpo_loss = float(dpo_metrics.get("dpo_loss", dpo_metrics.get("loss", 0.0)))
+            accuracy = float(dpo_metrics.get("accuracy", 0.0))
+
+            bad_numeric = (
+                _math.isnan(chosen) or _math.isinf(chosen)
+                or _math.isnan(dpo_loss) or _math.isinf(dpo_loss)
+            )
+
+            if not hasattr(self, "_dpo_chosen_crash_steps"):
+                self._dpo_chosen_crash_steps = 0
+                self._dpo_chosen_reward_ema = None
+                self._dpo_chosen_reward_var = 1e-12
+
+            decay = 0.99
+            warmup = 10
+
+            # Edit these if it is too noisy or too quiet.
+            abs_threshold = -0.020
+            drop_threshold = 0.015
+            z_threshold = -6.0
+
+            if self._dpo_chosen_reward_ema is None:
+                self._dpo_chosen_reward_ema = chosen
+                self._dpo_chosen_reward_var = 1e-12
+                chosen_z = 0.0
+            else:
+                std = max(self._dpo_chosen_reward_var, 1e-12) ** 0.5
+                chosen_z = (chosen - self._dpo_chosen_reward_ema) / std
+
+            chosen_drop = self._dpo_chosen_reward_ema - chosen
+
+            absolute_crash = chosen <= abs_threshold
+            ema_crash = (
+                self._dpo_chosen_crash_steps >= warmup
+                and chosen_drop >= drop_threshold
+            )
+            z_crash = (
+                self._dpo_chosen_crash_steps >= warmup
+                and chosen_z <= z_threshold
+            )
+
+            is_crash = bad_numeric or absolute_crash or ema_crash or z_crash
+
+            def batch_value(key):
+                v = ""
+                try:
+                    if isinstance(batch, dict):
+                        v = batch.get(key, "")
+                    else:
+                        v = getattr(batch, key, "")
+                except Exception:
+                    v = ""
+
+                if isinstance(v, (list, tuple)):
+                    return " | ".join(str(x) for x in v[:32])
+
+                return str(v)
+
+            def batch_len(key):
+                try:
+                    v = batch.get(key, "") if isinstance(batch, dict) else getattr(batch, key, "")
+                    if isinstance(v, (list, tuple)):
+                        return len(v)
+                except Exception:
+                    pass
+                return ""
+
+            if is_crash:
+                reasons = []
+                if bad_numeric:
+                    reasons.append("nan_or_inf")
+                if absolute_crash:
+                    reasons.append("chosen_absolute_negative")
+                if ema_crash:
+                    reasons.append("chosen_drop_from_ema")
+                if z_crash:
+                    reasons.append("chosen_negative_z")
+
+                # Prefer original source paths if the DPO source-path patch is installed.
+                # Fall back to raw image_path if not.
+                chosen_source = batch_value("dpo_chosen_source_path") or batch_value("image_path")
+                rejected_source_context = batch_value("dpo_rejected_source_path") or batch_value("image_path_rejected")
+
+                workspace_dir = getattr(self.config, "workspace_dir", None)
+                if workspace_dir is None:
+                    workspace_dir = getattr(self.config, "workspace", ".")
+
+                csv_path = _Path(workspace_dir) / "dpo_chosen_reward_crashes.csv"
+                csv_path.parent.mkdir(parents=True, exist_ok=True)
+                write_header = not csv_path.exists()
+
+                with csv_path.open("a", encoding="utf-8", newline="") as f:
+                    fieldnames = [
+                        "global_step",
+                        "epoch",
+                        "epoch_step",
+                        "reason",
+                        "chosen_reward",
+                        "chosen_reward_ema",
+                        "chosen_reward_drop",
+                        "chosen_reward_z",
+                        "rejected_reward_context",
+                        "reward_margin",
+                        "dpo_loss",
+                        "accuracy",
+                        "batch_image_count",
+                        "chosen_source_path",
+                        "chosen_image_path_raw",
+                        "rejected_source_path_context",
+                        "dpo_pair_key",
+                        "concept_name",
+                        "concept_path",
+                        "prompt",
+                    ]
+
+                    writer = _csv.DictWriter(f, fieldnames=fieldnames)
+                    if write_header:
+                        writer.writeheader()
+
+                    writer.writerow({
+                        "global_step": getattr(train_progress, "global_step", ""),
+                        "epoch": getattr(train_progress, "epoch", ""),
+                        "epoch_step": getattr(train_progress, "epoch_step", ""),
+                        "reason": "+".join(reasons),
+                        "chosen_reward": chosen,
+                        "chosen_reward_ema": self._dpo_chosen_reward_ema,
+                        "chosen_reward_drop": chosen_drop,
+                        "chosen_reward_z": chosen_z,
+                        "rejected_reward_context": rejected,
+                        "reward_margin": margin,
+                        "dpo_loss": dpo_loss,
+                        "accuracy": accuracy,
+                        "batch_image_count": batch_len("image_path"),
+                        "chosen_source_path": chosen_source,
+                        "chosen_image_path_raw": batch_value("image_path"),
+                        "rejected_source_path_context": rejected_source_context,
+                        "dpo_pair_key": batch_value("dpo_pair_key"),
+                        "concept_name": batch_value("concept_name"),
+                        "concept_path": batch_value("concept_path"),
+                        "prompt": batch_value("text"),
+                    })
+
+                try:
+                    self.tensorboard.add_scalar(
+                        "dpo/chosen_crash_flag",
+                        1.0,
+                        getattr(train_progress, "global_step", 0),
+                    )
+                    self.tensorboard.add_scalar(
+                        "dpo/chosen_crash_reward",
+                        chosen,
+                        getattr(train_progress, "global_step", 0),
+                    )
+                except Exception:
+                    pass
+
+                print(
+                    f"[DPO CHOSEN CRASH] "
+                    f"step={getattr(train_progress, 'global_step', '')} "
+                    f"reason={'+'.join(reasons)} "
+                    f"chosen={chosen:.6g} "
+                    f"ema={self._dpo_chosen_reward_ema:.6g} "
+                    f"drop={chosen_drop:.6g} "
+                    f"z={chosen_z:.3f} "
+                    f"path={chosen_source} "
+                    f"csv={csv_path}"
+                )
+
+            # Update EMA after judging this batch against the previous trend.
+            if not bad_numeric:
+                diff = chosen - self._dpo_chosen_reward_ema
+                self._dpo_chosen_reward_ema = (
+                    self._dpo_chosen_reward_ema * decay
+                    + chosen * (1.0 - decay)
+                )
+                self._dpo_chosen_reward_var = (
+                    self._dpo_chosen_reward_var * decay
+                    + (diff * diff) * (1.0 - decay)
+                )
+                self._dpo_chosen_crash_steps += 1
+
+        except Exception as e:
+            print(f"[DPO CHOSEN CRASH LOGGER ERROR] {e}")
+
+
+
+    # DPO_PAIR_LOSS_STATE_LOG_PATCH
+    def __log_dpo_pair_loss_state(self, batch, dpo_metrics, train_progress):
+        """
+        Logs every DPO microbatch/pair with raw loss and saturation state.
+
+        saturated means:
+            dpo_loss <= 1e-3
+
+        With batch size 1 this gives the exact pair.
+        With batch size >1 it logs the paths in that DPO microbatch.
+        """
+        try:
+            import csv as _csv
+            from pathlib import Path as _Path
+
+            if not dpo_metrics:
+                return
+
+            dpo_loss = float(dpo_metrics.get("dpo_loss", dpo_metrics.get("loss", 0.0)))
+            chosen_reward = float(dpo_metrics.get("chosen_reward", 0.0))
+            rejected_reward = float(dpo_metrics.get("rejected_reward", 0.0))
+            reward_margin = float(dpo_metrics.get("reward_margin", chosen_reward - rejected_reward))
+            accuracy = float(dpo_metrics.get("accuracy", 0.0))
+
+            saturation_threshold = 1e-3
+            is_saturated = dpo_loss <= saturation_threshold
+
+            def batch_value(key):
+                try:
+                    v = batch.get(key, "") if isinstance(batch, dict) else getattr(batch, key, "")
+                except Exception:
+                    v = ""
+
+                if isinstance(v, (list, tuple)):
+                    return " | ".join(str(x) for x in v[:64])
+
+                return str(v)
+
+            def batch_len(key):
+                try:
+                    v = batch.get(key, "") if isinstance(batch, dict) else getattr(batch, key, "")
+                    if isinstance(v, (list, tuple)):
+                        return len(v)
+                except Exception:
+                    pass
+                return ""
+
+            chosen_source = batch_value("dpo_chosen_source_path") or batch_value("image_path")
+            rejected_source = batch_value("dpo_rejected_source_path") or batch_value("image_path_rejected")
+
+            workspace_dir = getattr(self.config, "workspace_dir", None)
+            if workspace_dir is None:
+                workspace_dir = getattr(self.config, "workspace", ".")
+
+            csv_path = _Path(workspace_dir) / "dpo_pair_loss_states.csv"
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+            write_header = not csv_path.exists()
+
+            with csv_path.open("a", encoding="utf-8", newline="") as f:
+                fieldnames = [
+                    "global_step",
+                    "epoch",
+                    "epoch_step",
+                    "dpo_loss",
+                    "saturation_threshold",
+                    "is_saturated",
+                    "chosen_reward",
+                    "rejected_reward",
+                    "reward_margin",
+                    "accuracy",
+                    "batch_image_count",
+                    "chosen_source_path",
+                    "rejected_source_path",
+                    "chosen_image_path_raw",
+                    "rejected_image_path_raw",
+                    "dpo_pair_key",
+                    "concept_name",
+                    "concept_path",
+                    "prompt",
+                ]
+
+                writer = _csv.DictWriter(f, fieldnames=fieldnames)
+                if write_header:
+                    writer.writeheader()
+
+                writer.writerow({
+                    "global_step": getattr(train_progress, "global_step", ""),
+                    "epoch": getattr(train_progress, "epoch", ""),
+                    "epoch_step": getattr(train_progress, "epoch_step", ""),
+                    "dpo_loss": dpo_loss,
+                    "saturation_threshold": saturation_threshold,
+                    "is_saturated": is_saturated,
+                    "chosen_reward": chosen_reward,
+                    "rejected_reward": rejected_reward,
+                    "reward_margin": reward_margin,
+                    "accuracy": accuracy,
+                    "batch_image_count": batch_len("image_path"),
+                    "chosen_source_path": chosen_source,
+                    "rejected_source_path": rejected_source,
+                    "chosen_image_path_raw": batch_value("image_path"),
+                    "rejected_image_path_raw": batch_value("image_path_rejected"),
+                    "dpo_pair_key": batch_value("dpo_pair_key"),
+                    "concept_name": batch_value("concept_name"),
+                    "concept_path": batch_value("concept_path"),
+                    "prompt": batch_value("text"),
+                })
+
+            try:
+                self.tensorboard.add_scalar(
+                    "dpo/pair_is_saturated",
+                    1.0 if is_saturated else 0.0,
+                    getattr(train_progress, "global_step", 0),
+                )
+                self.tensorboard.add_scalar(
+                    "dpo/pair_loss_logged",
+                    dpo_loss,
+                    getattr(train_progress, "global_step", 0),
+                )
+            except Exception:
+                pass
+
+        except Exception as e:
+            print(f"[DPO PAIR LOSS LOGGER ERROR] {e}")
+
+
+    def __calculate_mixed_rlhf_training_loss(
+        self,
+        batch: dict,
+        train_progress: TrainProgress,
+    ) -> tuple[Tensor, dict[str, float] | None]:
+        if not self.config.rlhf_enabled:
+            return self.__calculate_standard_training_loss(batch, train_progress), None
+
+        dpo_indices = self.__rlhf_dpo_indices(batch)
+        if not dpo_indices:
+            return self.__calculate_standard_training_loss(batch, train_progress), None
+
+        normal_indices = self.__normal_indices(batch)
+
+        if not normal_indices:
+            dpo_loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
+            self.__log_dpo_chosen_crash(batch, self.model_setup.get_last_dpo_metrics(), train_progress)
+            return dpo_loss, self.model_setup.get_last_dpo_metrics()
+
+        total_items = len(dpo_indices) + len(normal_indices)
+        loss_parts: list[Tensor] = []
+        dpo_metrics: dict[str, float] | None = None
+
+        if normal_indices:
+            normal_batch = self.__subbatch(batch, normal_indices)
+            normal_loss = self.__calculate_standard_training_loss(normal_batch, train_progress)
+            loss_parts.append(normal_loss * (len(normal_indices) / total_items))
+
+        if dpo_indices:
+            dpo_batch = self.__subbatch(batch, dpo_indices)
+            dpo_loss = self.model_setup.calculate_dpo_loss(self.model, dpo_batch, self.config, train_progress)
+            self.__log_dpo_chosen_crash(dpo_batch, self.model_setup.get_last_dpo_metrics(), train_progress)
+            loss_parts.append(dpo_loss * (len(dpo_indices) / total_items))
+            dpo_metrics = self.model_setup.get_last_dpo_metrics()
+
+        return sum(loss_parts), dpo_metrics
+
     def train(self):
         train_device = torch.device(self.config.train_device)
 
@@ -729,6 +1228,16 @@ class GenericTrainer(BaseTrainer):
         accumulated_dpo_metrics: dict[str, float] | None = None
         ema_loss = None
         ema_loss_steps = 0
+
+        # AVG_LOSS_TENSORBOARD_PATCH: average loss counters.
+        avg_loss_total = 0.0
+        avg_loss_steps = 0
+        epoch_loss_total = 0.0
+        epoch_loss_steps = 0
+        self._avg_loss_total = avg_loss_total
+        self._avg_loss_steps = avg_loss_steps
+        self._avg_loss_epoch_total = epoch_loss_total
+        self._avg_loss_epoch_steps = epoch_loss_steps
         ema_reward_margin = None
         ema_reward_margin_steps = 0
         ema_chosen_reward = None
@@ -779,6 +1288,36 @@ class GenericTrainer(BaseTrainer):
                 )
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
+
+            # AVG_LOSS_TENSORBOARD_PATCH: reset current epoch average loss.
+            epoch_loss_total = 0.0
+            epoch_loss_steps = 0
+            self._avg_loss_epoch_total = epoch_loss_total
+            self._avg_loss_epoch_steps = epoch_loss_steps
+
+            if getattr(self.config, "continue_last_backup", False):
+                try:
+                    _avg_loss_backup_path = self.config.get_last_backup_path()
+                    if _avg_loss_backup_path:
+                        _avg_loss_state_path = os.path.join(_avg_loss_backup_path, "onetrainer_config", "avg_loss_state.json")
+                        if os.path.isfile(_avg_loss_state_path):
+                            with open(_avg_loss_state_path, "r") as _avg_loss_state_file:
+                                _avg_loss_state = json.load(_avg_loss_state_file)
+                            if (
+                                _avg_loss_state.get("epoch") == train_progress.epoch
+                                and _avg_loss_state.get("epoch_step") == getattr(train_progress, "epoch_step", None)
+                                and _avg_loss_state.get("global_step") == train_progress.global_step
+                            ):
+                                avg_loss_total = float(_avg_loss_state.get("avg_loss_total", avg_loss_total))
+                                avg_loss_steps = int(_avg_loss_state.get("avg_loss_steps", avg_loss_steps))
+                                epoch_loss_total = float(_avg_loss_state.get("epoch_loss_total", epoch_loss_total))
+                                epoch_loss_steps = int(_avg_loss_state.get("epoch_loss_steps", epoch_loss_steps))
+                                self._avg_loss_total = avg_loss_total
+                                self._avg_loss_steps = avg_loss_steps
+                                self._avg_loss_epoch_total = epoch_loss_total
+                                self._avg_loss_epoch_steps = epoch_loss_steps
+                except Exception:
+                    pass
 
             if multi.is_master():
                 batches = step_tqdm = tqdm(self.data_loader.get_data_loader(), desc="step", total=current_epoch_length,
@@ -834,47 +1373,18 @@ class GenericTrainer(BaseTrainer):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    if self.config.rlhf_enabled:
-                        loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
-                        # Accumulate per-micro-batch DPO metrics across the grad-accum window.
-                        # Without this, only the final micro-batch's metric reaches TensorBoard —
-                        # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
-                        micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
+                    loss, micro_dpo_metrics = self.__calculate_mixed_rlhf_training_loss(
+                        batch,
+                        train_progress,
+                    )
+                    if micro_dpo_metrics:
+                        self.__log_dpo_pair_loss_state(batch, micro_dpo_metrics, train_progress)
                         if accumulated_dpo_metrics is None:
                             accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
                             accumulated_dpo_metrics["_count"] = 0
                         for _k, _v in micro_dpo_metrics.items():
                             accumulated_dpo_metrics[_k] += _v
                         accumulated_dpo_metrics["_count"] += 1
-                    else:
-                        # Standard training path
-                        prior_pred_indices = [
-                            i
-                            for i in range(self.config.batch_size)
-                            if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
-                        ]
-                        if len(prior_pred_indices) > 0 or (
-                            self.config.masked_training
-                            and self.config.masked_prior_preservation_weight > 0
-                            and self.config.training_method == TrainingMethod.LORA
-                        ):
-                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                                # do NOT create a subbatch using the indices, even though it would be more efficient:
-                                # different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                                prior_model_output_data = self.model_setup.predict(
-                                    self.model, batch, self.config, train_progress
-                                )
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                            prior_model_prediction = prior_model_output_data["predicted"].to(
-                                dtype=model_output_data["target"].dtype
-                            )
-                            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                            model_output_data["prior_target"] = prior_model_prediction
-                        else:
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
-
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
                         scaler.scale(loss).backward()
@@ -916,6 +1426,18 @@ class GenericTrainer(BaseTrainer):
                             )
 
                             accumulated_loss_cpu = accumulated_loss.item()
+
+                            # AVG_LOSS_TENSORBOARD_PATCH: whole-run and current-epoch average loss.
+                            avg_loss_total += accumulated_loss_cpu
+                            avg_loss_steps += 1
+                            epoch_loss_total += accumulated_loss_cpu
+                            epoch_loss_steps += 1
+                            self._avg_loss_total = avg_loss_total
+                            self._avg_loss_steps = avg_loss_steps
+                            self._avg_loss_epoch_total = epoch_loss_total
+                            self._avg_loss_epoch_steps = epoch_loss_steps
+                            if multi.is_master():
+                                self.tensorboard.add_scalar("avg_loss/train_step", avg_loss_total / avg_loss_steps, train_progress.global_step)
                             if math.isnan(accumulated_loss_cpu):
                                 raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
 
@@ -1037,6 +1559,10 @@ class GenericTrainer(BaseTrainer):
 
                 if self.commands.get_stop_command():
                     return
+
+            # AVG_LOSS_TENSORBOARD_PATCH: final average loss for this completed epoch.
+            if multi.is_master() and epoch_loss_steps > 0:
+                self.tensorboard.add_scalar("avg_loss/epoch", epoch_loss_total / epoch_loss_steps, train_progress.epoch)
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)

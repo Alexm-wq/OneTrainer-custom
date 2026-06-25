@@ -152,22 +152,47 @@ class BaseModelSetup(
 
     @classmethod
     def _create_dpo_batched_batch(cls, batch: dict) -> tuple[dict, int]:
-        # Returns a batch where every <key>/<key>_rejected pair is concatenated
-        # as [chosen; rejected] on dim 0, shared per-sample tensors are duplicated
-        # by self-concat, and non-batched values pass through. The chosen half is
-        # always the first B entries of the result.
+        # Returns a batch where every /_rejected pair is concatenated
+        # as [chosen; rejected] on dim 0.
+        #
+        # Mixed MGDS batches also contain Python lists such as image_path.
+        # Those must be concatenated as lists, not torch.cat()'d like tensors,
+        # because apparently Python objects do not magically become tensors
+        # just because the UI believes hard enough.
         chosen_b = batch["latent_image"].shape[0]
         batched: dict = {}
+
         for key, value in batch.items():
             if cls._is_dpo_rejected_key(key):
                 continue
+
             rejected_key = key + "_rejected"
+
             if rejected_key in batch:
-                batched[key] = torch.cat([value, batch[rejected_key]], dim=0)
+                rejected_value = batch[rejected_key]
+
+                if isinstance(value, torch.Tensor) and isinstance(rejected_value, torch.Tensor):
+                    batched[key] = torch.cat([value, rejected_value], dim=0)
+                elif isinstance(value, list) and isinstance(rejected_value, list):
+                    batched[key] = value + rejected_value
+                elif isinstance(value, tuple) and isinstance(rejected_value, tuple):
+                    batched[key] = value + rejected_value
+                else:
+                    # Non-model metadata. Keep chosen-side value.
+                    batched[key] = value
+
             elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == chosen_b:
                 batched[key] = torch.cat([value, value], dim=0)
+
+            elif isinstance(value, list) and len(value) == chosen_b:
+                batched[key] = value + value
+
+            elif isinstance(value, tuple) and len(value) == chosen_b:
+                batched[key] = value + value
+
             else:
                 batched[key] = value
+
         return batched, chosen_b
 
     @staticmethod
@@ -240,7 +265,7 @@ class BaseModelSetup(
         policy_target = policy_output["target"]
         policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b])
         policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:])
-        if config.rlhf_supervised_mix > 0:
+        if False and config.rlhf_supervised_mix > 0:  # OT-MIXED-RLHF-MGDS-v3 disabled supervised mix
             chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
             supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
             del chosen_output

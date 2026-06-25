@@ -915,8 +915,7 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
         return migrated_data
 
-    def effective_dpo_ref_mode(self) -> DPORefMode:
-        return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
+    def effective_dpo_ref_mode(self) -> DPORefMode: return DPORefMode.NEW_ADAPTER
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(

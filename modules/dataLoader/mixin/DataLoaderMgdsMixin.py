@@ -23,7 +23,9 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
             if concept.enabled:
                 validate_dpo_patterns(concept.dpo_chosen_pattern, concept.dpo_rejected_pattern)
 
-        dpo_concepts = [c for c in concepts if c.is_dpo()]
+        # OT-MIXED-RLHF: disabled old DPO-only concept filtering.
+        # Keep normal concepts; per-row routing happens in FilterDPOChosenPaths/DeriveDPORejectedPath.
+        dpo_concepts = list(concepts)
         skipped = [c.name or c.path for c in concepts if c.enabled and not c.is_dpo()]
 
         if not any(c.enabled for c in dpo_concepts):
@@ -31,8 +33,9 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
                 "RLHF DPO requires at least one enabled concept with chosen/rejected patterns "
                 "(set 'DPO Chosen Pattern' and 'DPO Rejected Pattern' in the concept window)."
             )
-        if skipped:
-            print(f"RLHF DPO: skipping {len(skipped)} concepts without DPO patterns: " + ", ".join(skipped))
+        # OT-MIXED-RLHF: old PR1403 DPO-only concept filtering removed.
+        # Keep normal concepts; FilterDPOChosenPaths + DeriveDPORejectedPath route rows per sample.
+        pass
 
         return dpo_concepts
 
@@ -51,7 +54,8 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         valid_types = {ConceptType.VALIDATION} if is_validation else {ConceptType.STANDARD, ConceptType.PRIOR_PREDICTION}
         concepts = [concept for concept in concepts if ConceptType(concept.type) in valid_types]
         if config.rlhf_enabled:
-            concepts = self.__filter_dpo_concepts(concepts)
+            # OT-MIXED-RLHF: disabled old replacement of concepts with DPO-only concepts.
+            concepts = list(concepts)
         concepts = [c.to_dict() for c in concepts]
 
         settings = {
