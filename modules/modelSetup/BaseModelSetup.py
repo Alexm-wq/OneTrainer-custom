@@ -274,27 +274,95 @@ class BaseModelSetup(
         chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
         rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
         margin = chosen_ratio - rejected_ratio
+        dpo_beta_scale = 1.0
+        chosen_reward_push_loss = None
+        chosen_reward_floor_loss = None
+        chosen_reward_aux_loss = None
+        chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
 
         if config.rlhf_dpo_objective == DPOObjective.IPO:
             # IPO regresses the raw margin toward the fixed target 1/(2*tau)
-            # instead of pushing it to infinity, which structurally resists
-            # reward hacking. tau plays beta's role; label smoothing and beta
-            # do not apply.
+            # instead of pushing it to infinity.
             dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
             loss = dpo_loss
         else:
             logits = beta * margin
             dpo_loss = -F.logsigmoid(logits).mean()
-            loss = dpo_loss
+            preference_loss = dpo_loss
 
             if config.rlhf_dpo_label_smoothing > 0:
-                s = config.rlhf_dpo_label_smoothing
-                loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
+                label_smoothing = config.rlhf_dpo_label_smoothing
+                preference_loss = (
+                    (1.0 - label_smoothing) * preference_loss
+                    + label_smoothing * (-F.logsigmoid(-logits).mean())
+                )
+
+            # Optional beta-gradient decouple:
+            # beta still controls saturation via logits = beta * margin,
+            # but this rescales the preference loss so low beta does not
+            # necessarily mean a tiny near-zero-margin update.
+            if getattr(config, "rlhf_dpo_beta_gradient_decouple", False):
+                beta_for_scale = float(beta.detach().item()) if isinstance(beta, torch.Tensor) else float(beta)
+                beta_ref = getattr(config, "rlhf_dpo_beta_gradient_reference", None)
+
+                if beta_ref is None or float(beta_ref) <= 0:
+                    beta_ref = float(config.rlhf_dpo_beta)
+
+                dpo_beta_scale = float(beta_ref) / max(beta_for_scale, 1e-12)
+
+                # Value-preserving gradient scaling:
+                # - forward/logged loss value stays equal to the unscaled preference loss
+                # - backward gradient is scaled by dpo_beta_scale
+                #
+                # This decouples beta's saturation behavior from gradient strength
+                # without making avg_loss/train_step explode whenever a DPO batch hits.
+                preference_loss = (
+                    preference_loss.detach()
+                    + dpo_beta_scale * (preference_loss - preference_loss.detach())
+                )
+
+            loss = preference_loss
+
+        # Optional chosen/winner reward anchor.
+        #
+        # This prevents the dumb case where margin improves only because
+        # rejected_reward drops harder while chosen_reward goes negative.
+        #
+        # It gives chosen_reward an incentive to rise up to a soft target,
+        # and adds a stronger asymmetric penalty when chosen_reward < floor.
+        if getattr(config, "rlhf_dpo_chosen_reward_anchor", False):
+            chosen_anchor_weight = float(getattr(config, "rlhf_dpo_chosen_reward_anchor_weight", 0.0))
+
+            if chosen_anchor_weight > 0:
+                chosen_reward_target = float(getattr(config, "rlhf_dpo_chosen_reward_target", 0.05))
+                chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
+                chosen_reward_floor_multiplier = float(getattr(config, "rlhf_dpo_chosen_reward_floor_multiplier", 4.0))
+                chosen_reward_sharpness = max(
+                    float(getattr(config, "rlhf_dpo_chosen_reward_sharpness", 20.0)),
+                    1e-6,
+                )
+
+                # Soft capped push: active below target, fades above target.
+                chosen_reward_push_loss = F.softplus(
+                    (chosen_reward_target - chosen_ratio) * chosen_reward_sharpness
+                ).mean() / chosen_reward_sharpness
+
+                # Stronger floor penalty: only active below floor, usually 0.
+                chosen_reward_floor_loss = F.relu(
+                    chosen_reward_floor_value - chosen_ratio
+                ).pow(2).mean()
+
+                chosen_reward_aux_loss = chosen_anchor_weight * (
+                    chosen_reward_push_loss
+                    + chosen_reward_floor_multiplier * chosen_reward_floor_loss
+                )
+
+                loss = loss + chosen_reward_aux_loss
 
         if supervised_loss is not None:
+
             loss = loss + config.rlhf_supervised_mix * supervised_loss
             del supervised_loss
-
         self._last_dpo_metrics = {
             "loss": loss.detach().item(),
             "dpo_loss": dpo_loss.detach().item(),
@@ -302,6 +370,32 @@ class BaseModelSetup(
             "rejected_reward": rejected_ratio.detach().mean().item(),
             "reward_margin": margin.detach().mean().item(),
             "accuracy": (chosen_ratio > rejected_ratio).float().mean().item(),
+            "beta_runtime": float(beta.detach().item()) if isinstance(beta, torch.Tensor) else float(beta),
+            "beta_margin": (
+                margin.detach().mean()
+                * (beta.detach() if isinstance(beta, torch.Tensor) else torch.tensor(float(beta), device=margin.device))
+            ).item(),
+            "dpo_beta_scale": float(dpo_beta_scale),
+            "chosen_reward_anchor_loss": (
+                chosen_reward_aux_loss.detach().item()
+                if chosen_reward_aux_loss is not None
+                else 0.0
+            ),
+            "chosen_reward_push_loss": (
+                chosen_reward_push_loss.detach().item()
+                if chosen_reward_push_loss is not None
+                else 0.0
+            ),
+            "chosen_reward_floor_loss": (
+                chosen_reward_floor_loss.detach().item()
+                if chosen_reward_floor_loss is not None
+                else 0.0
+            ),
+            "chosen_reward_below_floor": (
+                (chosen_ratio.detach() < chosen_reward_floor_value).float().mean().item()
+                if getattr(config, "rlhf_dpo_chosen_reward_anchor", False)
+                else 0.0
+            ),
         }
 
         if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:

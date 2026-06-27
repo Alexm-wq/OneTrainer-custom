@@ -5,6 +5,8 @@ from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
+from modules.dataLoader.dpo.EncodeDPORejectedOrDummyLatent import EncodeDPORejectedOrDummyLatent
+from modules.dataLoader.dpo.LoadDPORejectedImageOrDummy import LoadDPORejectedImageOrDummy
 from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
@@ -127,7 +129,16 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         modules = [load_image, load_video]
 
         if config.rlhf_enabled:
-            modules.append(LoadImage(path_in_name='image_path_rejected', image_out_name='image_rejected', range_min=0, range_max=1, supported_extensions=path_util.supported_image_extensions(), dtype=train_dtype.torch_dtype()))
+            modules.append(LoadDPORejectedImageOrDummy(
+                path_in_name='image_path_rejected',
+                image_in_name='image',
+                is_paired_in_name='dpo_is_paired',
+                image_out_name='image_rejected',
+                range_min=0,
+                range_max=1,
+                channels=3,
+                dtype=train_dtype.torch_dtype(),
+            ))
 
         if vae_frame_dim:
             modules.append(image_to_video)
@@ -479,16 +490,24 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         )
 
     def _dpo_rejected_preparation_modules(self, config: TrainConfig, model: BaseModel) -> list:
-        # Mirrors the standard chosen-image VAE encode for 'image_rejected'.
-        # Dataloaders whose encode deviates from this pattern override it.
+        # Mixed RLHF:
+        # - actual DPO rows still VAE-encode image_rejected
+        # - normal rows emit a dummy latent_image_rejected without requesting/loading/encoding image_rejected
         if not config.rlhf_enabled:
             return []
 
-        rescale_image = RescaleImageChannels(image_in_name='image_rejected', image_out_name='image_rejected', in_range_min=0, in_range_max=1, out_range_min=-1, out_range_max=1)
-        encode_image = EncodeVAE(in_name='image_rejected', out_name='latent_image_rejected_distribution', vae=model.vae, autocast_contexts=[model.autocast_context], dtype=model.train_dtype.torch_dtype())
-        image_sample = SampleVAEDistribution(in_name='latent_image_rejected_distribution', out_name='latent_image_rejected', mode='mean')
-
-        return [rescale_image, encode_image, image_sample]
+        return [
+            EncodeDPORejectedOrDummyLatent(
+                image_in_name='image_rejected',
+                latent_image_in_name='latent_image',
+                is_paired_in_name='dpo_is_paired',
+                latent_out_name='latent_image_rejected',
+                vae=model.vae,
+                autocast_contexts=[model.autocast_context],
+                dtype=model.train_dtype.torch_dtype(),
+                dummy_mode='zeros',
+            )
+        ]
 
     @abstractmethod
     def _preparation_modules(self, config: TrainConfig, model: BaseModel):

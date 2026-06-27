@@ -184,7 +184,7 @@ class RLHFTab:
             tooltip="Logs the reward margin bucketed by timestep quartile (dpo/margin_by_t/q1..q4) to TensorBoard. "
             "Useful to verify pairs are compared evenly across noise levels.",
         )
-        components.switch(self.scroll_frame, 8, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
+        components.switch(self.scroll_frame, 9, 4, self.ui_state, "rlhf_dpo_timestep_margin_logging")
 
         components.button(
             self.scroll_frame,
@@ -226,6 +226,83 @@ class RLHFTab:
             training_type,
             tooltip="DPO always writes an adapter file. New Adapter means the adapter starts from scratch. Existing Adapter means DPO refines a loaded adapter.",
         )
+
+        components.label(
+            self.scroll_frame,
+            9,
+            0,
+            "Beta Grad Decouple",
+            tooltip="Decouples beta's saturation behavior from its gradient scale. "
+                    "Useful with low beta: pairs stay active longer, while DPO can keep a stronger update. "
+                    "Only applies to DPO sigmoid.",
+        )
+        components.switch(self.scroll_frame, 9, 1, self.ui_state, "rlhf_dpo_beta_gradient_decouple")
+
+        components.label(
+            self.scroll_frame,
+            9,
+            3,
+            "Beta Grad Ref",
+            tooltip="Reference beta used for Beta Grad Decouple. Empty = use configured Beta. "
+                    "Example: Beta=25, Ref=150 gives low-beta saturation with roughly 150-beta initial gradient scale.",
+        )
+        components.entry(self.scroll_frame, 9, 4, self.ui_state, "rlhf_dpo_beta_gradient_reference")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            0,
+            "Chosen Anchor",
+            tooltip="Adds an auxiliary reward term on the chosen/winner image. "
+                    "It pushes chosen_reward upward until a soft target and penalizes it harder below the floor.",
+        )
+        components.switch(self.scroll_frame, 10, 1, self.ui_state, "rlhf_dpo_chosen_reward_anchor")
+
+        components.label(
+            self.scroll_frame,
+            10,
+            3,
+            "Anchor Weight",
+            tooltip="Strength of the chosen reward anchor. Start low: 0.05 to 0.20.",
+        )
+        components.entry(self.scroll_frame, 10, 4, self.ui_state, "rlhf_dpo_chosen_reward_anchor_weight")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            0,
+            "Anchor Target",
+            tooltip="Soft positive target for chosen_reward. The incentive fades above this value. "
+                    "Try 0.03 to 0.10 depending on reward scale.",
+        )
+        components.entry(self.scroll_frame, 11, 1, self.ui_state, "rlhf_dpo_chosen_reward_target")
+
+        components.label(
+            self.scroll_frame,
+            11,
+            3,
+            "Anchor Floor",
+            tooltip="Chosen reward floor. Usually 0.0. Below this, the extra floor penalty activates.",
+        )
+        components.entry(self.scroll_frame, 11, 4, self.ui_state, "rlhf_dpo_chosen_reward_floor")
+
+        components.label(
+            self.scroll_frame,
+            12,
+            0,
+            "Floor Mult",
+            tooltip="Multiplier for the below-floor penalty. Try 4 to 10.",
+        )
+        components.entry(self.scroll_frame, 12, 1, self.ui_state, "rlhf_dpo_chosen_reward_floor_multiplier")
+
+        components.label(
+            self.scroll_frame,
+            12,
+            3,
+            "Anchor Sharp",
+            tooltip="Sharpness of the soft cap around Anchor Target. Try 20 to 50.",
+        )
+        components.entry(self.scroll_frame, 12, 4, self.ui_state, "rlhf_dpo_chosen_reward_sharpness")
 
     def _check_pairs(self):
         try:
