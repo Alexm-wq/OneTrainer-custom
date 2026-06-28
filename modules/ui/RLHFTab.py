@@ -34,7 +34,10 @@ class RLHFTab:
     def refresh_ui(self):
         if self.scroll_frame:
             self.scroll_frame.destroy()
-        self.scroll_frame = ctk.CTkFrame(self.master, fg_color="transparent")
+
+        self.master.grid_rowconfigure(0, weight=1)
+        self.master.grid_columnconfigure(0, weight=1)
+        self.scroll_frame = ctk.CTkScrollableFrame(self.master, fg_color="transparent")
         self.scroll_frame.grid(row=0, column=0, sticky="nsew")
 
         self.scroll_frame.grid_columnconfigure(0, weight=0)
@@ -138,7 +141,6 @@ class RLHFTab:
             "Note that Beta and learning rate are coupled - if you double Beta, halve the learning rate.",
         )
         components.switch(self.scroll_frame, 6, 1, self.ui_state, "rlhf_dpo_adaptive_beta")
-
         components.label(
             self.scroll_frame,
             3,
@@ -303,6 +305,34 @@ class RLHFTab:
             tooltip="Sharpness of the soft cap around Anchor Target. Try 20 to 50.",
         )
         components.entry(self.scroll_frame, 12, 4, self.ui_state, "rlhf_dpo_chosen_reward_sharpness")
+
+        # negative concept controls
+        components.label(
+            self.scroll_frame,
+            13,
+            0,
+            "Negative Weight",
+            tooltip="Multiplier for negative concept anti-reconstruction loss. Start around 0.01-0.05 for subtle flaws, 0.05-0.10 for obvious failures.",
+        )
+        components.entry(self.scroll_frame, 13, 1, self.ui_state, "rlhf_negative_weight")
+
+        components.label(
+            self.scroll_frame,
+            14,
+            0,
+            "Negative Beta",
+            tooltip="Sharpness of the negative softplus margin. Higher is harder; start around 5.",
+        )
+        components.entry(self.scroll_frame, 14, 1, self.ui_state, "rlhf_negative_beta")
+
+        components.label(
+            self.scroll_frame,
+            15,
+            0,
+            "Negative Margin",
+            tooltip="Target relative degradation on negative samples. 0.05 means the policy should become about 5% worse than the reference at predicting negatives.",
+        )
+        components.entry(self.scroll_frame, 15, 1, self.ui_state, "rlhf_negative_margin")
 
     def _check_pairs(self):
         try:

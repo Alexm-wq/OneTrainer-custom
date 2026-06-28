@@ -583,6 +583,9 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_ipo_tau: float
     rlhf_dpo_adaptive_beta: bool
     rlhf_dpo_timestep_margin_logging: bool
+    rlhf_negative_weight: float
+    rlhf_negative_beta: float
+    rlhf_negative_margin: float
     rlhf_dpo_ref_mode: DPORefMode
     rlhf_supervised_mix: float
     rlhf_dpo_validation: bool
@@ -627,7 +630,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=15,
+            config_version=17,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -646,6 +649,8 @@ class TrainConfig(BaseConfig):
                 14: self.__migration_14,
                 15: self.__migration_15,
                 16: self.__migration_16,
+
+                17: self.__migration_17,
             }
         )
 
@@ -915,7 +920,21 @@ class TrainConfig(BaseConfig):
         migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
         return migrated_data
 
-    def effective_dpo_ref_mode(self) -> DPORefMode: return DPORefMode.NEW_ADAPTER
+    def __migration_17(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_negative_weight", 0.10)
+        migrated_data.setdefault("rlhf_negative_beta", 5.0)
+        migrated_data.setdefault("rlhf_negative_margin", 0.05)
+        return migrated_data
+
+    def effective_dpo_ref_mode(self) -> DPORefMode:
+        mode = self.rlhf_dpo_ref_mode
+        if isinstance(mode, DPORefMode):
+            return mode
+        try:
+            return DPORefMode(mode)
+        except Exception:
+            return DPORefMode.NEW_ADAPTER
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
@@ -1312,6 +1331,9 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
+        data.append(("rlhf_negative_weight", 0.10, float, False))
+        data.append(("rlhf_negative_beta", 5.0, float, False))
+        data.append(("rlhf_negative_margin", 0.05, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
         data.append(("rlhf_supervised_mix", 0.0, float, False))
         data.append(("rlhf_dpo_validation", False, bool, False))

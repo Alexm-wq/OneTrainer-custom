@@ -352,6 +352,25 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
+    def __dpo_tensorboard_metric_names(self) -> set[str]:
+        # Keep TensorBoard DPO logging compact. Detailed pair/crash diagnostics
+        # belong in CSV/debug files, not in TensorBoard scalar spam.
+        return {
+            "loss",
+            "dpo_loss",
+            "accuracy",
+            "chosen_reward",
+            "rejected_reward",
+            "reward_margin",
+            "beta",
+            "raw_beta",
+            "adaptive_beta",
+            "supervised_loss",
+            "chosen_reward_aux_loss",
+            "chosen_reward_push_loss",
+            "chosen_reward_floor_loss",
+        }
+
     def __validate(self, train_progress: TrainProgress):
         if self.__needs_validate(train_progress):
             self.validation_data_loader.get_data_set().start_next_epoch()
@@ -386,7 +405,6 @@ class GenericTrainer(BaseTrainer):
                     validation_batch = self.__subbatch(validation_batch, dpo_indices)
                     with torch.no_grad():
                         self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
-                        self.__log_dpo_chosen_crash(batch, self.model_setup.get_last_dpo_metrics(), train_progress)
                     dpo_metrics = self.model_setup.get_last_dpo_metrics()
                     dpo_val_accuracy.append(dpo_metrics["accuracy"])
                     dpo_val_chosen_reward.append(dpo_metrics["chosen_reward"])
@@ -744,7 +762,7 @@ class GenericTrainer(BaseTrainer):
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="ignore")
         if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "y", "dpo", "paired"}
+            return value.strip().lower() in {"1", "true", "yes", "y", "dpo", "paired", "negative"}
         return bool(value)
 
     def __rlhf_dpo_indices(self, batch: dict) -> list[int]:
@@ -765,9 +783,27 @@ class GenericTrainer(BaseTrainer):
 
         return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
 
+    def __negative_indices(self, batch: dict) -> list[int]:
+        batch_len = self.__batch_len(batch)
+
+        if "negative_concept" not in batch:
+            return []
+
+        flags = batch["negative_concept"]
+
+        if isinstance(flags, torch.Tensor):
+            values = flags.detach().cpu().flatten().tolist()
+        elif isinstance(flags, (list, tuple)):
+            values = list(flags)
+        else:
+            values = [flags] * batch_len
+
+        return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
+
     def __normal_indices(self, batch: dict) -> list[int]:
         dpo = set(self.__rlhf_dpo_indices(batch))
-        return [i for i in range(self.__batch_len(batch)) if i not in dpo]
+        negative = set(self.__negative_indices(batch))
+        return [i for i in range(self.__batch_len(batch)) if i not in dpo and i not in negative]
 
     def __subbatch(self, batch: dict, indices: list[int]) -> dict:
         batch_len = self.__batch_len(batch)
@@ -788,6 +824,84 @@ class GenericTrainer(BaseTrainer):
 
         return out
 
+    def __rlhf_loss_kind_indices(self, batch: dict, loss_kind: str) -> list[int]:
+        batch_len = self.__batch_len(batch)
+
+        dpo_indices = set(self.__rlhf_dpo_indices(batch))
+
+        try:
+            negative_indices = set(self.__negative_indices(batch))
+        except AttributeError:
+            negative_indices = set()
+
+        # Priority:
+        #   DPO beats all other flags.
+        #   Negative only applies to non-DPO rows.
+        #   Normal is everything else.
+        negative_indices = negative_indices - dpo_indices
+
+        if loss_kind == "dpo":
+            return sorted(dpo_indices)
+
+        if loss_kind == "negative":
+            return sorted(negative_indices)
+
+        if loss_kind == "normal":
+            blocked = dpo_indices | negative_indices
+            return [i for i in range(batch_len) if i not in blocked]
+
+        raise ValueError(f"unknown RLHF loss kind: {loss_kind}")
+
+    def __init_rlhf_ga_queues(self):
+        if not hasattr(self, "_rlhf_ga_queues"):
+            self._rlhf_ga_queues = {
+                "normal": [],
+                "negative": [],
+                "dpo": [],
+            }
+        if not hasattr(self, "_rlhf_ga_loss_kind"):
+            self._rlhf_ga_loss_kind = None
+
+    def __enqueue_rlhf_loss_kind_batches(self, batch: dict):
+        self.__init_rlhf_ga_queues()
+
+        for kind in ("normal", "negative", "dpo"):
+            indices = self.__rlhf_loss_kind_indices(batch, kind)
+            if indices:
+                self._rlhf_ga_queues[kind].append(self.__subbatch(batch, indices))
+
+    def __ready_rlhf_loss_kinds(self) -> list[str]:
+        self.__init_rlhf_ga_queues()
+        needed = max(1, int(self.config.gradient_accumulation_steps))
+        return [
+            kind
+            for kind in ("normal", "negative", "dpo")
+            if len(self._rlhf_ga_queues[kind]) >= needed
+        ]
+
+    def __dequeue_homogeneous_rlhf_accumulation_batch(self) -> tuple[dict | None, str | None]:
+        self.__init_rlhf_ga_queues()
+
+        current_kind = self._rlhf_ga_loss_kind
+
+        # At the start of a GA window, pick one ready queue at random.
+        if current_kind is None:
+            ready_kinds = self.__ready_rlhf_loss_kinds()
+            if not ready_kinds:
+                return None, None
+
+            choice_index = int(torch.randint(0, len(ready_kinds), (1,)).item())
+            current_kind = ready_kinds[choice_index]
+            self._rlhf_ga_loss_kind = current_kind
+
+        queue = self._rlhf_ga_queues[current_kind]
+
+        # Should only happen if something external reset the queues.
+        if not queue:
+            return None, current_kind
+
+        return queue.pop(0), current_kind
+
     def __concept_type_at(self, batch: dict, index: int) -> ConceptType:
         raw = batch["concept_type"][index]
         if isinstance(raw, torch.Tensor):
@@ -799,6 +913,83 @@ class GenericTrainer(BaseTrainer):
         return ConceptType(raw)
 
     def __calculate_standard_training_loss(
+            self,
+            batch: dict,
+            train_progress: TrainProgress,
+    ) -> Tensor:
+        negative_indices = self.__negative_indices(batch)
+
+        if negative_indices and not self.config.rlhf_enabled:
+            raise RuntimeError(
+                "A concept is marked as Negative Concept, but RLHF is disabled. "
+                "Refusing to train bad generated negatives as normal positives."
+            )
+
+        if not self.config.rlhf_enabled:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        negative_set = set(negative_indices)
+        dpo_indices = [i for i in self.__rlhf_dpo_indices(batch) if i not in negative_set]
+        normal_indices = self.__normal_indices(batch)
+
+        if not dpo_indices and not negative_indices:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        loss_sum = None
+        count_sum = 0
+
+        def add_loss(loss: Tensor, count: int):
+            nonlocal loss_sum, count_sum
+            if count <= 0:
+                return
+            weighted = loss * count
+            loss_sum = weighted if loss_sum is None else loss_sum + weighted
+            count_sum += count
+
+        if normal_indices:
+            normal_batch = self.__subbatch(batch, normal_indices)
+            normal_loss = self.__calculate_standard_only_training_loss(normal_batch, train_progress)
+            add_loss(normal_loss, len(normal_indices))
+
+        if dpo_indices:
+            dpo_batch = self.__subbatch(batch, dpo_indices)
+            dpo_loss = self.model_setup.calculate_dpo_loss(
+                self.model,
+                dpo_batch,
+                self.config,
+                train_progress,
+            )
+            add_loss(dpo_loss, len(dpo_indices))
+
+            dpo_metrics = self.model_setup.get_last_dpo_metrics()
+            if dpo_metrics:
+                if hasattr(self, "tensorboard"):
+                    for name, value in dpo_metrics.items():
+                        if isinstance(value, (int, float)) and name in self.__dpo_tensorboard_metric_names():
+                            self.tensorboard.add_scalar(f"dpo/{name}", float(value), train_progress.global_step)
+
+        if negative_indices:
+            negative_batch = self.__subbatch(batch, negative_indices)
+            negative_loss = self.model_setup.calculate_negative_loss(
+                self.model,
+                negative_batch,
+                self.config,
+                train_progress,
+            )
+            add_loss(negative_loss, len(negative_indices))
+
+            negative_metrics = self.model_setup.get_last_negative_metrics()
+            if negative_metrics and hasattr(self, "tensorboard"):
+                for name, value in negative_metrics.items():
+                    if isinstance(value, (int, float)):
+                        self.tensorboard.add_scalar(f"negative/{name}", float(value), train_progress.global_step)
+
+        if loss_sum is None:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        return loss_sum / max(count_sum, 1)
+
+    def __calculate_standard_only_training_loss(
         self,
         batch: dict,
         train_progress: TrainProgress,
@@ -1182,7 +1373,6 @@ class GenericTrainer(BaseTrainer):
 
         if not normal_indices:
             dpo_loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
-            self.__log_dpo_chosen_crash(batch, self.model_setup.get_last_dpo_metrics(), train_progress)
             return dpo_loss, self.model_setup.get_last_dpo_metrics()
 
         total_items = len(dpo_indices) + len(normal_indices)
@@ -1197,7 +1387,6 @@ class GenericTrainer(BaseTrainer):
         if dpo_indices:
             dpo_batch = self.__subbatch(batch, dpo_indices)
             dpo_loss = self.model_setup.calculate_dpo_loss(self.model, dpo_batch, self.config, train_progress)
-            self.__log_dpo_chosen_crash(dpo_batch, self.model_setup.get_last_dpo_metrics(), train_progress)
             loss_parts.append(dpo_loss * (len(dpo_indices) / total_items))
             dpo_metrics = self.model_setup.get_last_dpo_metrics()
 
@@ -1372,6 +1561,12 @@ class GenericTrainer(BaseTrainer):
                 ):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
+
+                    if self.config.rlhf_enabled:
+                        self.__enqueue_rlhf_loss_kind_batches(batch)
+                        batch, _rlhf_ga_loss_kind = self.__dequeue_homogeneous_rlhf_accumulation_batch()
+                        if batch is None:
+                            continue
 
                     loss, micro_dpo_metrics = self.__calculate_mixed_rlhf_training_loss(
                         batch,

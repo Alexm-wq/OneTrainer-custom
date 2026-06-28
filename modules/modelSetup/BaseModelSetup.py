@@ -36,6 +36,7 @@ class BaseModelSetup(
         self.frozen_parameters = {}
         self._dpo_ref_params = None
         self._last_dpo_metrics = None
+        self._last_negative_metrics = None
         self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
         self._dpo_runtime_beta = None
 
@@ -213,6 +214,9 @@ class BaseModelSetup(
     def get_last_dpo_metrics(self) -> dict[str, float]:
         return self._last_dpo_metrics or {}
 
+    def get_last_negative_metrics(self) -> dict[str, float]:
+        return self._last_negative_metrics or {}
+
     def set_dpo_runtime_beta(self, beta: float | None):
         # Adaptive-beta override from the trainer. The logged reward metrics
         # are computed before beta is applied, so adapting beta from them does
@@ -348,9 +352,11 @@ class BaseModelSetup(
                 ).mean() / chosen_reward_sharpness
 
                 # Stronger floor penalty: only active below floor, usually 0.
-                chosen_reward_floor_loss = F.relu(
-                    chosen_reward_floor_value - chosen_ratio
-                ).pow(2).mean()
+                chosen_reward_floor_violation = F.relu(chosen_reward_floor_value - chosen_ratio)
+                chosen_reward_floor_loss = (
+                    chosen_reward_floor_violation.mean()
+                    + chosen_reward_sharpness * chosen_reward_floor_violation.pow(2).mean()
+                )
 
                 chosen_reward_aux_loss = chosen_anchor_weight * (
                     chosen_reward_push_loss
@@ -359,13 +365,17 @@ class BaseModelSetup(
 
                 loss = loss + chosen_reward_aux_loss
 
+        # Log DPO objective before optional supervised mix.
+        # This includes chosen-anchor loss, but not supervised_loss.
+        dpo_logged_loss = loss
+
         if supervised_loss is not None:
 
             loss = loss + config.rlhf_supervised_mix * supervised_loss
             del supervised_loss
         self._last_dpo_metrics = {
             "loss": loss.detach().item(),
-            "dpo_loss": dpo_loss.detach().item(),
+            "dpo_loss": dpo_logged_loss.detach().item(),
             "chosen_reward": chosen_ratio.detach().mean().item(),
             "rejected_reward": rejected_ratio.detach().mean().item(),
             "reward_margin": margin.detach().mean().item(),
@@ -411,6 +421,89 @@ class BaseModelSetup(
                 mask = quartile_index == quartile
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_sum"] = per_sample_margin[mask].sum().item()
                 self._last_dpo_metrics[f"margin_t_q{quartile + 1}_count"] = float(mask.sum().item())
+
+        return loss
+
+    def calculate_negative_loss(
+            self,
+            model: BaseModel,
+            batch: dict,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+    ) -> Tensor:
+        beta = max(float(getattr(config, "rlhf_negative_beta", 5.0)), 1e-6)
+        margin = float(getattr(config, "rlhf_negative_margin", 0.05))
+        weight = float(getattr(config, "rlhf_negative_weight", 0.10))
+
+        def mse_per_sample(pred: Tensor, target: Tensor) -> Tensor:
+            return (pred.float() - target.float()).pow(2).mean(
+                dim=list(range(1, pred.ndim)),
+                dtype=torch.float32,
+            )
+
+        # Ref and policy both use deterministic=True, so they share the same
+        # timestep/noise path. The only intended difference is reference adapter
+        # state vs current policy adapter state.
+        with torch.no_grad():
+            with self.reference_model(model, config):
+                ref_output = self.predict(
+                    model,
+                    batch,
+                    config,
+                    train_progress,
+                    deterministic=True,
+                )
+
+        policy_output = self.predict(
+            model,
+            batch,
+            config,
+            train_progress,
+            deterministic=True,
+        )
+
+        ref_pred = ref_output["predicted"]
+        ref_target = ref_output["target"]
+        policy_pred = policy_output["predicted"]
+        policy_target = policy_output["target"]
+
+        ref_mse = mse_per_sample(ref_pred, ref_target).detach()
+        policy_mse = mse_per_sample(policy_pred, policy_target)
+
+        # Positive bad_reward means policy improved at reconstructing the bad image.
+        # Negative bad_reward means policy became worse at reconstructing the bad image.
+        bad_reward = (ref_mse - policy_mse) / ref_mse.clamp_min(1e-6)
+
+        # Desired condition:
+        #     bad_reward <= -margin
+        # Active while:
+        #     bad_reward + margin > 0
+        loss_per_sample = F.softplus(beta * (bad_reward + margin)) / beta
+
+        loss_weight = batch.get("loss_weight", None)
+        if loss_weight is not None:
+            if not isinstance(loss_weight, torch.Tensor):
+                loss_weight = torch.tensor(loss_weight, device=loss_per_sample.device)
+            loss_weight = loss_weight.to(device=loss_per_sample.device, dtype=loss_per_sample.dtype).view(-1)
+            if loss_weight.shape[0] == loss_per_sample.shape[0]:
+                loss_per_sample = loss_per_sample * loss_weight
+
+        raw_loss = loss_per_sample.mean()
+        loss = raw_loss * weight
+
+        with torch.no_grad():
+            active_fraction = (bad_reward > -margin).float().mean()
+            self._last_negative_metrics = {
+                "loss": loss.detach().item(),
+                "raw_loss": raw_loss.detach().item(),
+                "policy_mse": policy_mse.detach().mean().item(),
+                "reference_mse": ref_mse.detach().mean().item(),
+                "bad_reward": bad_reward.detach().mean().item(),
+                "active_fraction": active_fraction.detach().item(),
+                "margin": margin,
+                "weight": weight,
+                "beta": beta,
+            }
 
         return loss
 

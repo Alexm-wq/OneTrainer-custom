@@ -330,6 +330,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         output_names = resolved_output_names + [
             ("concept.loss_weight", "loss_weight"),
             ("concept.type", "concept_type"),
+            ("concept.negative", "negative_concept"),
         ]
 
         if config.validation:
@@ -414,11 +415,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         # The DPO patterns change which rows a concept produces, so they are part
         # of the cache group key.
         image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
-                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'],
+                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept.negative'],
                                      group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept.negative'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
@@ -434,7 +435,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if len(sort_names) > 0:
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled')
+                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept.negative'], group_enabled_in_name='concept.enabled')
 
             modules.append(variation_sorting)
 
