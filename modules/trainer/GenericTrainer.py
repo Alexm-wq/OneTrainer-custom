@@ -859,48 +859,120 @@ class GenericTrainer(BaseTrainer):
                 "negative": [],
                 "dpo": [],
             }
+        if not hasattr(self, "_rlhf_ga_last_batch"):
+            self._rlhf_ga_last_batch = {
+                "normal": None,
+                "negative": None,
+                "dpo": None,
+            }
         if not hasattr(self, "_rlhf_ga_loss_kind"):
             self._rlhf_ga_loss_kind = None
+        if not hasattr(self, "_rlhf_ga_kind_micro_step"):
+            self._rlhf_ga_kind_micro_step = 0
 
     def __enqueue_rlhf_loss_kind_batches(self, batch: dict):
         self.__init_rlhf_ga_queues()
 
+        enqueue_counts = {"normal": 0, "negative": 0, "dpo": 0}
+
         for kind in ("normal", "negative", "dpo"):
             indices = self.__rlhf_loss_kind_indices(batch, kind)
+            enqueue_counts[kind] = len(indices)
             if indices:
                 self._rlhf_ga_queues[kind].append(self.__subbatch(batch, indices))
 
+        try:
+            step = self.model.train_progress.global_step
+            for kind in ("normal", "negative", "dpo"):
+                queued_samples = sum(self.__batch_len(_b) for _b in self._rlhf_ga_queues[kind])
+                self.tensorboard.add_scalar(f"rlhf_queue/enqueued_{kind}", float(enqueue_counts[kind]), step)
+                self.tensorboard.add_scalar(f"rlhf_queue/queued_{kind}", float(queued_samples), step)
+        except Exception:
+            pass
+
     def __ready_rlhf_loss_kinds(self) -> list[str]:
         self.__init_rlhf_ga_queues()
-        needed = max(1, int(self.config.gradient_accumulation_steps))
         return [
             kind
             for kind in ("normal", "negative", "dpo")
-            if len(self._rlhf_ga_queues[kind]) >= needed
+            if self._rlhf_ga_queues[kind]
         ]
 
     def __dequeue_homogeneous_rlhf_accumulation_batch(self) -> tuple[dict | None, str | None]:
         self.__init_rlhf_ga_queues()
 
+        needed = max(1, int(self.config.gradient_accumulation_steps))
+
+        # Hard reset at GA boundary. This is internal and does not depend on finding
+        # the optimizer.step() location.
+        if self._rlhf_ga_loss_kind is not None and self._rlhf_ga_kind_micro_step >= needed:
+            self._rlhf_ga_loss_kind = None
+            self._rlhf_ga_kind_micro_step = 0
+
         current_kind = self._rlhf_ga_loss_kind
 
-        # At the start of a GA window, pick one ready queue at random.
+        # Start of a GA window: choose by actual queued sample ratio.
         if current_kind is None:
-            ready_kinds = self.__ready_rlhf_loss_kinds()
-            if not ready_kinds:
+            weights = []
+            for kind in ("normal", "negative", "dpo"):
+                count = sum(self.__batch_len(_b) for _b in self._rlhf_ga_queues[kind])
+                if count > 0:
+                    weights.append((kind, count))
+
+            if not weights:
                 return None, None
 
-            choice_index = int(torch.randint(0, len(ready_kinds), (1,)).item())
-            current_kind = ready_kinds[choice_index]
+            total = sum(count for _, count in weights)
+            r = int(torch.randint(0, total, (1,)).item())
+
+            running = 0
+            current_kind = weights[-1][0]
+            for kind, count in weights:
+                running += count
+                if r < running:
+                    current_kind = kind
+                    break
+
             self._rlhf_ga_loss_kind = current_kind
+            self._rlhf_ga_kind_micro_step = 0
+
+            try:
+                step = self.model.train_progress.global_step
+                kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
+                self.tensorboard.add_scalar("rlhf_queue/selected_kind", kind_ids[current_kind], step)
+            except Exception:
+                pass
 
         queue = self._rlhf_ga_queues[current_kind]
 
-        # Should only happen if something external reset the queues.
-        if not queue:
-            return None, current_kind
+        if queue:
+            batch = queue.pop(0)
+            self._rlhf_ga_last_batch[current_kind] = batch
+        else:
+            # Rare type ran dry before the GA window finished. Duplicate same type.
+            batch = self._rlhf_ga_last_batch.get(current_kind)
+            if batch is None:
+                self._rlhf_ga_loss_kind = None
+                self._rlhf_ga_kind_micro_step = 0
+                return None, current_kind
+            try:
+                step = self.model.train_progress.global_step
+                kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
+                self.tensorboard.add_scalar("rlhf_queue/duplicated_kind", kind_ids[current_kind], step)
+            except Exception:
+                pass
 
-        return queue.pop(0), current_kind
+        self._rlhf_ga_kind_micro_step += 1
+
+        try:
+            step = self.model.train_progress.global_step
+            kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
+            self.tensorboard.add_scalar("rlhf_queue/trained_kind", kind_ids[current_kind], step)
+            self.tensorboard.add_scalar("rlhf_queue/ga_micro_step", float(self._rlhf_ga_kind_micro_step), step)
+        except Exception:
+            pass
+
+        return batch, current_kind
 
     def __concept_type_at(self, batch: dict, index: int) -> ConceptType:
         raw = batch["concept_type"][index]
