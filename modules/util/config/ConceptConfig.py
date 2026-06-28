@@ -136,6 +136,7 @@ class ConceptConfig(BaseConfig):
     text_variations: int
     repeats: float
     loss_weight: float
+    negative: bool
     concept_stats: dict
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
@@ -146,11 +147,12 @@ class ConceptConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=3,
+            config_version=4,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
                 2: self.__migration_2,
+            3: self.__migration_3,
             }
         )
 
@@ -211,6 +213,11 @@ class ConceptConfig(BaseConfig):
 
         return migrated_data
 
+    def __migration_3(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("negative", False)
+        return migrated_data
+
     def to_dict(self):
         as_dict = super().to_dict()
         as_dict['image'] = self.image.to_dict()
@@ -219,6 +226,9 @@ class ConceptConfig(BaseConfig):
 
     def is_dpo(self) -> bool:
         return bool(self.dpo_chosen_pattern) and bool(self.dpo_rejected_pattern)
+
+    def is_negative(self) -> bool:
+        return bool(self.negative)
 
     @staticmethod
     def default_values():
@@ -238,6 +248,7 @@ class ConceptConfig(BaseConfig):
         data.append(("balancing", 1.0, float, False))
         data.append(("balancing_strategy", BalancingStrategy.REPEATS, BalancingStrategy, False))
         data.append(("loss_weight", 1.0, float, False))
+        data.append(("negative", False, bool, False))
         data.append(("concept_stats", {}, dict, False))
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
