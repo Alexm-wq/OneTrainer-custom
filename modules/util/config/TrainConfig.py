@@ -111,7 +111,7 @@ class TrainOptimizerConfig(BaseConfig):
     use_schedulefree: True
     use_orthograd: False
     nnmf_factor: False
-    orthogonal_gradient: False
+    orthogonal_gradient: str
     use_atan2: False
     use_AdEMAMix: False
     beta3_ema: float
@@ -140,8 +140,32 @@ class TrainOptimizerConfig(BaseConfig):
     auto_kappa_p: False
     compile: False
 
+    spectral_normalization: bool
+    stochastic_sign: bool
+    centered_wd: float
+    centered_wd_mode: str
+    factored_2nd: bool
+    fisher_wd: bool
+    state_precision: str
+    orthogonal_sinkhorn: bool
+    sinkhorn_iterations: int
+    normed_momentum: bool
+    nesterov_coef: float
+    snr_cond: bool
+    geometric_wd: bool
+    scaled_wd: bool
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(data)
+
+        # PR1557 compatibility: old configs stored this as bool.
+        if isinstance(self.orthogonal_gradient, bool):
+            self.orthogonal_gradient = "flattened" if self.orthogonal_gradient else "disabled"
+
+        if getattr(self, "state_precision", None) not in ("auto", "factored", "fp32", "fp16", "bf16_sr", "int8_sr"):
+            self.state_precision = "auto"
+
+        if getattr(self, "centered_wd_mode", None) not in ("full", "float8", "int8", "int4"):
+            self.centered_wd_mode = "full"
 
     @staticmethod
     def default_values():
@@ -224,7 +248,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("use_schedulefree", True, bool, True))
         data.append(("use_orthograd", False, bool, False))
         data.append(("nnmf_factor", False, bool, False))
-        data.append(("orthogonal_gradient", False, bool, False))
+        data.append(("orthogonal_gradient", "disabled", str, False))
         data.append(("use_atan2", False, bool, False))
         data.append(("use_AdEMAMix", False, bool, False))
         data.append(("beta3_ema", None, float, True))

@@ -105,7 +105,7 @@ class BaseOptimizerParamsWindowView:
             'use_schedulefree': {'title': 'use_schedulefree', 'tooltip': 'Use Schedulefree method', 'type': 'bool'},
             'use_orthograd': {'title': 'use_orthograd', 'tooltip': 'Use orthograd method', 'type': 'bool'},
             'nnmf_factor': {'title': 'Factored Optimizer', 'tooltip': 'Enables a memory-efficient mode by applying fast low-rank factorization to the optimizers states. It combines factorization for magnitudes with 1-bit compression for signs, drastically reducing VRAM usage and allowing for larger models or batch sizes. This is an approximation which may slightly alter training dynamics.', 'type': 'bool'},
-            'orthogonal_gradient': {'title': 'OrthoGrad', 'tooltip': 'Reduces overfitting by removing the gradient component parallel to the weight, thus improving generalization.', 'type': 'bool'},
+            'orthogonal_gradient': {'title': 'OrthoGrad', 'tooltip': 'Reduces overfitting by removing the gradient component parallel to the weight, thus improving generalization.', 'type': 'str'},
             'use_atan2': {'title': 'Atan2 Scaling', 'tooltip': 'A robust replacement for eps, which also incorporates gradient clipping, bounding and stabilizing the optimizer updates.', 'type': 'bool'},
             'use_AdEMAMix': {'title': 'AdEMAMix EMA', 'tooltip': 'Adds a second, slow-moving EMA, which is combined with the primary momentum to stabilize updates, and accelerate the training.', 'type': 'bool'},
             'beta3_ema': {'title': 'Beta3 EMA', 'tooltip': 'Coefficient for slow-moving EMA of AdEMAMix.', 'type': 'float'},
@@ -140,7 +140,39 @@ class BaseOptimizerParamsWindowView:
         # Extract the keys for the selected optimizer
         for index, key in enumerate(OPTIMIZER_DEFAULT_PARAMETERS[selected_optimizer].keys()):
             if key not in KEY_DETAIL_MAP:
-                continue
+                # PR1557 fallback for optimizer params added by newer optimizer backends.
+                value = None
+                try:
+                    if "selected_optimizer" in locals():
+                        value = OPTIMIZER_DEFAULT_PARAMETERS[selected_optimizer].get(key, None)
+                except Exception:
+                    value = None
+                forced_types = {
+                    "spectral_normalization": "bool",
+                    "stochastic_sign": "bool",
+                    "centered_wd": "float",
+                    "centered_wd_mode": "str",
+                    "factored_2nd": "bool",
+                    "fisher_wd": "bool",
+                    "state_precision": "str",
+                    "orthogonal_sinkhorn": "bool",
+                    "sinkhorn_iterations": "int",
+                    "normed_momentum": "bool",
+                    "nesterov_coef": "float",
+                    "snr_cond": "bool",
+                    "geometric_wd": "bool",
+                    "scaled_wd": "bool",
+                    "orthogonal_gradient": "str",
+                }
+                inferred_type = forced_types.get(
+                    key,
+                    "bool" if isinstance(value, bool) else "int" if isinstance(value, int) and not isinstance(value, bool) else "float" if isinstance(value, float) else "str"
+                )
+                KEY_DETAIL_MAP[key] = {
+                    "title": key.replace("_", " ").title(),
+                    "tooltip": key,
+                    "type": inferred_type,
+                }
             arg_info = KEY_DETAIL_MAP[key]
 
             title = arg_info['title']
