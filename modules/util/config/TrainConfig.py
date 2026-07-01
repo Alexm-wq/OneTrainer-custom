@@ -140,6 +140,7 @@ class TrainOptimizerConfig(BaseConfig):
     stochastic_sign: False
     centered_wd: float
     centered_wd_mode: str
+    scaled_wd: bool
     factored_2nd: False
     fisher_wd: False
     state_precision: str
@@ -285,6 +286,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("nesterov_coef", None, float, True))
         data.append(("snr_cond", False, bool, False))
         data.append(("geometric_wd", False, bool, False))
+        data.append(("scaled_wd", False, bool, False))
         data.append(("MSign_interval", None, int, True))
 
         return TrainOptimizerConfig(data)

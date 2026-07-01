@@ -58,3 +58,29 @@ model_metakeys.txt
 # backup patch files
 *.bak*
 *.backup*
+
+# local/runtime junk
+conda_env/
+workspace-cache/
+workspace/run/
+workspace/debug/
+workspace/tensorboard/
+__pycache__/
+*.pyc
+
+# large model/cache/data files
+.hf_home/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.gguf
+*.onnx
+*.npz
+*.npy
+
+# datasets / generated outputs
+Dataset/
+FullData/
+DPO_finished/

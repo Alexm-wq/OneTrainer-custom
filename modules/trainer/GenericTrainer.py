@@ -709,12 +709,14 @@ class GenericTrainer(BaseTrainer):
                             scaler.unscale_parameter_(tensor, self.model.optimizer)
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                            self.__apply_scaled_weight_decay_to_param(tensor, param_group)
                             scaler.maybe_opt_step_parameter(tensor, param_group, i, self.model.optimizer)
                             tensor.grad = None
                     else:
                         def __optimizer_step(tensor: Tensor, param_group=param_group, i=i):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(tensor, self.config.clip_grad_norm)
+                            self.__apply_scaled_weight_decay_to_param(tensor, param_group)
                             self.model.optimizer.step_parameter(tensor, param_group, i)
                             tensor.grad = None
 
@@ -745,13 +747,55 @@ class GenericTrainer(BaseTrainer):
             self.model.optimizer.eval()
 
 
+
     def __batch_len(self, batch: dict) -> int:
-        for value in batch.values():
-            if isinstance(value, torch.Tensor) and value.ndim > 0:
-                return int(value.shape[0])
+        preferred_keys = (
+            "concept_name",
+            "concept_path",
+            "image_path",
+            "text",
+            "dpo_is_paired",
+            "negative_concept",
+            "latent_image",
+            "latent_image_rejected",
+            "image",
+        )
+
+        for key in preferred_keys:
+            if key not in batch:
+                continue
+
+            value = batch[key]
+
             if isinstance(value, (list, tuple)):
                 return len(value)
+
+            if isinstance(value, torch.Tensor):
+                if key in {"dpo_is_paired", "negative_concept"}:
+                    return int(value.numel())
+                if value.ndim > 0:
+                    return int(value.shape[0])
+
+        for value in batch.values():
+            if isinstance(value, (list, tuple)):
+                return len(value)
+
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+
         return int(self.config.batch_size)
+
+    def __debug_rlhf_queue(self, message: str):
+        if not multi.is_master():
+            return
+
+        if not hasattr(self, "_rlhf_queue_debug_print_count"):
+            self._rlhf_queue_debug_print_count = 0
+
+        # Keep it useful, not infinite spam.
+        if self._rlhf_queue_debug_print_count < 120:
+            print(f"[OT-RLHF-QUEUE-DEBUG] {message}")
+            self._rlhf_queue_debug_print_count += 1
 
     @staticmethod
     def __as_bool(value) -> bool:
@@ -759,21 +803,23 @@ class GenericTrainer(BaseTrainer):
             if value.numel() == 0:
                 return False
             value = value.detach().cpu().flatten()[0].item()
+
         if isinstance(value, bytes):
             value = value.decode("utf-8", errors="ignore")
+
         if isinstance(value, str):
             return value.strip().lower() in {"1", "true", "yes", "y", "dpo", "paired", "negative"}
+
         return bool(value)
 
-    def __rlhf_dpo_indices(self, batch: dict) -> list[int]:
+    def __flag_indices(self, batch: dict, key: str) -> list[int]:
         batch_len = self.__batch_len(batch)
 
-        if "dpo_is_paired" not in batch:
-            if self.config.rlhf_enabled and "latent_image_rejected" in batch:
-                return list(range(batch_len))
+        if key not in batch:
             return []
 
-        flags = batch["dpo_is_paired"]
+        flags = batch[key]
+
         if isinstance(flags, torch.Tensor):
             values = flags.detach().cpu().flatten().tolist()
         elif isinstance(flags, (list, tuple)):
@@ -781,121 +827,344 @@ class GenericTrainer(BaseTrainer):
         else:
             values = [flags] * batch_len
 
-        return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
+        if len(values) < batch_len:
+            values = values + [False] * (batch_len - len(values))
+
+        return [
+            i
+            for i, value in enumerate(values[:batch_len])
+            if self.__as_bool(value)
+        ]
+
+    def __rlhf_dpo_indices(self, batch: dict) -> list[int]:
+        # Explicit dataloader flag only.
+        # Do NOT infer DPO from latent_image_rejected because normal rows can carry dummy rejected latents.
+        return self.__flag_indices(batch, "dpo_is_paired")
 
     def __negative_indices(self, batch: dict) -> list[int]:
-        batch_len = self.__batch_len(batch)
-
-        if "negative_concept" not in batch:
-            return []
-
-        flags = batch["negative_concept"]
-
-        if isinstance(flags, torch.Tensor):
-            values = flags.detach().cpu().flatten().tolist()
-        elif isinstance(flags, (list, tuple)):
-            values = list(flags)
-        else:
-            values = [flags] * batch_len
-
-        return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
+        dpo_indices = set(self.__rlhf_dpo_indices(batch))
+        return [
+            i
+            for i in self.__flag_indices(batch, "negative_concept")
+            if i not in dpo_indices
+        ]
 
     def __normal_indices(self, batch: dict) -> list[int]:
-        dpo = set(self.__rlhf_dpo_indices(batch))
-        negative = set(self.__negative_indices(batch))
-        return [i for i in range(self.__batch_len(batch)) if i not in dpo and i not in negative]
+        dpo_indices = set(self.__rlhf_dpo_indices(batch))
+        negative_indices = set(self.__negative_indices(batch))
+        blocked = dpo_indices | negative_indices
+
+        return [
+            i
+            for i in range(self.__batch_len(batch))
+            if i not in blocked
+        ]
 
     def __subbatch(self, batch: dict, indices: list[int]) -> dict:
         batch_len = self.__batch_len(batch)
         out = {}
-        tensor_indices = None
+        tensor_indices_by_device = {}
 
         for key, value in batch.items():
             if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_len:
-                if tensor_indices is None:
-                    tensor_indices = torch.tensor(indices, device=value.device, dtype=torch.long)
-                out[key] = value.index_select(0, tensor_indices)
+                device = value.device
+
+                if device not in tensor_indices_by_device:
+                    tensor_indices_by_device[device] = torch.tensor(indices, device=device, dtype=torch.long)
+
+                out[key] = value.index_select(0, tensor_indices_by_device[device])
+
             elif isinstance(value, list) and len(value) == batch_len:
                 out[key] = [value[i] for i in indices]
+
             elif isinstance(value, tuple) and len(value) == batch_len:
                 out[key] = tuple(value[i] for i in indices)
+
             else:
                 out[key] = value
 
         return out
 
     def __rlhf_loss_kind_indices(self, batch: dict, loss_kind: str) -> list[int]:
-        batch_len = self.__batch_len(batch)
-
-        dpo_indices = set(self.__rlhf_dpo_indices(batch))
-
-        try:
-            negative_indices = set(self.__negative_indices(batch))
-        except AttributeError:
-            negative_indices = set()
-
         # Priority:
         #   DPO beats all other flags.
-        #   Negative only applies to non-DPO rows.
+        #   Negative applies only to non-DPO rows.
         #   Normal is everything else.
-        negative_indices = negative_indices - dpo_indices
-
         if loss_kind == "dpo":
-            return sorted(dpo_indices)
+            return self.__rlhf_dpo_indices(batch)
 
         if loss_kind == "negative":
-            return sorted(negative_indices)
+            return self.__negative_indices(batch)
 
         if loss_kind == "normal":
-            blocked = dpo_indices | negative_indices
-            return [i for i in range(batch_len) if i not in blocked]
+            return self.__normal_indices(batch)
 
         raise ValueError(f"unknown RLHF loss kind: {loss_kind}")
 
+    def __parse_resolution_override_value(self, value):
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+
+            flat = value.detach().cpu().flatten().tolist()
+
+            if len(flat) == 0:
+                return None
+
+            if len(flat) >= 2:
+                # If represented as width/height, group by the configured side/max dimension.
+                return int(round(max(float(flat[0]), float(flat[1]))))
+
+            return int(round(float(flat[0])))
+
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+
+        if isinstance(value, str):
+            text = value.strip().lower().replace(" ", "")
+
+            if not text:
+                return None
+
+            if text.isdigit():
+                return int(text)
+
+            if "x" in text:
+                a, b = text.split("x", 1)
+                if a.isdigit() and b.isdigit():
+                    return max(int(a), int(b))
+
+            if "," in text:
+                a, b = text.split(",", 1)
+                if a.isdigit() and b.isdigit():
+                    return max(int(a), int(b))
+
+            return None
+
+        if isinstance(value, (list, tuple)):
+            if len(value) == 0:
+                return None
+
+            if len(value) >= 2 and isinstance(value[0], (int, float)) and isinstance(value[1], (int, float)):
+                return int(round(max(float(value[0]), float(value[1]))))
+
+            return self.__parse_resolution_override_value(value[0])
+
+        if isinstance(value, (int, float)):
+            return int(round(float(value)))
+
+        return None
+
+    def __fallback_resolution_group_from_tensor(self, batch: dict) -> int:
+        # Safety fallback only if no explicit concept/global resolution is available.
+        # Converts actual trained tensor area into square-equivalent side rounded to nearest 64.
+        value = batch.get("latent_image")
+
+        if isinstance(value, torch.Tensor) and value.ndim >= 4:
+            # Expected cached latent shape: [B, C, H/8, W/8]
+            h = int(value.shape[-2])
+            w = int(value.shape[-1])
+            side = int(round(((h * w * 64) ** 0.5) / 64.0) * 64)
+            return max(side, 1)
+
+        value = batch.get("image")
+
+        if isinstance(value, torch.Tensor) and value.ndim >= 4:
+            # Image-space fallback: [B, C, H, W]
+            h = int(value.shape[-2])
+            w = int(value.shape[-1])
+            side = int(round(((h * w) ** 0.5) / 64.0) * 64)
+            return max(side, 1)
+
+        return 0
+
+    def __resolution_group_at(self, batch: dict, index: int) -> int:
+        # Preferred:
+        #   concept override resolution from the dataloader batch.
+        # Fallback:
+        #   global UI/config resolution.
+        # Last resort:
+        #   actual trained tensor shape.
+        candidate_keys = (
+            "concept_resolution_override",
+            "resolution_override",
+            "train_resolution",
+            "resolution",
+            "bucket_resolution",
+            "target_resolution",
+            "image_resolution",
+            "concept_resolution",
+        )
+
+        batch_len = self.__batch_len(batch)
+
+        for key in candidate_keys:
+            if key not in batch:
+                continue
+
+            raw = batch[key]
+
+            if isinstance(raw, (list, tuple)) and len(raw) == batch_len:
+                parsed = self.__parse_resolution_override_value(raw[index])
+            elif isinstance(raw, torch.Tensor) and raw.ndim > 0 and raw.shape[0] == batch_len:
+                parsed = self.__parse_resolution_override_value(raw[index])
+            else:
+                parsed = self.__parse_resolution_override_value(raw)
+
+            if parsed is not None and parsed > 0:
+                return parsed
+
+        # Global UI/default resolution fallback.
+        for attr in (
+            "resolution",
+            "train_resolution",
+            "training_resolution",
+            "image_resolution",
+        ):
+            if hasattr(self.config, attr):
+                parsed = self.__parse_resolution_override_value(getattr(self.config, attr))
+                if parsed is not None and parsed > 0:
+                    return parsed
+
+        # Safety fallback only.
+        return self.__fallback_resolution_group_from_tensor(batch)
+
     def __init_rlhf_ga_queues(self):
-        if not hasattr(self, "_rlhf_ga_queues"):
-            self._rlhf_ga_queues = {
-                "normal": [],
-                "negative": [],
-                "dpo": [],
-            }
-        if not hasattr(self, "_rlhf_ga_last_batch"):
-            self._rlhf_ga_last_batch = {
-                "normal": None,
-                "negative": None,
-                "dpo": None,
-            }
+        # key = (objective_kind, resolution_group)
+        #
+        # objective_kind:
+        #   "normal"
+        #   "negative"
+        #   "dpo"
+        #
+        # resolution_group:
+        #   concept override resolution if present, e.g. 640, 892, 1024, 2048
+        #   otherwise global UI/config resolution
+        #   otherwise tensor-derived fallback
+        if not hasattr(self, "_rlhf_ga_queues") or not isinstance(self._rlhf_ga_queues, dict):
+            self._rlhf_ga_queues = {}
+
+        if not hasattr(self, "_rlhf_ga_last_batch") or not isinstance(self._rlhf_ga_last_batch, dict):
+            self._rlhf_ga_last_batch = {}
+
+        # Replay pool used only for homogeneous tail filling.
+        # key = (objective_kind, resolution_group)
+        # Value = recent real batches from the same exact key.
+        if not hasattr(self, "_rlhf_ga_replay_pool") or not isinstance(self._rlhf_ga_replay_pool, dict):
+            self._rlhf_ga_replay_pool = {}
+
+        if not hasattr(self, "_rlhf_ga_replay_pool_size"):
+            self._rlhf_ga_replay_pool_size = 32
+
+        if not hasattr(self, "_rlhf_ga_queue_key"):
+            self._rlhf_ga_queue_key = None
+
         if not hasattr(self, "_rlhf_ga_loss_kind"):
             self._rlhf_ga_loss_kind = None
+
         if not hasattr(self, "_rlhf_ga_kind_micro_step"):
             self._rlhf_ga_kind_micro_step = 0
+
+        # Reset stale old-format queues if they somehow survived in memory.
+        if any(isinstance(key, str) for key in self._rlhf_ga_queues.keys()):
+            self._rlhf_ga_queues = {}
+            self._rlhf_ga_last_batch = {}
+            self._rlhf_ga_replay_pool = {}
+            self._rlhf_ga_queue_key = None
+            self._rlhf_ga_loss_kind = None
+            self._rlhf_ga_kind_micro_step = 0
+
+
+    def __remember_rlhf_replay_batch(self, key: tuple[str, int], batch: dict):
+        self.__init_rlhf_ga_queues()
+
+        pool = self._rlhf_ga_replay_pool.setdefault(key, [])
+        pool.append(batch)
+
+        cap = max(1, int(getattr(self, "_rlhf_ga_replay_pool_size", 32)))
+
+        if len(pool) > cap:
+            del pool[:len(pool) - cap]
+
+    def __random_rlhf_replay_batch(self, key: tuple[str, int]) -> tuple[dict | None, int, int]:
+        self.__init_rlhf_ga_queues()
+
+        pool = self._rlhf_ga_replay_pool.get(key, [])
+
+        if pool:
+            index = int(torch.randint(0, len(pool), (1,)).item())
+            return pool[index], index, len(pool)
+
+        # Compatibility fallback. Should rarely happen.
+        batch = self._rlhf_ga_last_batch.get(key)
+        if batch is not None:
+            return batch, -1, 1
+
+        return None, -1, 0
+
 
     def __enqueue_rlhf_loss_kind_batches(self, batch: dict):
         self.__init_rlhf_ga_queues()
 
         enqueue_counts = {"normal": 0, "negative": 0, "dpo": 0}
+        debug_groups = []
 
         for kind in ("normal", "negative", "dpo"):
             indices = self.__rlhf_loss_kind_indices(batch, kind)
             enqueue_counts[kind] = len(indices)
-            if indices:
-                self._rlhf_ga_queues[kind].append(self.__subbatch(batch, indices))
+
+            if not indices:
+                continue
+
+            grouped_indices = {}
+
+            for index in indices:
+                resolution_group = self.__resolution_group_at(batch, index)
+                grouped_indices.setdefault(resolution_group, []).append(index)
+
+            for resolution_group, group_indices in grouped_indices.items():
+                key = (kind, resolution_group)
+                self._rlhf_ga_queues.setdefault(key, []).append(self.__subbatch(batch, group_indices))
+                debug_groups.append(f"{kind}@{resolution_group}:rows={len(group_indices)}")
 
         try:
             step = self.model.train_progress.global_step
+            queued_by_kind = {"normal": 0, "negative": 0, "dpo": 0}
+            queued_by_key = {}
+
+            for (kind, resolution_group), queue in self._rlhf_ga_queues.items():
+                queued_count = sum(self.__batch_len(_b) for _b in queue)
+                queued_by_kind[kind] = queued_by_kind.get(kind, 0) + queued_count
+                queued_by_key[(kind, resolution_group)] = queued_count
+
             for kind in ("normal", "negative", "dpo"):
-                queued_samples = sum(self.__batch_len(_b) for _b in self._rlhf_ga_queues[kind])
                 self.tensorboard.add_scalar(f"rlhf_queue/enqueued_{kind}", float(enqueue_counts[kind]), step)
-                self.tensorboard.add_scalar(f"rlhf_queue/queued_{kind}", float(queued_samples), step)
+                self.tensorboard.add_scalar(f"rlhf_queue/queued_{kind}", float(queued_by_kind.get(kind, 0)), step)
+
+            # Aggregate debug scalars for resolution groups.
+            for (kind, resolution_group), queued_count in queued_by_key.items():
+                kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
+                self.tensorboard.add_scalar("rlhf_queue/debug_kind_id", kind_ids[kind], step)
+                self.tensorboard.add_scalar("rlhf_queue/debug_resolution_group", float(resolution_group), step)
+                self.tensorboard.add_scalar("rlhf_queue/debug_queued_key_count", float(queued_count), step)
+
         except Exception:
             pass
 
-    def __ready_rlhf_loss_kinds(self) -> list[str]:
+        if debug_groups:
+            self.__debug_rlhf_queue(
+                "enqueue "
+                + ", ".join(debug_groups)
+                + f" total_queued_keys={len(self._rlhf_ga_queues)}"
+            )
+
+    def __ready_rlhf_loss_kinds(self) -> list[tuple[str, int]]:
         self.__init_rlhf_ga_queues()
+
         return [
-            kind
-            for kind in ("normal", "negative", "dpo")
-            if self._rlhf_ga_queues[kind]
+            key
+            for key, queue in self._rlhf_ga_queues.items()
+            if queue
         ]
 
     def __dequeue_homogeneous_rlhf_accumulation_batch(self) -> tuple[dict | None, str | None]:
@@ -903,74 +1172,118 @@ class GenericTrainer(BaseTrainer):
 
         needed = max(1, int(self.config.gradient_accumulation_steps))
 
-        # Hard reset at GA boundary. This is internal and does not depend on finding
-        # the optimizer.step() location.
-        if self._rlhf_ga_loss_kind is not None and self._rlhf_ga_kind_micro_step >= needed:
+        # Hard reset at full GA boundary.
+        if self._rlhf_ga_queue_key is not None and self._rlhf_ga_kind_micro_step >= needed:
+            self.__debug_rlhf_queue(
+                f"ga_boundary_reset previous_key={self._rlhf_ga_queue_key} "
+                f"micro_steps={self._rlhf_ga_kind_micro_step}/{needed}"
+            )
+            self._rlhf_ga_queue_key = None
             self._rlhf_ga_loss_kind = None
             self._rlhf_ga_kind_micro_step = 0
 
-        current_kind = self._rlhf_ga_loss_kind
+        current_key = self._rlhf_ga_queue_key
 
-        # Start of a GA window: choose by actual queued sample ratio.
-        if current_kind is None:
+        # Start of a new GA window: pick queue key by actual queued sample count.
+        if current_key is None:
             weights = []
-            for kind in ("normal", "negative", "dpo"):
-                count = sum(self.__batch_len(_b) for _b in self._rlhf_ga_queues[kind])
+
+            for key, queue in self._rlhf_ga_queues.items():
+                count = sum(self.__batch_len(_b) for _b in queue)
                 if count > 0:
-                    weights.append((kind, count))
+                    weights.append((key, count))
 
             if not weights:
+                self.__debug_rlhf_queue("dequeue no_ready_queue")
                 return None, None
 
             total = sum(count for _, count in weights)
             r = int(torch.randint(0, total, (1,)).item())
 
             running = 0
-            current_kind = weights[-1][0]
-            for kind, count in weights:
+            current_key = weights[-1][0]
+
+            for key, count in weights:
                 running += count
                 if r < running:
-                    current_kind = kind
+                    current_key = key
                     break
 
-            self._rlhf_ga_loss_kind = current_kind
+            self._rlhf_ga_queue_key = current_key
+            self._rlhf_ga_loss_kind = current_key[0]
             self._rlhf_ga_kind_micro_step = 0
 
             try:
                 step = self.model.train_progress.global_step
                 kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
-                self.tensorboard.add_scalar("rlhf_queue/selected_kind", kind_ids[current_kind], step)
+                self.tensorboard.add_scalar("rlhf_queue/selected_kind", kind_ids[current_key[0]], step)
+                self.tensorboard.add_scalar("rlhf_queue/selected_resolution_group", float(current_key[1]), step)
             except Exception:
                 pass
 
-        queue = self._rlhf_ga_queues[current_kind]
+            self.__debug_rlhf_queue(
+                f"select key={current_key} "
+                f"weights={[(str(k), c) for k, c in weights]} "
+                f"ga={needed}"
+            )
+
+        current_kind, current_resolution_group = current_key
+        queue = self._rlhf_ga_queues.get(current_key, [])
+
+        duplicated = False
+        duplicate_pool_index = -1
+        duplicate_pool_size = 0
 
         if queue:
             batch = queue.pop(0)
-            self._rlhf_ga_last_batch[current_kind] = batch
+            self._rlhf_ga_last_batch[current_key] = batch
+            self.__remember_rlhf_replay_batch(current_key, batch)
         else:
-            # Rare type ran dry before the GA window finished. Duplicate same type.
-            batch = self._rlhf_ga_last_batch.get(current_kind)
+            # Tail fill ONLY from the same exact (kind, resolution_group),
+            # but choose randomly from recent real batches instead of repeating the last image.
+            batch, duplicate_pool_index, duplicate_pool_size = self.__random_rlhf_replay_batch(current_key)
+            duplicated = True
+
             if batch is None:
+                self.__debug_rlhf_queue(f"dequeue key={current_key} empty_no_replay_batch")
+                self._rlhf_ga_queue_key = None
                 self._rlhf_ga_loss_kind = None
                 self._rlhf_ga_kind_micro_step = 0
                 return None, current_kind
+
             try:
                 step = self.model.train_progress.global_step
                 kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
                 self.tensorboard.add_scalar("rlhf_queue/duplicated_kind", kind_ids[current_kind], step)
+                self.tensorboard.add_scalar("rlhf_queue/duplicated_resolution_group", float(current_resolution_group), step)
+                self.tensorboard.add_scalar("rlhf_queue/duplicated_pool_index", float(duplicate_pool_index), step)
+                self.tensorboard.add_scalar("rlhf_queue/duplicated_pool_size", float(duplicate_pool_size), step)
             except Exception:
                 pass
 
         self._rlhf_ga_kind_micro_step += 1
 
+        remaining_for_key = sum(self.__batch_len(_b) for _b in self._rlhf_ga_queues.get(current_key, []))
+
         try:
             step = self.model.train_progress.global_step
             kind_ids = {"normal": 0.0, "negative": 1.0, "dpo": 2.0}
             self.tensorboard.add_scalar("rlhf_queue/trained_kind", kind_ids[current_kind], step)
+            self.tensorboard.add_scalar("rlhf_queue/trained_resolution_group", float(current_resolution_group), step)
             self.tensorboard.add_scalar("rlhf_queue/ga_micro_step", float(self._rlhf_ga_kind_micro_step), step)
+            self.tensorboard.add_scalar("rlhf_queue/current_key_remaining", float(remaining_for_key), step)
         except Exception:
             pass
+
+        self.__debug_rlhf_queue(
+            f"train key={current_key} "
+            f"batch_len={self.__batch_len(batch)} "
+            f"micro_step={self._rlhf_ga_kind_micro_step}/{needed} "
+            f"duplicated={duplicated} "
+            f"duplicate_pool_index={duplicate_pool_index} "
+            f"duplicate_pool_size={duplicate_pool_size} "
+            f"remaining_key_rows={remaining_for_key}"
+        )
 
         return batch, current_kind
 
@@ -1464,6 +1777,216 @@ class GenericTrainer(BaseTrainer):
 
         return sum(loss_parts), dpo_metrics
 
+
+    def __scaled_weight_decay_enabled(self) -> bool:
+        optimizer_config = getattr(self.config, "optimizer", None)
+
+        reason = None
+        enabled = False
+
+        if optimizer_config is None:
+            reason = "no optimizer config"
+        elif not hasattr(optimizer_config, "scaled_wd"):
+            reason = "optimizer config has no scaled_wd attribute"
+        elif not bool(getattr(optimizer_config, "scaled_wd", False)):
+            reason = f"scaled_wd is false; weight_decay={getattr(optimizer_config, 'weight_decay', None)}"
+        else:
+            weight_decay = getattr(optimizer_config, "weight_decay", None)
+
+            if weight_decay is None:
+                reason = "weight_decay is None"
+            else:
+                try:
+                    enabled = float(weight_decay) != 0.0
+                    if not enabled:
+                        reason = "weight_decay is 0"
+                except Exception:
+                    reason = f"weight_decay is not numeric: {weight_decay!r}"
+
+        if multi.is_master() and not getattr(self, "_ot_scaled_wd_status_printed", False):
+            try:
+                if enabled:
+                    print(
+                        f"[OT-SCALED-WD] enabled config "
+                        f"scaled_wd={getattr(optimizer_config, 'scaled_wd', None)} "
+                        f"weight_decay={getattr(optimizer_config, 'weight_decay', None)}"
+                    )
+                else:
+                    print(f"[OT-SCALED-WD] disabled: {reason}")
+            except Exception:
+                pass
+
+            self._ot_scaled_wd_status_printed = True
+
+        return enabled
+
+    @staticmethod
+    def __scaled_wd_width_for_param(param: torch.Tensor, group_name: str = "") -> tuple[float, str]:
+        # Implements the PR1557 rule:
+        #   Full/LoRA: WD / width
+        #   OFT:       2 * WD / block_size
+        #
+        # This is intentionally conservative and parameter-shape based.
+        shape = tuple(param.shape)
+        name = str(group_name or "").lower()
+
+        if len(shape) == 0:
+            return 1.0, "scalar"
+
+        # OFT/DoFT-style matrices. If the group/name exposes OFT, use 2 / block_size.
+        if "oft" in name or "dora_oft" in name or "doft" in name:
+            block_size = max(1, int(shape[-1]))
+            return float(block_size) / 2.0, "oft"
+
+        # Matrix / conv / LoRA factors: use the logical width. For LoRA A/B this gives
+        # the larger side, which is the stable width-like scaling target.
+        if len(shape) >= 2:
+            width = max(1, int(max(shape[-1], shape[-2])))
+            return float(width), "width"
+
+        # Bias/vector fallback.
+        return float(max(1, int(param.numel()))), "vector"
+
+    def __prepare_scaled_weight_decay_groups(self):
+        if not self.__scaled_weight_decay_enabled():
+            return
+
+        optimizer = getattr(self.model, "optimizer", None)
+        if optimizer is None:
+            return
+
+        optimizer_config = getattr(self.config, "optimizer", None)
+        config_wd = float(getattr(optimizer_config, "weight_decay", 0.0) or 0.0)
+
+        for group in optimizer.param_groups:
+            if group.get("_ot_scaled_wd_prepared", False):
+                continue
+
+            group_wd = group.get("weight_decay", config_wd)
+            if group_wd is None:
+                group_wd = config_wd
+
+            try:
+                group_wd = float(group_wd)
+            except Exception:
+                group_wd = config_wd
+
+            group["_ot_scaled_wd_base"] = group_wd
+            group["_ot_scaled_wd_prepared"] = True
+
+            # Important: prevent the underlying optimizer from applying its own WD too.
+            # The scaled WD below is already decoupled and applied explicitly.
+            group["weight_decay"] = 0.0
+
+
+    def __apply_scaled_weight_decay_to_param(self, param: torch.Tensor, param_group: dict | None = None):
+        if not self.__scaled_weight_decay_enabled():
+            return
+
+        if param is None:
+            return
+
+        optimizer_config = getattr(self.config, "optimizer", None)
+        config_wd = float(getattr(optimizer_config, "weight_decay", 0.0) or 0.0)
+
+        if param_group is None:
+            base_wd = config_wd
+            group_name = ""
+        else:
+            if not param_group.get("_ot_scaled_wd_prepared", False):
+                group_wd = param_group.get("weight_decay", config_wd)
+                try:
+                    group_wd = float(group_wd)
+                except Exception:
+                    group_wd = config_wd
+
+                param_group["_ot_scaled_wd_base"] = group_wd
+                param_group["_ot_scaled_wd_prepared"] = True
+                param_group["weight_decay"] = 0.0
+
+            base_wd = float(param_group.get("_ot_scaled_wd_base", config_wd) or 0.0)
+            group_name = param_group.get("name", param_group.get("param_group_name", ""))
+
+        if base_wd == 0.0:
+            return
+
+        width, mode = self.__scaled_wd_width_for_param(param, group_name)
+
+        if width <= 0:
+            return
+
+        if mode == "oft":
+            decay = (2.0 * base_wd) / max(1.0, width * 2.0)
+        else:
+            decay = base_wd / max(1.0, width)
+
+        decay = max(0.0, min(float(decay), 0.25))
+
+        if decay != 0.0:
+            with torch.no_grad():
+                param.data.mul_(1.0 - decay)
+
+        if multi.is_master() and not getattr(self, "_ot_scaled_wd_debug_printed", False):
+            try:
+                print(
+                    f"[OT-SCALED-WD] enabled base_wd={base_wd} "
+                    f"group={group_name} mode={mode} width={width:g} applied_decay={decay:g}"
+                )
+            except Exception:
+                pass
+            self._ot_scaled_wd_debug_printed = True
+
+
+    def __apply_scaled_weight_decay(self):
+        if not self.__scaled_weight_decay_enabled():
+            return
+
+        optimizer = getattr(self.model, "optimizer", None)
+        if optimizer is None:
+            return
+
+        self.__prepare_scaled_weight_decay_groups()
+
+        debug_printed = getattr(self, "_ot_scaled_wd_debug_printed", False)
+
+        with torch.no_grad():
+            for group in optimizer.param_groups:
+                base_wd = float(group.get("_ot_scaled_wd_base", 0.0) or 0.0)
+                if base_wd == 0.0:
+                    continue
+
+                group_name = group.get("name", group.get("param_group_name", ""))
+
+                for param in group.get("params", []):
+                    if param is None:
+                        continue
+
+                    width, mode = self.__scaled_wd_width_for_param(param, group_name)
+                    if width <= 0:
+                        continue
+
+                    if mode == "oft":
+                        decay = (2.0 * base_wd) / max(1.0, width * 2.0)
+                    else:
+                        decay = base_wd / max(1.0, width)
+
+                    # Avoid pathological user mistakes nuking tensors in one step.
+                    decay = max(0.0, min(float(decay), 0.25))
+
+                    if decay != 0.0:
+                        param.data.mul_(1.0 - decay)
+
+                    if multi.is_master() and not debug_printed:
+                        try:
+                            print(
+                                f"[OT-SCALED-WD] enabled base_wd={base_wd} "
+                                f"group={group_name} mode={mode} width={width:g} applied_decay={decay:g}"
+                            )
+                        except Exception:
+                            pass
+                        self._ot_scaled_wd_debug_printed = True
+                        debug_printed = True
+
     def train(self):
         train_device = torch.device(self.config.train_device)
 
@@ -1670,17 +2193,20 @@ class GenericTrainer(BaseTrainer):
                             multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
 
                         if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                            self.__apply_scaled_weight_decay()
                             scaler.step_after_unscale_parameter_(self.model.optimizer)
                             scaler.update()
                         elif scaler:
                             scaler.unscale_(self.model.optimizer)
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            self.__apply_scaled_weight_decay()
                             scaler.step(self.model.optimizer)
                             scaler.update()
                         else:
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+                            self.__apply_scaled_weight_decay()
                             self.model.optimizer.step()
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients

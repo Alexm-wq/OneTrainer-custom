@@ -367,6 +367,8 @@ class BaseModelSetup(
 
         # Log DPO objective before optional supervised mix.
         # This includes chosen-anchor loss, but not supervised_loss.
+
+        # Logged DPO loss includes DPO-side auxiliary losses, including chosen reward anchor.
         dpo_logged_loss = loss
 
         if supervised_loss is not None:
