@@ -171,6 +171,31 @@ class BaseFlux2Setup(
 
         return model_output_data
 
+    def rlhf_logp_per_sample(
+            self,
+            model: Flux2Model,
+            batch: dict,
+            data: dict,
+            config: TrainConfig,
+    ) -> Tensor:
+        # Flux2 / Flux Klein native DPO likelihood proxy.
+        #
+        # Normal Flux2 training uses _flow_matching_losses(...).mean().
+        # DPO needs the same native loss path before the batch mean, so the
+        # preference objective uses one negative per-sample loss as its logp
+        # proxy instead of BaseModelSetup's raw-MSE fallback.
+        #
+        # This keeps DPO in Flux2's own units: configured MSE/MAE/log-cosh/
+        # Huber stack, mask handling, loss_scaler, per-sample loss_weight, and
+        # sigma/timestep weighting all match normal Flux2 training.
+        return -self._flow_matching_losses(
+            batch=batch,
+            data=data,
+            config=config,
+            train_device=self.train_device,
+            sigmas=model.noise_scheduler.sigmas,
+        )
+
     def calculate_loss(
             self,
             model: Flux2Model,

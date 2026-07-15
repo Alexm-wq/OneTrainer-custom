@@ -1,3 +1,4 @@
+import time
 import contextlib
 import copy
 import json
@@ -23,10 +24,8 @@ from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.dpo_beta_controller import DPOBetaController
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
-from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
@@ -83,6 +82,8 @@ class GenericTrainer(BaseTrainer):
         self.model = None
         self.one_step_trained = False
         self.grad_hook_handles = []
+        self._dpo_reference_snapshot_path = None
+        self._dpo_reference_initialized = False
 
     def start(self):
         if multi.is_master():
@@ -101,8 +102,8 @@ class GenericTrainer(BaseTrainer):
         self.callbacks.on_update_status("loading the model")
 
         model_names = self.config.model_names()
-
         last_backup_path = None
+
         if self.config.continue_last_backup:
             self.callbacks.on_update_status("searching for previous backups")
             last_backup_path = self.config.get_last_backup_path()
@@ -147,13 +148,14 @@ class GenericTrainer(BaseTrainer):
         self.model.eval()
         torch_gc()
 
+        if last_backup_path:
+            self._dpo_reference_snapshot_path = os.path.join(
+                last_backup_path,
+                "onetrainer_dpo_reference.pt",
+            )
+
         if self.config.rlhf_enabled and self.config.training_method != TrainingMethod.LORA:
             raise NotImplementedError("RLHF DPO is currently implemented for adapter training in the LoRA tab only.")
-
-        # Resuming a DPO run: restore the frozen reference saved with the backup so
-        # it is not re-captured from the already-trained adapter weights.
-        if self.config.rlhf_enabled and last_backup_path:
-            self.model_setup.load_dpo_reference(last_backup_path, self.model)
 
         self.callbacks.on_update_status("creating the data loader/caching")
 
@@ -168,12 +170,10 @@ class GenericTrainer(BaseTrainer):
 
         self.parameters = self.model.parameters.parameters()
 
-        if self.config.validation or self.config.dpo_validation_active():
+        if self.config.validation:
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
-
-        self._dpo_beta_controller: DPOBetaController | None = None
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -190,7 +190,7 @@ class GenericTrainer(BaseTrainer):
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text']):
+                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text'] or filename.startswith('image-rlhf-') or filename.startswith('text-rlhf-')):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
@@ -373,44 +373,6 @@ class GenericTrainer(BaseTrainer):
                 desc="validation_step",
                 total=current_epoch_length_validation)
 
-            if self.config.dpo_validation_active():
-                dpo_val_accuracy = []
-                dpo_val_chosen_reward = []
-                dpo_val_rejected_reward = []
-                dpo_val_reward_margin = []
-
-                for validation_batch in step_tqdm_validation:
-                    if self.__needs_gc(train_progress):
-                        torch_gc()
-
-                    with torch.no_grad():
-                        self.model_setup.calculate_dpo_loss(self.model, validation_batch, self.config, train_progress)
-                    dpo_metrics = self.model_setup.get_last_dpo_metrics()
-                    dpo_val_accuracy.append(dpo_metrics["accuracy"])
-                    dpo_val_chosen_reward.append(dpo_metrics["chosen_reward"])
-                    dpo_val_rejected_reward.append(dpo_metrics["rejected_reward"])
-                    dpo_val_reward_margin.append(dpo_metrics["reward_margin"])
-
-                if dpo_val_accuracy:
-                    # Validation loss is intentionally not tracked: reward hacking
-                    # drives it toward zero, so a low val loss is not evidence of a
-                    # good model. Held-out ranking accuracy is hack-resistant.
-                    val_accuracy = sum(dpo_val_accuracy) / len(dpo_val_accuracy)
-                    val_chosen_reward = sum(dpo_val_chosen_reward) / len(dpo_val_chosen_reward)
-                    val_rejected_reward = sum(dpo_val_rejected_reward) / len(dpo_val_rejected_reward)
-                    val_reward_margin = sum(dpo_val_reward_margin) / len(dpo_val_reward_margin)
-
-                    self.tensorboard.add_scalar("dpo/val_accuracy", val_accuracy, train_progress.global_step)
-                    self.tensorboard.add_scalar("dpo/val_chosen_reward", val_chosen_reward, train_progress.global_step)
-                    self.tensorboard.add_scalar(
-                        "dpo/val_rejected_reward", val_rejected_reward, train_progress.global_step
-                    )
-                    self.tensorboard.add_scalar("dpo/val_reward_margin", val_reward_margin, train_progress.global_step)
-
-                # DPO validation uses a different data pipeline (paired samples) than
-                # standard validation, so they cannot share the same data loader.
-                return
-
             accumulated_loss_per_concept = {}
             concept_counts = {}
             mapping_seed_to_label = {}
@@ -506,7 +468,9 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.__save_backup_config(backup_path)
-            self.model_setup.save_dpo_reference(backup_path)
+            self.model_setup.save_dpo_reference(
+                os.path.join(backup_path, "onetrainer_dpo_reference.pt")
+            )
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -654,6 +618,217 @@ class GenericTrainer(BaseTrainer):
                     self.grad_hook_handles.append(handle)
 
 
+
+    def __dpo_tensorboard_metric_names(self) -> set[str]:
+        return {
+            "objective_loss",
+            "chosen_reward",
+            "rejected_reward",
+            "reward_margin",
+            "chosen_term",
+            "rejected_term",
+            "margin_term",
+        }
+
+    def __batch_len(self, batch: dict) -> int:
+        preferred_keys = (
+            "concept_name",
+            "concept_path",
+            "image_path",
+            "text",
+            "dpo_is_paired",
+            "latent_image",
+            "latent_image_rejected",
+            "image",
+        )
+
+        for key in preferred_keys:
+            if key not in batch:
+                continue
+            value = batch[key]
+            if isinstance(value, (list, tuple)):
+                return len(value)
+            if isinstance(value, torch.Tensor):
+                if key == "dpo_is_paired":
+                    return int(value.numel())
+                if value.ndim > 0:
+                    return int(value.shape[0])
+
+        for value in batch.values():
+            if isinstance(value, (list, tuple)):
+                return len(value)
+            if isinstance(value, torch.Tensor) and value.ndim > 0:
+                return int(value.shape[0])
+
+        return int(self.config.batch_size)
+
+    @staticmethod
+    def __as_bool(value) -> bool:
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return False
+            value = value.detach().cpu().flatten()[0].item()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8", errors="ignore")
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "y", "dpo", "paired"}
+        return bool(value)
+
+    def __flag_indices(self, batch: dict, key: str) -> list[int]:
+        batch_len = self.__batch_len(batch)
+        if key not in batch:
+            return []
+
+        flags = batch[key]
+        if isinstance(flags, torch.Tensor):
+            values = flags.detach().cpu().flatten().tolist()
+        elif isinstance(flags, (list, tuple)):
+            values = list(flags)
+        else:
+            values = [flags] * batch_len
+
+        if len(values) < batch_len:
+            values = values + [False] * (batch_len - len(values))
+
+        return [i for i, value in enumerate(values[:batch_len]) if self.__as_bool(value)]
+
+    def __rlhf_dpo_indices(self, batch: dict) -> list[int]:
+        # Explicit flag only. Do not infer from latent_image_rejected because normal rows carry dummy rejected latents.
+        return self.__flag_indices(batch, "dpo_is_paired")
+
+    def __normal_indices(self, batch: dict) -> list[int]:
+        dpo = set(self.__rlhf_dpo_indices(batch))
+        return [i for i in range(self.__batch_len(batch)) if i not in dpo]
+
+    def __subbatch(self, batch: dict, indices: list[int]) -> dict:
+        batch_len = self.__batch_len(batch)
+        out = {}
+        index_cache = {}
+
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_len:
+                device = value.device
+                if device not in index_cache:
+                    index_cache[device] = torch.tensor(indices, device=device, dtype=torch.long)
+                out[key] = value.index_select(0, index_cache[device])
+            elif isinstance(value, list) and len(value) == batch_len:
+                out[key] = [value[i] for i in indices]
+            elif isinstance(value, tuple) and len(value) == batch_len:
+                out[key] = tuple(value[i] for i in indices)
+            else:
+                out[key] = value
+
+        return out
+
+    def __concept_type_at(self, batch: dict, index: int) -> ConceptType:
+        raw = batch["concept_type"][index]
+        if isinstance(raw, torch.Tensor):
+            raw = raw.detach().cpu().item()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+        if isinstance(raw, ConceptType):
+            return raw
+        return ConceptType(raw)
+
+    @staticmethod
+    def __assert_dpo_resolution_homogeneous(batch: dict):
+        chosen = batch.get("latent_image")
+        rejected = batch.get("latent_image_rejected")
+        if isinstance(chosen, torch.Tensor) and isinstance(rejected, torch.Tensor):
+            if chosen.shape != rejected.shape:
+                raise RuntimeError(
+                    "DPO resolution mismatch: latent_image shape "
+                    f"{tuple(chosen.shape)} != latent_image_rejected shape {tuple(rejected.shape)}. "
+                    "The rejected image must go through the same chosen-image bucket/crop path."
+                )
+
+    def __calculate_standard_only_training_loss(
+            self,
+            batch: dict,
+            train_progress: TrainProgress,
+    ) -> Tensor:
+        batch_len = self.__batch_len(batch)
+        prior_pred_indices = [
+            i for i in range(batch_len)
+            if self.__concept_type_at(batch, i) == ConceptType.PRIOR_PREDICTION
+        ]
+
+        if len(prior_pred_indices) > 0 or (
+                self.config.masked_training
+                and self.config.masked_prior_preservation_weight > 0
+                and self.config.training_method == TrainingMethod.LORA
+        ):
+            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
+                prior_model_output_data = self.model_setup.predict(
+                    self.model, batch, self.config, train_progress
+                )
+            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+            prior_model_prediction = prior_model_output_data["predicted"].to(dtype=model_output_data["target"].dtype)
+            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
+            model_output_data["prior_target"] = prior_model_prediction
+        else:
+            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
+
+        return self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+
+    def __calculate_mixed_rlhf_training_loss(
+            self,
+            batch: dict,
+            train_progress: TrainProgress,
+    ) -> Tensor:
+        if not self.config.rlhf_enabled:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        dpo_indices = self.__rlhf_dpo_indices(batch)
+        if not dpo_indices:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        normal_indices = self.__normal_indices(batch)
+
+        total_items = len(dpo_indices) + len(normal_indices)
+        loss_sum = None
+
+        def add_loss(loss: Tensor, count: int):
+            nonlocal loss_sum
+            if count <= 0:
+                return
+            weighted = loss * (count / max(total_items, 1))
+            loss_sum = weighted if loss_sum is None else loss_sum + weighted
+
+        if normal_indices:
+            normal_batch = self.__subbatch(batch, normal_indices)
+            normal_loss = self.__calculate_standard_only_training_loss(normal_batch, train_progress)
+            add_loss(normal_loss, len(normal_indices))
+            if hasattr(self, "tensorboard"):
+                self.tensorboard.add_scalar(
+                    "rlhf/normal_loss",
+                    float(normal_loss.detach().item()),
+                    train_progress.global_step,
+                )
+
+        if dpo_indices:
+            dpo_batch = self.__subbatch(batch, dpo_indices)
+            self.__assert_dpo_resolution_homogeneous(dpo_batch)
+            dpo_loss = self.model_setup.calculate_dpo_loss(
+                self.model,
+                dpo_batch,
+                self.config,
+                train_progress,
+            )
+            add_loss(dpo_loss, len(dpo_indices))
+
+            dpo_metrics = self.model_setup.get_last_dpo_metrics()
+            if hasattr(self, "tensorboard"):
+                for name, value in dpo_metrics.items():
+                    if isinstance(value, (int, float)) and name in self.__dpo_tensorboard_metric_names():
+                        self.tensorboard.add_scalar(f"dpo/{name}", float(value), train_progress.global_step)
+
+        if loss_sum is None:
+            return self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        return loss_sum
+
+
     def __before_eval(self):
         # Special case for schedule-free optimizers, which need eval()
         # called before evaluation. Can and should move this to a callback
@@ -661,6 +836,254 @@ class GenericTrainer(BaseTrainer):
         if self.config.optimizer.optimizer.is_schedule_free:
             torch.clear_autocast_cache()
             self.model.optimizer.eval()
+
+    def __ot_debug_dir(self) -> str:
+        path = os.environ.get("OT_CRASH_LOG_DIR", "/workspace/ot_crash_logs").strip()
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def __ot_debug_scalar(self, value):
+        try:
+            if hasattr(value, "detach"):
+                tensor = value.detach()
+                if tensor.numel() == 0:
+                    return None
+                if str(tensor.device).startswith("cuda") and os.environ.get("OT_CRASH_LOG_TENSOR_VALUES", "0") not in {"1", "true", "yes", "on"}:
+                    return {
+                        "tensor_value_skipped": "cuda tensor; set OT_CRASH_LOG_TENSOR_VALUES=1 to sync/copy values"
+                    }
+                return tensor.flatten()[0].cpu().item()
+            return value
+        except Exception as e:
+            return f"<scalar_error {type(e).__name__}: {e}>"
+
+    def __ot_debug_value_summary(self, value, max_items: int = 8, depth: int = 0):
+        if depth > 3:
+            return "<max_depth>"
+
+        try:
+            if hasattr(value, "detach"):
+                tensor = value.detach()
+                out = {
+                    "type": "tensor",
+                    "shape": list(tensor.shape),
+                    "dtype": str(tensor.dtype),
+                    "device": str(tensor.device),
+                    "requires_grad": bool(getattr(value, "requires_grad", False)),
+                    "numel": int(tensor.numel()),
+                }
+
+                # Default: do not sync/copy CUDA tensor values. For device-side
+                # asserts, syncing can itself trigger the pending crash and make
+                # the dump worse. Enable manually only when needed.
+                want_values = os.environ.get("OT_CRASH_LOG_TENSOR_VALUES", "0").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }
+
+                if tensor.numel() <= max_items and (want_values or not str(tensor.device).startswith("cuda")):
+                    try:
+                        out["values"] = tensor.flatten().cpu().tolist()
+                    except Exception as e:
+                        out["values_error"] = f"{type(e).__name__}: {e}"
+
+                if os.environ.get("OT_CRASH_LOG_TENSOR_STATS", "0").strip().lower() in {
+                    "1", "true", "yes", "on"
+                }:
+                    try:
+                        ft = tensor.float()
+                        out["nan_count"] = int(ft.isnan().sum().cpu().item())
+                        out["inf_count"] = int(ft.isinf().sum().cpu().item())
+                        finite = ft[torch.isfinite(ft)]
+                        if finite.numel() > 0:
+                            out["min"] = float(finite.min().cpu().item())
+                            out["max"] = float(finite.max().cpu().item())
+                            out["mean"] = float(finite.mean().cpu().item())
+                    except Exception as e:
+                        out["stats_error"] = f"{type(e).__name__}: {e}"
+
+                return out
+
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace")
+
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                if isinstance(value, str) and len(value) > 500:
+                    return value[:500] + "...<truncated>"
+                return value
+
+            if isinstance(value, (list, tuple)):
+                return {
+                    "type": type(value).__name__,
+                    "len": len(value),
+                    "items": [
+                        self.__ot_debug_value_summary(x, max_items=max_items, depth=depth + 1)
+                        for x in list(value)[:max_items]
+                    ],
+                }
+
+            if isinstance(value, dict):
+                keys = list(value.keys())
+                return {
+                    "type": "dict",
+                    "len": len(value),
+                    "keys": [str(k) for k in keys[:64]],
+                    "items": {
+                        str(k): self.__ot_debug_value_summary(value[k], max_items=max_items, depth=depth + 1)
+                        for k in keys[:max_items]
+                    },
+                }
+
+            text = str(value)
+            return text[:500] + ("...<truncated>" if len(text) > 500 else "")
+
+        except Exception as e:
+            return f"<summary_error {type(e).__name__}: {e}>"
+
+    def __ot_debug_batch_summary(self, batch: dict, train_progress=None) -> dict:
+        important_keys = [
+            "image_path",
+            "image_path_rejected",
+            "chosen_image_path",
+            "rejected_image_path",
+            "chosen_source_path",
+            "rejected_source_path",
+            "chosen_image_path_raw",
+            "rejected_image_path_raw",
+            "dpo_pair_key",
+            "dpo_is_paired",
+            "dpo_cache_mode",
+            "crop_resolution",
+            "scale_resolution",
+            "loss_weight",
+            "concept",
+            "concept.name",
+            "concept.path",
+            "concept.image.enable_resolution_override",
+            "concept.image.resolution_override",
+            "latent_image",
+            "latent_image_rejected",
+            "image",
+            "image_rejected",
+            "text",
+            "tokens",
+            "tokens_1",
+            "tokens_2",
+            "tokens_3",
+        ]
+
+        progress = {}
+        if train_progress is not None:
+            for name in [
+                "global_step",
+                "epoch",
+                "epoch_step",
+                "accumulation_step",
+                "sample_step",
+            ]:
+                if hasattr(train_progress, name):
+                    try:
+                        progress[name] = getattr(train_progress, name)
+                    except Exception:
+                        pass
+
+        summary = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "progress": progress,
+            "batch_type": type(batch).__name__,
+            "batch_keys": sorted([str(k) for k in batch.keys()]) if isinstance(batch, dict) else [],
+            "important": {},
+            "all": {},
+        }
+
+        if not isinstance(batch, dict):
+            summary["batch_repr"] = str(batch)[:1000]
+            return summary
+
+        for key in important_keys:
+            if key in batch:
+                summary["important"][key] = self.__ot_debug_value_summary(batch[key])
+
+        # Also summarize every key, but keep it shape/value-safe.
+        for key, value in batch.items():
+            summary["all"][str(key)] = self.__ot_debug_value_summary(value)
+
+        return summary
+
+    def __ot_write_batch_breadcrumb(self, batch: dict, train_progress=None):
+        if os.environ.get("OT_CRASH_BREADCRUMBS", "0").strip().lower() in {
+            "0", "false", "off", "no", "disabled"
+        }:
+            return
+
+        try:
+            path = os.path.join(self.__ot_debug_dir(), "batch_breadcrumbs.jsonl")
+            summary = self.__ot_debug_batch_summary(batch, train_progress)
+
+            # Breadcrumbs are meant to identify the last batch before async CUDA
+            # crashes. Keep them compact: important fields only.
+            compact = {
+                "time": summary.get("time"),
+                "progress": summary.get("progress"),
+                "important": summary.get("important"),
+            }
+
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(compact, ensure_ascii=False, default=str) + "\n")
+        except Exception as e:
+            print(f"[OT-CRASH-LOG] failed to write breadcrumb: {type(e).__name__}: {e}")
+
+    def __ot_write_crash_dump(self, exc: BaseException, batch: dict, train_progress=None):
+        try:
+            log_dir = self.__ot_debug_dir()
+            step = "unknown"
+            if train_progress is not None and hasattr(train_progress, "global_step"):
+                try:
+                    step = str(getattr(train_progress, "global_step"))
+                except Exception:
+                    pass
+
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(log_dir, f"crash_{stamp}_step_{step}")
+
+            payload = {
+                "exception_type": type(exc).__name__,
+                "exception": str(exc),
+                "traceback": traceback.format_exc(),
+                "batch": self.__ot_debug_batch_summary(batch, train_progress),
+                "env": {
+                    "CUDA_LAUNCH_BLOCKING": os.environ.get("CUDA_LAUNCH_BLOCKING", ""),
+                    "OT_CRASH_LOG_TENSOR_VALUES": os.environ.get("OT_CRASH_LOG_TENSOR_VALUES", "0"),
+                    "OT_CRASH_LOG_TENSOR_STATS": os.environ.get("OT_CRASH_LOG_TENSOR_STATS", "0"),
+                },
+            }
+
+            json_path = base + ".json"
+            txt_path = base + ".txt"
+
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
+
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write("OT crash dump\n")
+                f.write("=" * 80 + "\n\n")
+                f.write(f"exception_type: {payload['exception_type']}\n")
+                f.write(f"exception: {payload['exception']}\n\n")
+                f.write("traceback:\n")
+                f.write(payload["traceback"])
+                f.write("\n\nimportant batch fields:\n")
+                f.write(json.dumps(payload["batch"].get("important", {}), ensure_ascii=False, indent=2, default=str))
+                f.write("\n\nall batch fields:\n")
+                f.write(json.dumps(payload["batch"].get("all", {}), ensure_ascii=False, indent=2, default=str))
+
+            print(f"[OT-CRASH-LOG] wrote crash dump: {txt_path}")
+            print(f"[OT-CRASH-LOG] wrote crash json: {json_path}")
+            print("[OT-CRASH-LOG] if this is a CUDA device-side assert, rerun with CUDA_LAUNCH_BLOCKING=1 for the real failing line")
+
+        except Exception as log_exc:
+            print(f"[OT-CRASH-LOG] failed to write crash dump: {type(log_exc).__name__}: {log_exc}")
+            print("[OT-CRASH-LOG] original exception:")
+            print(traceback.format_exc())
+
 
     def train(self):
         train_device = torch.device(self.config.train_device)
@@ -684,14 +1107,8 @@ class GenericTrainer(BaseTrainer):
 
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
-        accumulated_dpo_metrics: dict[str, float] | None = None
         ema_loss = None
         ema_loss_steps = 0
-        ema_reward_margin = None
-        ema_reward_margin_steps = 0
-        ema_chosen_reward = None
-        ema_dpo_accuracy = None
-        reward_hacking_streak = 0
         epochs = range(train_progress.epoch, self.config.epochs, 1)
 
         for _epoch in tqdm(epochs, desc="epoch") if multi.is_master() else epochs:
@@ -708,6 +1125,15 @@ class GenericTrainer(BaseTrainer):
                 else:
                     self.model_setup.setup_train_device(self.model, self.config)
                     self.data_loader.get_data_set().start_next_epoch()
+
+            if self.config.rlhf_enabled and not self._dpo_reference_initialized:
+                self.model_setup.initialize_dpo_reference(
+                    self.model,
+                    self.config,
+                    self._dpo_reference_snapshot_path,
+                )
+                self._dpo_reference_initialized = True
+                self._dpo_reference_snapshot_path = None
 
             if self.config.debug_mode:
                 multi.warn_parameter_divergence(self.parameters, train_device)
@@ -793,46 +1219,18 @@ class GenericTrainer(BaseTrainer):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    if self.config.rlhf_enabled:
-                        loss = self.model_setup.calculate_dpo_loss(self.model, batch, self.config, train_progress)
-                        # Accumulate per-micro-batch DPO metrics across the grad-accum window.
-                        # Without this, only the final micro-batch's metric reaches TensorBoard —
-                        # which produces 0.0/1.0 accuracy when batch_size=1 regardless of effective batch.
-                        micro_dpo_metrics = self.model_setup.get_last_dpo_metrics()
-                        if accumulated_dpo_metrics is None:
-                            accumulated_dpo_metrics = dict.fromkeys(micro_dpo_metrics, 0.0)
-                            accumulated_dpo_metrics["_count"] = 0
-                        for _k, _v in micro_dpo_metrics.items():
-                            accumulated_dpo_metrics[_k] += _v
-                        accumulated_dpo_metrics["_count"] += 1
-                    else:
-                        # Standard training path
-                        prior_pred_indices = [
-                            i
-                            for i in range(self.config.batch_size)
-                            if ConceptType(batch["concept_type"][i]) == ConceptType.PRIOR_PREDICTION
-                        ]
-                        if len(prior_pred_indices) > 0 or (
-                            self.config.masked_training
-                            and self.config.masked_prior_preservation_weight > 0
-                            and self.config.training_method == TrainingMethod.LORA
-                        ):
-                            with self.model_setup.prior_model(self.model, self.config), torch.no_grad():
-                                # do NOT create a subbatch using the indices, even though it would be more efficient:
-                                # different timesteps are used for a smaller subbatch by predict(), but the conditioning must match exactly:
-                                prior_model_output_data = self.model_setup.predict(
-                                    self.model, batch, self.config, train_progress
-                                )
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-                            prior_model_prediction = prior_model_output_data["predicted"].to(
-                                dtype=model_output_data["target"].dtype
-                            )
-                            model_output_data["target"][prior_pred_indices] = prior_model_prediction[prior_pred_indices]
-                            model_output_data["prior_target"] = prior_model_prediction
-                        else:
-                            model_output_data = self.model_setup.predict(self.model, batch, self.config, train_progress)
-
-                        loss = self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
+                    # Normal behavior: use the batch exactly as emitted by the dataloader.
+                    # Do not split/requeue/replay batches inside GenericTrainer.
+                    #
+                    # RLHF/DPO math is still handled by __calculate_mixed_rlhf_training_loss().
+                    # This intentionally does not touch calculate_dpo_loss, native Krea DPO
+                    # logp, chosen-reward anchor/floor logic, or any RL loss code.
+                    self.__ot_write_batch_breadcrumb(batch, train_progress)
+                    try:
+                        loss = self.__calculate_mixed_rlhf_training_loss(batch, train_progress)
+                    except Exception as e:
+                        self.__ot_write_crash_dump(e, batch, train_progress)
+                        raise
 
                     loss = loss / self.config.gradient_accumulation_steps
                     if scaler:
@@ -869,30 +1267,6 @@ class GenericTrainer(BaseTrainer):
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
 
-                        # Adaptive beta must be applied on EVERY rank and driven by
-                        # the global margin: otherwise non-master ranks keep the
-                        # static beta and the averaged gradients mix losses at
-                        # different beta scales. All ranks all-reduce the margin and
-                        # run the same deterministic controller, so they stay in
-                        # lockstep without a broadcast. reduce_tensor_mean is a
-                        # collective, so this must sit outside the is_master() block.
-                        adaptive_beta = None
-                        if (
-                            self.config.rlhf_enabled
-                            and accumulated_dpo_metrics is not None
-                            and self.config.rlhf_dpo_adaptive_beta
-                            and self.config.rlhf_dpo_objective == DPOObjective.SIGMOID
-                        ):
-                            margin_t = torch.tensor(
-                                accumulated_dpo_metrics["reward_margin"] / accumulated_dpo_metrics["_count"],
-                                device=train_device,
-                            )
-                            multi.reduce_tensor_mean(margin_t)
-                            if self._dpo_beta_controller is None:
-                                self._dpo_beta_controller = DPOBetaController(self.config.rlhf_dpo_beta)
-                            adaptive_beta = self._dpo_beta_controller.update(margin_t.item())
-                            self.model_setup.set_dpo_runtime_beta(adaptive_beta)
-
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
                                 self.model, self.config, lr_scheduler, self.tensorboard
@@ -902,82 +1276,7 @@ class GenericTrainer(BaseTrainer):
                             if math.isnan(accumulated_loss_cpu):
                                 raise RuntimeError("Training loss became NaN. This may be due to invalid parameters, precision issues, or a bug in the loss computation.")
 
-                            self.tensorboard.add_scalar(
-                                "loss/train_step", accumulated_loss_cpu, train_progress.global_step
-                            )
-                            if self.config.rlhf_enabled and accumulated_dpo_metrics is not None:
-                                count = accumulated_dpo_metrics.pop("_count")
-                                dpo_metrics = {k: v / count for k, v in accumulated_dpo_metrics.items()}
-                                self.tensorboard.add_scalar("loss/dpo", dpo_metrics["loss"], train_progress.global_step)
-                                self.tensorboard.add_scalar(
-                                    "dpo/raw_loss", dpo_metrics["dpo_loss"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "dpo/chosen_reward", dpo_metrics["chosen_reward"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "dpo/rejected_reward", dpo_metrics["rejected_reward"], train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "dpo/reward_margin", dpo_metrics["reward_margin"], train_progress.global_step
-                                )
-                                ema_reward_margin = ema_reward_margin or dpo_metrics["reward_margin"]
-                                ema_reward_margin_steps += 1
-                                ema_reward_margin_decay = min(0.99, 1 - (1 / ema_reward_margin_steps))
-                                ema_reward_margin = (ema_reward_margin * ema_reward_margin_decay) + (
-                                    dpo_metrics["reward_margin"] * (1 - ema_reward_margin_decay)
-                                )
-                                self.tensorboard.add_scalar(
-                                    "dpo/smooth_reward_margin", ema_reward_margin, train_progress.global_step
-                                )
-                                self.tensorboard.add_scalar(
-                                    "dpo/accuracy", dpo_metrics["accuracy"], train_progress.global_step
-                                )
-
-                                # Reward-hacking signature: the margin keeps growing while
-                                # BOTH rewards go negative (the model degrades chosen and
-                                # rejected alike) and held-out ranking saturates.
-                                ema_chosen_reward = ema_chosen_reward or dpo_metrics["chosen_reward"]
-                                ema_chosen_reward = (ema_chosen_reward * ema_reward_margin_decay) + (
-                                    dpo_metrics["chosen_reward"] * (1 - ema_reward_margin_decay)
-                                )
-                                ema_dpo_accuracy = ema_dpo_accuracy or dpo_metrics["accuracy"]
-                                ema_dpo_accuracy = (ema_dpo_accuracy * ema_reward_margin_decay) + (
-                                    dpo_metrics["accuracy"] * (1 - ema_reward_margin_decay)
-                                )
-                                if ema_chosen_reward < 0 and ema_dpo_accuracy > 0.95:
-                                    reward_hacking_streak += 1
-                                else:
-                                    reward_hacking_streak = 0
-                                if reward_hacking_streak == 25:
-                                    warning = (
-                                        "DPO reward-hacking signature detected: chosen reward has stayed "
-                                        "negative while training accuracy is saturated. The margin is likely "
-                                        "growing by degrading both images of each pair. Lower the learning "
-                                        "rate, raise beta, or switch to the IPO objective."
-                                    )
-                                    print(warning)
-                                    self.tensorboard.add_text("dpo/warnings", warning, train_progress.global_step)
-
-                                if adaptive_beta is not None:
-                                    # Controller already ran on every rank above; here we
-                                    # only log the (globally-consistent) beta it produced.
-                                    self.tensorboard.add_scalar("dpo/beta", adaptive_beta, train_progress.global_step)
-                                    self.tensorboard.add_scalar(
-                                        "dpo/raw_margin_ema",
-                                        self._dpo_beta_controller.margin_ema,
-                                        train_progress.global_step,
-                                    )
-
-                                if self.config.rlhf_dpo_timestep_margin_logging:
-                                    for quartile in range(4):
-                                        quartile_count = dpo_metrics.get(f"margin_t_q{quartile + 1}_count", 0.0)
-                                        if quartile_count > 0:
-                                            self.tensorboard.add_scalar(
-                                                f"dpo/margin_by_t/q{quartile + 1}",
-                                                dpo_metrics[f"margin_t_q{quartile + 1}_sum"] / quartile_count,
-                                                train_progress.global_step,
-                                            )
+                            self.tensorboard.add_scalar("loss/train_step",accumulated_loss_cpu , train_progress.global_step)
                             ema_loss = ema_loss or accumulated_loss_cpu
                             ema_loss_steps += 1
                             ema_loss_decay = min(0.99, 1 - (1 / ema_loss_steps))
@@ -989,7 +1288,6 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
 
                         accumulated_loss = 0.0
-                        accumulated_dpo_metrics = None
                         self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
 
                         if self.model.ema:
@@ -1007,7 +1305,7 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
-                if (self.config.validation or self.config.dpo_validation_active()) and multi.is_master():
+                if self.config.validation and multi.is_master():
                     self.__validate(train_progress)
 
                 train_progress.next_step(self.config.batch_size)
@@ -1039,11 +1337,7 @@ class GenericTrainer(BaseTrainer):
 
                 if self.model.ema:
                     self.model.ema.copy_ema_to(self.parameters, store_temp=False)
-
-                if (
-                    os.path.isdir(self.config.output_model_destination)
-                    and self.config.output_model_format.is_single_file()
-                ):
+                if os.path.isdir(self.config.output_model_destination) and self.config.output_model_format.is_single_file():
                     save_path = os.path.join(
                         self.config.output_model_destination,
                         f"{self.config.save_filename_prefix}{get_string_timestamp()}{self.config.output_model_format.file_extension()}"

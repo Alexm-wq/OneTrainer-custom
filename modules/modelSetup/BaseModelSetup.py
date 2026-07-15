@@ -1,11 +1,11 @@
 import os
+import csv
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
@@ -13,10 +13,13 @@ from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
+import modules.util.multi_gpu_util as multi
+import torch.nn.functional as F
 
 
 class BaseModelSetup(
@@ -34,11 +37,11 @@ class BaseModelSetup(
         self.train_device = train_device
         self.temp_device = temp_device
         self.debug_mode = debug_mode
-        self.frozen_parameters = {}
         self._dpo_ref_params = None
         self._last_dpo_metrics = None
-        self._dpo_paired_half = None  # read by ModelSetupNoiseMixin._apply_dpo_paired_rng
+        self._dpo_paired_half = None
         self._dpo_runtime_beta = None
+        self.frozen_parameters = {}
 
     @abstractmethod
     def create_parameters(
@@ -151,35 +154,128 @@ class BaseModelSetup(
     def _is_dpo_rejected_key(key: str) -> bool:
         return key.endswith("_rejected")
 
-    @classmethod
-    def _create_dpo_batched_batch(cls, batch: dict) -> tuple[dict, int]:
-        # Returns a batch where every <key>/<key>_rejected pair is concatenated
-        # as [chosen; rejected] on dim 0, shared per-sample tensors are duplicated
-        # by self-concat, and non-batched values pass through. The chosen half is
-        # always the first B entries of the result.
-        chosen_b = batch["latent_image"].shape[0]
-        batched: dict = {}
+    def _create_dpo_batched_batch(self, batch: dict) -> tuple[dict, int]:
+        # The chosen latent is the authoritative batch dimension. Inferring B
+        # from arbitrary dict order can pick a metadata list with a different
+        # length and silently corrupt the chosen/rejected split.
+        latent_image = batch.get("latent_image")
+        if not isinstance(latent_image, torch.Tensor) or latent_image.ndim == 0:
+            raise RuntimeError(
+                "DPO batch must contain a batched latent_image tensor"
+            )
+
+        chosen_b = int(latent_image.shape[0])
+        if chosen_b <= 0:
+            raise RuntimeError("DPO batch is empty")
+
+        rejected_latent = batch.get("latent_image_rejected")
+        if not isinstance(rejected_latent, torch.Tensor):
+            raise RuntimeError(
+                "DPO batch must contain latent_image_rejected as a Tensor"
+            )
+        if rejected_latent.shape != latent_image.shape:
+            raise RuntimeError(
+                "DPO latent shape mismatch: "
+                f"latent_image {tuple(latent_image.shape)} != "
+                f"latent_image_rejected {tuple(rejected_latent.shape)}"
+            )
+
+        batched = {}
+
+        rejected_key_map = {
+            "latent_image": "latent_image_rejected",
+            "image": "image_rejected",
+            "image_path": "image_path_rejected",
+            "chosen_image_path": "rejected_image_path",
+            "chosen_source_path": "rejected_source_path",
+        }
+
         for key, value in batch.items():
-            if cls._is_dpo_rejected_key(key):
+            if key.endswith("_rejected") or key.startswith("rejected_"):
                 continue
-            rejected_key = key + "_rejected"
-            if rejected_key in batch:
-                batched[key] = torch.cat([value, batch[rejected_key]], dim=0)
-            elif isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == chosen_b:
-                batched[key] = torch.cat([value, value], dim=0)
-            elif (
-                isinstance(value, (list, tuple))
-                and value
-                and all(isinstance(v, torch.Tensor) and v.ndim > 0 and v.shape[0] == chosen_b for v in value)
-            ):
-                # SDXL-style per-field tensor lists (original_resolution / crop_resolution /
-                # crop_offset collate a per-sample tuple into a list of [B] tensors). The
-                # rejected image shares the chosen sample's bucket, so duplicate each field
-                # elementwise to reach 2B and keep add_time_ids aligned with the latents.
-                batched[key] = type(value)(torch.cat([v, v], dim=0) for v in value)
+
+            rejected_key = rejected_key_map.get(key)
+            if rejected_key is None and key.startswith("chosen_"):
+                candidate = "rejected_" + key[len("chosen_"):]
+                if candidate in batch:
+                    rejected_key = candidate
+
+            if rejected_key is not None and rejected_key in batch:
+                rejected_value = batch[rejected_key]
+
+                if isinstance(value, torch.Tensor):
+                    if not isinstance(rejected_value, torch.Tensor):
+                        raise TypeError(
+                            f"DPO batch key '{key}' is Tensor but rejected key '{rejected_key}' "
+                            f"is {type(rejected_value).__name__}"
+                        )
+                    if value.ndim == 0 or rejected_value.ndim == 0:
+                        raise RuntimeError(
+                            f"DPO paired tensor keys '{key}'/'{rejected_key}' "
+                            "must have a batch dimension"
+                        )
+                    if int(value.shape[0]) != chosen_b or int(rejected_value.shape[0]) != chosen_b:
+                        raise RuntimeError(
+                            f"DPO paired tensor keys '{key}'/'{rejected_key}' must both "
+                            f"have batch size {chosen_b}, got {value.shape[0]} and "
+                            f"{rejected_value.shape[0]}"
+                        )
+                    if key == "latent_image" and value.shape != rejected_value.shape:
+                        raise RuntimeError(
+                            "DPO latent shape mismatch: "
+                            f"latent_image {tuple(value.shape)} != "
+                            f"latent_image_rejected {tuple(rejected_value.shape)}"
+                        )
+                    batched[key] = torch.cat([value, rejected_value], dim=0)
+
+                elif isinstance(value, list):
+                    if isinstance(rejected_value, tuple):
+                        rejected_value = list(rejected_value)
+                    if not isinstance(rejected_value, list):
+                        raise TypeError(
+                            f"DPO batch key '{key}' is list but rejected key '{rejected_key}' "
+                            f"is {type(rejected_value).__name__}"
+                        )
+                    if len(value) != chosen_b or len(rejected_value) != chosen_b:
+                        raise RuntimeError(
+                            f"DPO paired list keys '{key}'/'{rejected_key}' must both "
+                            f"have length {chosen_b}, got {len(value)} and "
+                            f"{len(rejected_value)}"
+                        )
+                    batched[key] = value + rejected_value
+
+                elif isinstance(value, tuple):
+                    if isinstance(rejected_value, list):
+                        rejected_value = tuple(rejected_value)
+                    if not isinstance(rejected_value, tuple):
+                        raise TypeError(
+                            f"DPO batch key '{key}' is tuple but rejected key '{rejected_key}' "
+                            f"is {type(rejected_value).__name__}"
+                        )
+                    if len(value) != chosen_b or len(rejected_value) != chosen_b:
+                        raise RuntimeError(
+                            f"DPO paired tuple keys '{key}'/'{rejected_key}' must both "
+                            f"have length {chosen_b}, got {len(value)} and "
+                            f"{len(rejected_value)}"
+                        )
+                    batched[key] = value + rejected_value
+
+                else:
+                    batched[key] = value
+
             else:
-                batched[key] = value
+                if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == chosen_b:
+                    batched[key] = torch.cat([value, value], dim=0)
+                elif isinstance(value, list) and len(value) == chosen_b:
+                    batched[key] = value + value
+                elif isinstance(value, tuple) and len(value) == chosen_b:
+                    batched[key] = value + value
+                else:
+                    batched[key] = value
+
+        self._dpo_paired_half = chosen_b
         return batched, chosen_b
+
 
     @staticmethod
     def _split_dpo_batched_output(output: dict, chosen_b: int) -> tuple[dict, dict]:
@@ -205,6 +301,329 @@ class BaseModelSetup(
         # not create a feedback loop.
         self._dpo_runtime_beta = beta
 
+    def rlhf_logp_per_sample(
+            self,
+            model: BaseModel,
+            batch: dict,
+            data: dict,
+            config: TrainConfig,
+    ) -> Tensor:
+        # Default DPO likelihood proxy: old raw-MSE behavior.
+        #
+        # Keep the old memory behavior: do not upcast the full [2B,C,H,W]
+        # tensors before subtraction. Only the reduction accumulates in fp32.
+        #
+        # Model families can override this to use their native per-sample
+        # training loss math. Krea overrides this to use _flow_matching_losses(),
+        # so DPO follows the same MSE/MAE/log-cosh/Huber/loss-weight/sigma math
+        # as normal Krea training.
+        predicted = data["predicted"]
+        target = data["target"]
+        return -(
+            predicted - target
+        ).pow(2).mean(dim=list(range(1, predicted.ndim)), dtype=torch.float32)
+
+    @staticmethod
+    def _validate_rlhf_logp_per_sample(logp: Tensor, chosen_b: int, name: str) -> Tensor:
+        # DPO requires exactly one scalar logp proxy per chosen/rejected sample.
+        # A scalar mean loss or unreduced spatial tensor would silently corrupt
+        # the preference objective, so fail hard.
+        if not isinstance(logp, torch.Tensor):
+            raise TypeError(
+                f"{name} rlhf_logp_per_sample must return a Tensor, "
+                f"got {type(logp).__name__}"
+            )
+
+        expected_b = 2 * int(chosen_b)
+        if logp.ndim != 1 or int(logp.shape[0]) != expected_b:
+            raise RuntimeError(
+                f"{name} rlhf_logp_per_sample must return shape "
+                f"[{expected_b}], got {tuple(logp.shape)}"
+            )
+
+        # DPO arithmetic is cheap at [2B], so force stable fp32 margins without
+        # creating large fp32 activation copies.
+        if logp.dtype != torch.float32:
+            logp = logp.float()
+
+        return logp
+
+    @staticmethod
+    def _dpo_csv_index_value(value, index: int | None = None):
+        if value is None:
+            return ""
+
+        if isinstance(value, (str, int, float, bool)):
+            return value
+
+        if isinstance(value, bytes):
+            return value.decode("utf-8", errors="replace")
+
+        if hasattr(value, "detach"):
+            tensor = value.detach()
+            if tensor.numel() == 0:
+                return ""
+
+            if index is not None and tensor.ndim > 0 and int(tensor.shape[0]) > index:
+                tensor = tensor[index]
+            else:
+                tensor = tensor.flatten()[0]
+
+            if tensor.numel() == 1:
+                item = tensor.detach().cpu().item()
+                if isinstance(item, float):
+                    return float(item)
+                if isinstance(item, int):
+                    return int(item)
+                if isinstance(item, bool):
+                    return bool(item)
+                return item
+
+            flat = tensor.detach().cpu().flatten().tolist()
+            return "x".join(str(x) for x in flat)
+
+        if isinstance(value, (list, tuple)):
+            if index is None:
+                if len(value) == 0:
+                    return ""
+                return BaseModelSetup._dpo_csv_index_value(value[0], None)
+            if 0 <= index < len(value):
+                return BaseModelSetup._dpo_csv_index_value(value[index], None)
+            return ""
+
+        return str(value)
+
+    @staticmethod
+    def _dpo_csv_float_value(value, index: int | None = None):
+        value = BaseModelSetup._dpo_csv_index_value(value, index)
+        if value == "":
+            return ""
+        try:
+            return float(value)
+        except Exception:
+            return value
+
+    @staticmethod
+    def _dpo_csv_neg_float_value(value, index: int | None = None):
+        value = BaseModelSetup._dpo_csv_float_value(value, index)
+        if value == "":
+            return ""
+        try:
+            return -float(value)
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _dpo_csv_batch_value(batch: dict, names: tuple[str, ...], index: int | None = None):
+        for name in names:
+            if name in batch:
+                return BaseModelSetup._dpo_csv_index_value(batch.get(name), index)
+        return ""
+
+    @staticmethod
+    def _dpo_csv_concept_value(batch: dict, index: int, key: str):
+        flat_name = f"concept.{key}"
+        if flat_name in batch:
+            return BaseModelSetup._dpo_csv_index_value(batch.get(flat_name), index)
+
+        concept = batch.get("concept")
+        if isinstance(concept, (list, tuple)) and 0 <= index < len(concept):
+            concept = concept[index]
+
+        if isinstance(concept, dict):
+            cur = concept
+            for part in key.split("."):
+                if not isinstance(cur, dict) or part not in cur:
+                    return ""
+                cur = cur[part]
+            return BaseModelSetup._dpo_csv_index_value(cur, None)
+
+        return ""
+
+    @staticmethod
+    def _dpo_csv_path(config: TrainConfig) -> str:
+        # Default: write into the current OneTrainer working directory.
+        # No environment export needed.
+        #
+        # Optional override still exists if you ever want it:
+        #   OT_DPO_PAIR_CSV_PATH=/some/path.csv
+        path = os.environ.get("OT_DPO_PAIR_CSV_PATH", "").strip()
+        if path:
+            return path
+        return os.path.join(os.getcwd(), "dpo_pair_log.csv")
+
+    @staticmethod
+    def _dpo_csv_scalar(value):
+        if value is None:
+            return ""
+        if hasattr(value, "detach"):
+            if value.detach().numel() == 0:
+                return ""
+            return float(value.detach().float().mean().cpu().item())
+        try:
+            return float(value)
+        except Exception:
+            return str(value)
+
+    def _write_dpo_pair_csv_log(
+            self,
+            batch: dict,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+            chosen_b: int,
+            policy_timestep,
+            pair_total_loss,
+            chosen_ratio,
+            rejected_ratio,
+            margin,
+            chosen_violation,
+            rejected_violation,
+            margin_violation,
+            chosen_term,
+            rejected_term,
+            margin_term,
+    ):
+        if not multi.is_master():
+            return
+
+        chosen_b = int(chosen_b)
+        if chosen_b <= 0:
+            return
+
+        fieldnames = [
+            "global_step",
+            "epoch",
+            "pair_index",
+            "objective",
+            "chosen_image_path",
+            "rejected_image_path",
+            "dpo_pair_key",
+            "timestep",
+            "chosen_reward",
+            "rejected_reward",
+            "reward_margin",
+            "chosen_violation",
+            "rejected_violation",
+            "margin_violation",
+            "chosen_term",
+            "rejected_term",
+            "margin_term",
+            "pair_loss",
+        ]
+
+        path = self._dpo_csv_path(config)
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        # Preserve an existing old-schema CSV instead of appending rows with a
+        # different column order beneath its header.
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                current_header = next(csv.reader(f), [])
+
+            if current_header != fieldnames:
+                legacy_index = 1
+                legacy_path = f"{path}.legacy-{legacy_index}"
+                while os.path.exists(legacy_path):
+                    legacy_index += 1
+                    legacy_path = f"{path}.legacy-{legacy_index}"
+                os.replace(path, legacy_path)
+                print(
+                    f"[OT-DPO-PAIR-CSV] moved old-schema log to {legacy_path}"
+                )
+
+        write_header = not os.path.exists(path) or os.path.getsize(path) == 0
+
+        rows = []
+        for i in range(chosen_b):
+            rows.append({
+                "global_step": getattr(train_progress, "global_step", ""),
+                "epoch": getattr(train_progress, "epoch", ""),
+                "pair_index": i,
+                "objective": str(
+                    getattr(config, "rlhf_dpo_objective", "")
+                ),
+                "chosen_image_path": self._dpo_csv_batch_value(
+                    batch,
+                    (
+                        "image_path",
+                        "chosen_image_path",
+                        "chosen_source_path",
+                        "chosen_image_path_raw",
+                    ),
+                    i,
+                ),
+                "rejected_image_path": self._dpo_csv_batch_value(
+                    batch,
+                    (
+                        "image_path_rejected",
+                        "rejected_image_path",
+                        "rejected_source_path",
+                        "rejected_image_path_raw",
+                    ),
+                    i,
+                ),
+                "dpo_pair_key": self._dpo_csv_batch_value(
+                    batch,
+                    ("dpo_pair_key",),
+                    i,
+                ),
+                "timestep": self._dpo_csv_index_value(
+                    policy_timestep,
+                    i,
+                ),
+                "chosen_reward": self._dpo_csv_float_value(
+                    chosen_ratio,
+                    i,
+                ),
+                "rejected_reward": self._dpo_csv_float_value(
+                    rejected_ratio,
+                    i,
+                ),
+                "reward_margin": self._dpo_csv_float_value(
+                    margin,
+                    i,
+                ),
+                "chosen_violation": self._dpo_csv_float_value(
+                    chosen_violation,
+                    i,
+                ),
+                "rejected_violation": self._dpo_csv_float_value(
+                    rejected_violation,
+                    i,
+                ),
+                "margin_violation": self._dpo_csv_float_value(
+                    margin_violation,
+                    i,
+                ),
+                "chosen_term": self._dpo_csv_float_value(
+                    chosen_term,
+                    i,
+                ),
+                "rejected_term": self._dpo_csv_float_value(
+                    rejected_term,
+                    i,
+                ),
+                "margin_term": self._dpo_csv_float_value(
+                    margin_term,
+                    i,
+                ),
+                "pair_loss": self._dpo_csv_float_value(
+                    pair_total_loss,
+                    i,
+                ),
+            })
+
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+
+
     def calculate_dpo_loss(
         self,
         model: BaseModel,
@@ -217,11 +636,6 @@ class BaseModelSetup(
                 "RLHF DPO requires paired chosen/rejected batches, but the dataloader did not provide rejected samples."
             )
 
-        def mse_per_sample(pred, target):
-            # fp32 accumulation in the reduction instead of upcasting the full
-            # [2B,C,H,W] tensors - avoids four fp32 copies per step.
-            return (pred - target).pow(2).mean(dim=list(range(1, pred.ndim)), dtype=torch.float32)
-
         beta = config.rlhf_dpo_beta if self._dpo_runtime_beta is None else self._dpo_runtime_beta
         supervised_loss = None
 
@@ -233,110 +647,289 @@ class BaseModelSetup(
         # 2B-sized, so mixing them in one session compiles two graphs.
         batched_input, chosen_b = self._create_dpo_batched_batch(batch)
 
-        # Conditioning (caption) dropout is drawn per-sample inside encode_text.
-        # On the [chosen; rejected] batch that independently zeroes the prompt on
-        # one half of a pair (~2p(1-p) of pairs), comparing a prompted sample
-        # against an unconditional one and silently corrupting the preference
-        # margin. Neutralize it for the paired forward so both halves see
-        # identical conditioning; restore afterwards. (Diffusion-DPO trains on the
-        # given prompts, not CFG-dropped ones.)
-        te_configs = (config.text_encoder, config.text_encoder_2, config.text_encoder_3, config.text_encoder_4)
-        saved_dropout = [te.dropout_probability for te in te_configs]
-
         self._dpo_paired_half = chosen_b
         try:
-            for te in te_configs:
-                te.dropout_probability = 0.0
             with torch.no_grad(), self.reference_model(model, config):
                 ref_output = self.predict(model, batched_input, config, train_progress)
-                ref_predicted = ref_output["predicted"]
-                ref_target = ref_output["target"]
-                ref_chosen_logp = -mse_per_sample(ref_predicted[:chosen_b], ref_target[:chosen_b])
-                ref_rejected_logp = -mse_per_sample(ref_predicted[chosen_b:], ref_target[chosen_b:])
-                del ref_output, ref_predicted, ref_target
+                ref_logp = self.rlhf_logp_per_sample(model, batched_input, ref_output, config)
+                ref_logp = self._validate_rlhf_logp_per_sample(ref_logp, chosen_b, "reference")
+                ref_chosen_logp = ref_logp[:chosen_b]
+                ref_rejected_logp = ref_logp[chosen_b:]
+                del ref_output, ref_logp
 
             policy_output = self.predict(model, batched_input, config, train_progress)
         finally:
             self._dpo_paired_half = None
-            for te, saved in zip(te_configs, saved_dropout, strict=True):
-                te.dropout_probability = saved
         policy_timestep = policy_output.get("timestep")
-        policy_predicted = policy_output["predicted"]
-        policy_target = policy_output["target"]
-        policy_chosen_logp = -mse_per_sample(policy_predicted[:chosen_b], policy_target[:chosen_b])
-        policy_rejected_logp = -mse_per_sample(policy_predicted[chosen_b:], policy_target[chosen_b:])
+        policy_logp = self.rlhf_logp_per_sample(model, batched_input, policy_output, config)
+        policy_logp = self._validate_rlhf_logp_per_sample(policy_logp, chosen_b, "policy")
+        policy_chosen_logp = policy_logp[:chosen_b]
+        policy_rejected_logp = policy_logp[chosen_b:]
         if config.rlhf_supervised_mix > 0:
             chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
             supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
             del chosen_output
-        del policy_output, policy_predicted, policy_target
+        del policy_output, policy_logp
 
         chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
         rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
         margin = chosen_ratio - rejected_ratio
 
+        # Default for logging and non-decoupled / IPO paths.
+        dpo_beta_scale = 1.0
+        chosen_reward_push_loss = None
+        chosen_reward_floor_loss = None
+        chosen_reward_aux_loss = None
+        chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
+        anchored_chosen_loss = None
+        anchored_rejected_loss = None
+        anchored_margin_loss = None
+        chosen_violation = None
+        rejected_violation = None
+        margin_violation = None
+        chosen_term_per_pair = None
+        rejected_term_per_pair = None
+        margin_term_per_pair = None
+
         if config.rlhf_dpo_objective == DPOObjective.IPO:
-            # IPO regresses the raw margin toward the fixed target 1/(2*tau)
-            # instead of pushing it to infinity, which structurally resists
-            # reward hacking. tau plays beta's role; label smoothing and beta
-            # do not apply.
             dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
             loss = dpo_loss
+        elif config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
+            chosen_target = float(
+                getattr(config, "rlhf_dpo_anchored_chosen_target", 0.02)
+            )
+            rejected_target = float(
+                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)
+            )
+            margin_target = float(
+                getattr(config, "rlhf_dpo_anchored_margin_target", 0.10)
+            )
+
+            chosen_weight = max(
+                float(
+                    getattr(
+                        config,
+                        "rlhf_dpo_anchored_chosen_weight",
+                        1.0,
+                    )
+                ),
+                0.0,
+            )
+            rejected_weight = max(
+                float(
+                    getattr(
+                        config,
+                        "rlhf_dpo_anchored_rejected_weight",
+                        0.5,
+                    )
+                ),
+                0.0,
+            )
+            margin_weight = max(
+                float(
+                    getattr(
+                        config,
+                        "rlhf_dpo_anchored_margin_weight",
+                        0.25,
+                    )
+                ),
+                0.0,
+            )
+            huber_delta = max(
+                float(
+                    getattr(
+                        config,
+                        "rlhf_dpo_anchored_huber_delta",
+                        0.05,
+                    )
+                ),
+                1e-8,
+            )
+
+            chosen_violation = F.relu(chosen_target - chosen_ratio)
+            rejected_violation = F.relu(
+                rejected_ratio - rejected_target
+            )
+            margin_violation = F.relu(margin_target - margin)
+
+            chosen_loss_per_pair = F.smooth_l1_loss(
+                chosen_violation,
+                torch.zeros_like(chosen_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+            rejected_loss_per_pair = F.smooth_l1_loss(
+                rejected_violation,
+                torch.zeros_like(rejected_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+            margin_loss_per_pair = F.smooth_l1_loss(
+                margin_violation,
+                torch.zeros_like(margin_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+
+            chosen_term_per_pair = (
+                chosen_weight * chosen_loss_per_pair
+            )
+            rejected_term_per_pair = (
+                rejected_weight * rejected_loss_per_pair
+            )
+            margin_term_per_pair = (
+                margin_weight * margin_loss_per_pair
+            )
+
+            anchored_pair_loss_proxy = (
+                chosen_term_per_pair
+                + rejected_term_per_pair
+                + margin_term_per_pair
+            )
+
+            # Log weighted contributions so the three component curves sum to
+            # the Anchored Reject objective loss.
+            anchored_chosen_loss = chosen_term_per_pair.mean()
+            anchored_rejected_loss = rejected_term_per_pair.mean()
+            anchored_margin_loss = margin_term_per_pair.mean()
+
+            dpo_loss = anchored_pair_loss_proxy.mean()
+            loss = dpo_loss
+
         else:
             logits = beta * margin
             dpo_loss = -F.logsigmoid(logits).mean()
-            loss = dpo_loss
+            preference_loss = dpo_loss
 
             if config.rlhf_dpo_label_smoothing > 0:
-                s = config.rlhf_dpo_label_smoothing
-                loss = (1 - s) * loss + s * (-F.logsigmoid(-logits).mean())
+                label_smoothing = config.rlhf_dpo_label_smoothing
+                preference_loss = (
+                    (1.0 - label_smoothing) * preference_loss
+                    + label_smoothing * (-F.logsigmoid(-logits).mean())
+                )
+
+            if getattr(config, "rlhf_dpo_beta_gradient_decouple", False):
+                beta_for_scale = float(beta.detach().item()) if isinstance(beta, torch.Tensor) else float(beta)
+                beta_ref = getattr(config, "rlhf_dpo_beta_gradient_reference", None)
+                if beta_ref is None or float(beta_ref) <= 0:
+                    beta_ref = float(config.rlhf_dpo_beta)
+                dpo_beta_scale = float(beta_ref) / max(beta_for_scale, 1e-12)
+
+                # Value-preserving gradient scaling:
+                # forward/logged loss stays equal to preference_loss,
+                # backward gradient is scaled by dpo_beta_scale.
+                preference_loss = (
+                    preference_loss.detach()
+                    + dpo_beta_scale * (preference_loss - preference_loss.detach())
+                )
+
+            loss = preference_loss
+
+        if (
+            config.rlhf_dpo_objective != DPOObjective.ANCHORED_REJECT
+            and getattr(config, "rlhf_dpo_chosen_reward_anchor", False)
+        ):
+            chosen_anchor_weight = float(getattr(config, "rlhf_dpo_chosen_reward_anchor_weight", 0.0))
+            if chosen_anchor_weight > 0:
+                chosen_reward_target = float(getattr(config, "rlhf_dpo_chosen_reward_target", 0.05))
+                chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
+                chosen_reward_floor_multiplier = float(
+                    getattr(config, "rlhf_dpo_chosen_reward_floor_multiplier", 4.0)
+                )
+                chosen_reward_sharpness = max(
+                    float(getattr(config, "rlhf_dpo_chosen_reward_sharpness", 20.0)),
+                    1e-6,
+                )
+
+                chosen_reward_push_loss = F.softplus(
+                    (chosen_reward_target - chosen_ratio) * chosen_reward_sharpness
+                ).mean() / chosen_reward_sharpness
+
+                chosen_reward_floor_violation = F.relu(chosen_reward_floor_value - chosen_ratio)
+                chosen_reward_floor_loss = (
+                    chosen_reward_floor_violation.mean()
+                    + chosen_reward_sharpness * chosen_reward_floor_violation.pow(2).mean()
+                )
+
+                chosen_reward_aux_loss = chosen_anchor_weight * (
+                    chosen_reward_push_loss
+                    + chosen_reward_floor_multiplier * chosen_reward_floor_loss
+                )
+                loss = loss + chosen_reward_aux_loss
+
+        # DPO-side logged loss includes beta-grad scaling and chosen-anchor aux loss,
+        # but does not include supervised_mix.
+        dpo_logged_loss = loss
 
         if supervised_loss is not None:
             loss = loss + config.rlhf_supervised_mix * supervised_loss
             del supervised_loss
 
-        # Stack the six scalar metrics and sync once (six separate .item() calls
-        # would be six GPU->CPU stalls on the training hot path).
-        metric_values = torch.stack([
-            loss.detach().float(),
-            dpo_loss.detach().float(),
-            chosen_ratio.detach().mean(),
-            rejected_ratio.detach().mean(),
-            margin.detach().mean(),
-            (chosen_ratio > rejected_ratio).float().mean(),
-        ]).tolist()
-        self._last_dpo_metrics = dict(zip(
-            ("loss", "dpo_loss", "chosen_reward", "rejected_reward", "reward_margin", "accuracy"),
-            metric_values,
-            strict=True,
-        ))
+        pair_total_loss = None
 
-        if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:
-            # Per-sample raw margins bucketed by the chosen half's timestep
-            # quartile. Sums and counts are emitted for every quartile so the
-            # trainer's accumulation always sees the same key set.
-            raw_t = policy_timestep[:chosen_b].detach()
-            if torch.is_floating_point(raw_t):
-                # Continuous-timestep models already emit t in (0, 1].
-                t = raw_t.float()
+        try:
+            if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
+                pair_total_loss = anchored_pair_loss_proxy
+            elif config.rlhf_dpo_objective == DPOObjective.IPO:
+                pair_total_loss = (
+                    margin
+                    - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)
+                ).pow(2)
             else:
-                # Discrete schedulers emit integer steps in [0, num_train_timesteps);
-                # normalize by the model's actual count rather than sniffing the
-                # batch max (which misbuckets batches that only sample steps {0,1})
-                # or assuming 1000.
-                num_train_timesteps = model.noise_scheduler.config['num_train_timesteps']
-                t = raw_t.float() / num_train_timesteps
-            quartile_index = (t * 4).long().clamp(0, 3)
-            per_sample_margin = margin.detach().float()
-            # bincount for counts + scatter_add for sums, then one sync for all
-            # eight quartile scalars instead of eight .item() calls.
-            counts = torch.bincount(quartile_index, minlength=4).float()
-            sums = torch.zeros(4, device=per_sample_margin.device, dtype=per_sample_margin.dtype)
-            sums.scatter_add_(0, quartile_index, per_sample_margin)
-            sums_l, counts_l = torch.stack([sums, counts]).tolist()
-            for quartile in range(4):
-                self._last_dpo_metrics[f"margin_t_q{quartile + 1}_sum"] = sums_l[quartile]
-                self._last_dpo_metrics[f"margin_t_q{quartile + 1}_count"] = counts_l[quartile]
+                pair_logits = beta * margin
+                pair_total_loss = -F.logsigmoid(pair_logits)
+
+                if config.rlhf_dpo_label_smoothing > 0:
+                    label_smoothing = config.rlhf_dpo_label_smoothing
+                    pair_total_loss = (
+                        (1.0 - label_smoothing) * pair_total_loss
+                        + label_smoothing
+                        * (-F.logsigmoid(-pair_logits))
+                    )
+        except Exception as e:
+            print(
+                "[OT-DPO-PAIR-CSV] failed to compute per-pair loss: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        try:
+            self._write_dpo_pair_csv_log(
+                batch=batch,
+                config=config,
+                train_progress=train_progress,
+                chosen_b=chosen_b,
+                policy_timestep=policy_timestep,
+                pair_total_loss=pair_total_loss,
+                chosen_ratio=chosen_ratio,
+                rejected_ratio=rejected_ratio,
+                margin=margin,
+                chosen_violation=chosen_violation,
+                rejected_violation=rejected_violation,
+                margin_violation=margin_violation,
+                chosen_term=chosen_term_per_pair,
+                rejected_term=rejected_term_per_pair,
+                margin_term=margin_term_per_pair,
+            )
+        except Exception as e:
+            print(
+                "[OT-DPO-PAIR-CSV] failed to write row: "
+                f"{type(e).__name__}: {e}"
+            )
+
+
+        self._last_dpo_metrics = {
+            "objective_loss": dpo_logged_loss.detach().item(),
+            "chosen_reward": chosen_ratio.detach().mean().item(),
+            "rejected_reward": rejected_ratio.detach().mean().item(),
+            "reward_margin": margin.detach().mean().item(),
+        }
+
+        if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
+            self._last_dpo_metrics.update({
+                "chosen_term": anchored_chosen_loss.detach().item(),
+                "rejected_term": anchored_rejected_loss.detach().item(),
+                "margin_term": anchored_margin_loss.detach().item(),
+            })
 
         return loss
 
@@ -378,6 +971,126 @@ class BaseModelSetup(
             for adapter in model.adapters():
                 adapter.hook_to_module()
 
+    def initialize_dpo_reference(
+            self,
+            model: BaseModel,
+            config: TrainConfig,
+            snapshot_path: str | None = None,
+    ):
+        """Initialize a stable existing-adapter reference before training.
+
+        The old implementation captured the reference lazily on the first DPO
+        batch, so ordinary training steps before that batch changed the anchor.
+        This method is called after the model is on the training device and can
+        restore the original snapshot from an OT backup.
+        """
+        if not getattr(config, "rlhf_enabled", False):
+            return
+        if config.effective_dpo_ref_mode() != DPORefMode.EXISTING_ADAPTER:
+            return
+        if self._dpo_ref_params is not None:
+            return
+
+        adapters = list(model.adapters())
+        if len(adapters) == 0:
+            raise RuntimeError(
+                "RLHF DPO existing-adapter reference requires active adapters"
+            )
+
+        loaded_groups = None
+        if snapshot_path and os.path.isfile(snapshot_path):
+            try:
+                payload = torch.load(
+                    snapshot_path,
+                    map_location="cpu",
+                    weights_only=True,
+                )
+            except TypeError:
+                payload = torch.load(snapshot_path, map_location="cpu")
+
+            if isinstance(payload, dict):
+                loaded_groups = payload.get("adapter_parameters")
+            else:
+                loaded_groups = payload
+
+            if not isinstance(loaded_groups, (list, tuple)):
+                raise RuntimeError(
+                    f"Invalid DPO reference snapshot: {snapshot_path}"
+                )
+            if len(loaded_groups) != len(adapters):
+                raise RuntimeError(
+                    "DPO reference snapshot adapter count mismatch: "
+                    f"snapshot={len(loaded_groups)}, model={len(adapters)}"
+                )
+
+        snapshot_groups = []
+        for adapter_index, adapter in enumerate(adapters):
+            parameters = list(adapter.parameters())
+            loaded_parameters = (
+                loaded_groups[adapter_index]
+                if loaded_groups is not None
+                else None
+            )
+
+            if loaded_parameters is not None and len(loaded_parameters) != len(parameters):
+                raise RuntimeError(
+                    "DPO reference snapshot parameter count mismatch for "
+                    f"adapter {adapter_index}: snapshot={len(loaded_parameters)}, "
+                    f"model={len(parameters)}"
+                )
+
+            group = []
+            for parameter_index, parameter in enumerate(parameters):
+                if loaded_parameters is None:
+                    reference = parameter.detach().clone()
+                else:
+                    source = loaded_parameters[parameter_index]
+                    if not isinstance(source, torch.Tensor):
+                        raise RuntimeError(
+                            "DPO reference snapshot contains a non-tensor at "
+                            f"adapter {adapter_index}, parameter {parameter_index}"
+                        )
+                    if tuple(source.shape) != tuple(parameter.shape):
+                        raise RuntimeError(
+                            "DPO reference snapshot shape mismatch at adapter "
+                            f"{adapter_index}, parameter {parameter_index}: "
+                            f"snapshot={tuple(source.shape)}, "
+                            f"model={tuple(parameter.shape)}"
+                        )
+                    reference = source.to(
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    ).clone()
+
+                group.append(reference)
+            snapshot_groups.append(group)
+
+        self._dpo_ref_params = snapshot_groups
+
+        if loaded_groups is not None:
+            print(f"[OT-RLHF] restored fixed DPO reference from {snapshot_path}")
+        elif snapshot_path:
+            print(
+                "[OT-RLHF] backup has no saved DPO reference; using the "
+                "adapter state loaded at resume as the new fixed reference"
+            )
+        else:
+            print("[OT-RLHF] captured fixed existing-adapter DPO reference")
+
+    def save_dpo_reference(self, snapshot_path: str):
+        if self._dpo_ref_params is None:
+            return
+
+        os.makedirs(os.path.dirname(snapshot_path) or ".", exist_ok=True)
+        payload = {
+            "version": 1,
+            "adapter_parameters": [
+                [parameter.detach().cpu().clone() for parameter in group]
+                for group in self._dpo_ref_params
+            ],
+        }
+        torch.save(payload, snapshot_path)
+
     @contextmanager
     def reference_model(self, model: BaseModel, config: TrainConfig):
         adapters = model.adapters()
@@ -401,69 +1114,72 @@ class BaseModelSetup(
             finally:
                 for adapter in adapters:
                     adapter.hook_to_module()
-        elif ref_mode == DPORefMode.EXISTING_ADAPTER:
-            # Reference params are captured once at first call and frozen for the
-            # entire training run. This is intentional: DPO requires a fixed
-            # reference policy from the start of training.
-            if self._dpo_ref_params is None:
-                self._dpo_ref_params = [[p.data.clone() for p in adapter.parameters()] for adapter in adapters]
 
-            policy_data = [[p.data for p in adapter.parameters()] for adapter in adapters]
+        elif ref_mode == DPORefMode.EXISTING_ADAPTER:
+            # Fallback for callers outside GenericTrainer. GenericTrainer
+            # initializes this before the first optimizer step and restores it
+            # from backups when available.
+            if self._dpo_ref_params is None:
+                self.initialize_dpo_reference(model, config)
+
+            if self._dpo_ref_params is None:
+                raise RuntimeError(
+                    "Existing-adapter DPO reference was not initialized"
+                )
+            if len(self._dpo_ref_params) != len(adapters):
+                raise RuntimeError(
+                    "Existing-adapter DPO reference adapter count changed"
+                )
+
+            # Preserve Parameter storage so optimizer/DDP hooks do not see
+            # data-pointer replacement. Adapter tensors are small enough that a
+            # temporary policy clone is safer than swapping .data references.
+            policy_values = [
+                [parameter.detach().clone() for parameter in adapter.parameters()]
+                for adapter in adapters
+            ]
             try:
-                for adapter, ref_params in zip(adapters, self._dpo_ref_params, strict=True):
-                    for i, (param, ref_data) in enumerate(zip(adapter.parameters(), ref_params, strict=True)):
-                        # Reference params restored from a backup live on CPU; move
-                        # them onto the live param's device/dtype once and cache the
-                        # moved tensor (a no-op for the lazily-cloned in-run case).
-                        if ref_data.device != param.data.device or ref_data.dtype != param.data.dtype:
-                            ref_data = ref_data.to(device=param.data.device, dtype=param.data.dtype)
-                            ref_params[i] = ref_data
-                        param.data = ref_data
+                with torch.no_grad():
+                    for adapter_index, (adapter, ref_params) in enumerate(
+                            zip(adapters, self._dpo_ref_params, strict=True)
+                    ):
+                        parameters = list(adapter.parameters())
+                        if len(parameters) != len(ref_params):
+                            raise RuntimeError(
+                                "Existing-adapter DPO reference parameter count "
+                                f"changed for adapter {adapter_index}"
+                            )
+
+                        for parameter_index, (parameter, ref_data) in enumerate(
+                                zip(parameters, ref_params, strict=True)
+                        ):
+                            if tuple(parameter.shape) != tuple(ref_data.shape):
+                                raise RuntimeError(
+                                    "Existing-adapter DPO reference shape changed at "
+                                    f"adapter {adapter_index}, parameter {parameter_index}"
+                                )
+                            if (
+                                ref_data.device != parameter.device
+                                or ref_data.dtype != parameter.dtype
+                            ):
+                                ref_data = ref_data.to(
+                                    device=parameter.device,
+                                    dtype=parameter.dtype,
+                                )
+                                self._dpo_ref_params[adapter_index][parameter_index] = ref_data
+                            parameter.copy_(ref_data)
                 yield
             finally:
-                for adapter, policy_ptrs in zip(adapters, policy_data, strict=True):
-                    for param, policy_ptr in zip(adapter.parameters(), policy_ptrs, strict=True):
-                        param.data = policy_ptr
+                with torch.no_grad():
+                    for adapter, saved_values in zip(
+                            adapters, policy_values, strict=True
+                    ):
+                        for parameter, saved_value in zip(
+                                adapter.parameters(), saved_values, strict=True
+                        ):
+                            parameter.copy_(saved_value)
         else:
             raise ValueError(f"Unsupported DPO reference mode: {ref_mode}")
-
-    _DPO_REFERENCE_FILENAME = "dpo_reference.pt"
-
-    def save_dpo_reference(self, backup_path: str) -> None:
-        # Persist the frozen EXISTING_ADAPTER reference alongside a backup so it
-        # survives resume. Without this the reference is re-captured from the
-        # resumed (already DPO-trained) adapter weights, silently moving the KL
-        # anchor. NEW_ADAPTER mode never captures params, so nothing is written.
-        if self._dpo_ref_params is None:
-            return
-        try:
-            payload = [[t.detach().to("cpu", copy=True) for t in adapter] for adapter in self._dpo_ref_params]
-            torch.save(payload, os.path.join(backup_path, self._DPO_REFERENCE_FILENAME))
-        except OSError:
-            pass
-
-    def load_dpo_reference(self, backup_path: str, model: BaseModel) -> bool:
-        # Restore the frozen reference saved next to the backup we are resuming
-        # from. Returns True on success; on any structural mismatch it leaves
-        # _dpo_ref_params unset so the caller falls back to lazy capture rather
-        # than adopting a wrong reference.
-        path = os.path.join(backup_path, self._DPO_REFERENCE_FILENAME)
-        if not os.path.isfile(path):
-            return False
-        saved = torch.load(path, map_location="cpu", weights_only=True)
-        adapters = model.adapters()
-        if not isinstance(saved, list) or len(saved) != len(adapters):
-            return False
-        restored: list[list[Tensor]] = []
-        for adapter, adapter_saved in zip(adapters, saved, strict=True):
-            params = list(adapter.parameters())
-            if len(adapter_saved) != len(params):
-                return False
-            if any(tuple(t.shape) != tuple(p.shape) for t, p in zip(adapter_saved, params, strict=True)):
-                return False
-            restored.append(list(adapter_saved))
-        self._dpo_ref_params = restored
-        return True
 
     def _create_model_part_parameters(
         self,

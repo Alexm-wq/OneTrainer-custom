@@ -81,6 +81,41 @@ class BaseConceptWindowView:
         self.components.label(frame, 9, 0, "Loss Weight",
                          tooltip="The loss multiplyer for this concept.")
         self.components.entry(frame, 9, 1, ui_state, "loss_weight")
+        self.components.label(
+            frame,
+            10,
+            0,
+            "DPO Chosen Pattern",
+            tooltip=(
+                "Chosen path pattern relative to the concept folder. Use one "
+                "{} placeholder, for example winner/{}.png."
+            ),
+        )
+        self.components.entry(
+            frame,
+            10,
+            1,
+            ui_state,
+            "dpo_chosen_pattern",
+        )
+
+        self.components.label(
+            frame,
+            11,
+            0,
+            "DPO Rejected Pattern",
+            tooltip=(
+                "Rejected path pattern relative to the concept folder, using "
+                "the same {} stem, for example loser/{}.png."
+            ),
+        )
+        self.components.entry(
+            frame,
+            11,
+            1,
+            ui_state,
+            "dpo_rejected_pattern",
+        )
 
     def build_image_augmentation_tab(self, frame, controller, image_ui_state):
         # header

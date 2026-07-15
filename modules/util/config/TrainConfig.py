@@ -13,8 +13,6 @@ from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
@@ -32,6 +30,9 @@ from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
+from modules.util.enum.RLHFMode import RLHFMode
 
 
 class TrainOptimizerConfig(BaseConfig):
@@ -601,17 +602,6 @@ class TrainConfig(BaseConfig):
     lokr_full_matrix: bool
     lokr_vec_trick: bool
 
-    # dpo
-    rlhf_enabled: bool
-    rlhf_dpo_beta: float
-    rlhf_dpo_label_smoothing: float
-    rlhf_dpo_objective: DPOObjective
-    rlhf_dpo_ipo_tau: float
-    rlhf_dpo_adaptive_beta: bool
-    rlhf_dpo_timestep_margin_logging: bool
-    rlhf_supervised_mix: float
-    rlhf_dpo_validation: bool
-
     # optimizer
     optimizer: TrainOptimizerConfig
     optimizer_defaults: dict[str, TrainOptimizerConfig]
@@ -645,6 +635,36 @@ class TrainConfig(BaseConfig):
     # secrets - not saved into config file
     secrets: SecretsConfig
 
+    rlhf_enabled: bool
+    rlhf_mode: RLHFMode
+    rlhf_dpo_beta: float
+    rlhf_dpo_label_smoothing: float
+    rlhf_supervised_mix: float
+    rlhf_dpo_objective: DPOObjective
+    rlhf_dpo_ipo_tau: float
+    rlhf_dpo_ref_mode: DPORefMode
+    rlhf_dpo_adaptive_beta: bool
+    rlhf_dpo_validation: bool
+    rlhf_dpo_validation_percentage: float
+    rlhf_dpo_patience_enabled: bool
+    rlhf_dpo_patience_value: int
+    rlhf_dpo_save_best: bool
+    rlhf_dpo_timestep_margin_logging: bool
+    rlhf_dpo_beta_gradient_decouple: bool
+    rlhf_dpo_beta_gradient_reference: float
+    rlhf_dpo_chosen_reward_anchor: bool
+    rlhf_dpo_chosen_reward_anchor_weight: float
+    rlhf_dpo_chosen_reward_target: float
+    rlhf_dpo_chosen_reward_floor: float
+    rlhf_dpo_chosen_reward_floor_multiplier: float
+    rlhf_dpo_chosen_reward_sharpness: float
+    rlhf_dpo_anchored_chosen_target: float
+    rlhf_dpo_anchored_rejected_target: float
+    rlhf_dpo_anchored_margin_target: float
+    rlhf_dpo_anchored_chosen_weight: float
+    rlhf_dpo_anchored_rejected_weight: float
+    rlhf_dpo_anchored_margin_weight: float
+    rlhf_dpo_anchored_huber_delta: float
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -883,28 +903,21 @@ class TrainConfig(BaseConfig):
         return migrated_data
 
     def __migration_10(self, data: dict) -> dict:
-        # RLHF/DPO training defaults. Seeds the full DPO key set in one step;
-        # the reference mode is derived from lora_model_name at runtime.
+        # ModelFormat enum cleanup. The overloaded SAFETENSORS value reproduced whatever OneTrainer
+        # wrote before this change, dispatched per-model inside each saver. It splits by save type into
+        # the frozen "legacy" formats: LEGACY_SAFETENSORS (full model) and LEGACY_LORA (LoRA).
+        # Embedding keeps SAFETENSORS (the learned-vectors file). Only SAFETENSORS was ever
+        # UI-selectable, so it is the only released value that needs migrating.
         migrated_data = data.copy()
-        migrated_data.setdefault("rlhf_enabled", False)
-        migrated_data.setdefault("rlhf_dpo_beta", 200.0)
-        migrated_data.setdefault("rlhf_dpo_label_smoothing", 0.0)
-        migrated_data.setdefault("rlhf_dpo_objective", "SIGMOID")
-        migrated_data.setdefault("rlhf_dpo_ipo_tau", 1000.0)
-        migrated_data.setdefault("rlhf_dpo_adaptive_beta", False)
-        migrated_data.setdefault("rlhf_dpo_timestep_margin_logging", False)
-        migrated_data.setdefault("rlhf_supervised_mix", 0.25)
-        migrated_data.setdefault("rlhf_dpo_validation", False)
+
+        if migrated_data.get("output_model_format") == "SAFETENSORS":
+            training_method = migrated_data.get("training_method")
+            if training_method == "LORA":
+                migrated_data["output_model_format"] = "LEGACY_LORA"
+            elif training_method != "EMBEDDING":
+                migrated_data["output_model_format"] = "LEGACY_SAFETENSORS"
+
         return migrated_data
-
-    def effective_dpo_ref_mode(self) -> DPORefMode:
-        return DPORefMode.EXISTING_ADAPTER if self.lora_model_name else DPORefMode.NEW_ADAPTER
-
-    def dpo_validation_active(self) -> bool:
-        # DPO validation only makes sense inside a DPO run: the paired
-        # chosen/rejected validation pipeline is built only when both flags are
-        # set, so every consumer must gate on both to avoid a mid-run crash.
-        return self.rlhf_enabled and self.rlhf_dpo_validation
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
@@ -1291,17 +1304,6 @@ class TrainConfig(BaseConfig):
         data.append(("lokr_full_matrix", False, bool, False))
         data.append(("lokr_vec_trick", True, bool, False))
 
-        # dpo
-        data.append(("rlhf_enabled", False, bool, False))
-        data.append(("rlhf_dpo_beta", 200.0, float, False))
-        data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
-        data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
-        data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
-        data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
-        data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
-        data.append(("rlhf_supervised_mix", 0.25, float, False))
-        data.append(("rlhf_dpo_validation", False, bool, False))
-
         # optimizer
         data.append(("optimizer", TrainOptimizerConfig.default_values(), TrainOptimizerConfig, False))
         data.append(("optimizer_defaults", {}, dict[str, TrainOptimizerConfig], False))
@@ -1333,4 +1335,37 @@ class TrainConfig(BaseConfig):
         secrets = SecretsConfig.default_values()
         data.append(("secrets", secrets, SecretsConfig, False))
 
+        data.append(("rlhf_enabled", False, bool, False))
+        data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
+        data.append(("rlhf_dpo_beta", 300.0, float, False))
+        data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
+        data.append(("rlhf_supervised_mix", 0.0, float, False))
+        data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
+        data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
+        data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
+        data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
+        data.append(("rlhf_dpo_validation", False, bool, False))
+        data.append(("rlhf_dpo_validation_percentage", 0.0, float, False))
+        data.append(("rlhf_dpo_patience_enabled", False, bool, False))
+        data.append(("rlhf_dpo_patience_value", 5, int, False))
+        data.append(("rlhf_dpo_save_best", False, bool, False))
+        data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
+        data.append(("rlhf_dpo_beta_gradient_decouple", False, bool, False))
+        data.append(("rlhf_dpo_beta_gradient_reference", None, float, True))
+        data.append(("rlhf_dpo_chosen_reward_anchor", False, bool, False))
+        data.append(("rlhf_dpo_chosen_reward_anchor_weight", 0.0, float, False))
+        data.append(("rlhf_dpo_chosen_reward_target", 0.05, float, False))
+        data.append(("rlhf_dpo_chosen_reward_floor", 0.0, float, False))
+        data.append(("rlhf_dpo_chosen_reward_floor_multiplier", 4.0, float, False))
+        data.append(("rlhf_dpo_chosen_reward_sharpness", 20.0, float, False))
+        data.append(("rlhf_dpo_anchored_chosen_target", 0.02, float, False))
+        data.append(("rlhf_dpo_anchored_rejected_target", -0.05, float, False))
+        data.append(("rlhf_dpo_anchored_margin_target", 0.10, float, False))
+        data.append(("rlhf_dpo_anchored_chosen_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_anchored_rejected_weight", 0.5, float, False))
+        data.append(("rlhf_dpo_anchored_margin_weight", 0.25, float, False))
+        data.append(("rlhf_dpo_anchored_huber_delta", 0.05, float, False))
         return TrainConfig(data)
+
+    def effective_dpo_ref_mode(self):
+        return getattr(self, "rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER)

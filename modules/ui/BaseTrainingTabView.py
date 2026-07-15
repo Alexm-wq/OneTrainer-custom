@@ -9,6 +9,8 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.ui.validation_helpers import check_range, validate_resolution
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
 
 
 class BaseTrainingTabView(ABC):
@@ -66,7 +68,160 @@ class BaseTrainingTabView(ABC):
             self.__setup_ernie_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_ideogram():
             self.__setup_ideogram_ui(column_0, column_1, column_2, controller, ui_state)
+        self.__create_rlhf_frame(column_2, 99, controller, ui_state)
 
+
+    def __create_rlhf_frame(self, master, row, controller, ui_state):
+        frame = self.components.section_frame(master, row)
+
+        self.components.label(
+            frame,
+            0,
+            0,
+            "RLHF / DPO",
+            tooltip="Paired chosen/rejected preference training.",
+        )
+        self.components.switch(frame, 0, 1, ui_state, "rlhf_enabled")
+
+        self.components.label(frame, 1, 0, "Objective")
+        self.components.options_kv(
+            frame,
+            1,
+            1,
+            [
+                ("DPO / Sigmoid", DPOObjective.SIGMOID),
+                ("IPO", DPOObjective.IPO),
+            ],
+            ui_state,
+            "rlhf_dpo_objective",
+        )
+
+        self.components.label(
+            frame,
+            2,
+            0,
+            "Reference",
+            tooltip=(
+                "New Adapter uses the base model as reference. Existing Adapter "
+                "captures and saves a fixed adapter snapshot before training."
+            ),
+        )
+        self.components.options_kv(
+            frame,
+            2,
+            1,
+            [
+                ("Base / New Adapter", DPORefMode.NEW_ADAPTER),
+                ("Fixed Existing Adapter", DPORefMode.EXISTING_ADAPTER),
+            ],
+            ui_state,
+            "rlhf_dpo_ref_mode",
+        )
+
+        self.components.label(frame, 3, 0, "Beta")
+        self.components.entry(frame, 3, 1, ui_state, "rlhf_dpo_beta")
+
+        self.components.label(
+            frame,
+            4,
+            0,
+            "Beta Gradient Decouple",
+            tooltip="Separates sigmoid saturation from backward gradient scale.",
+        )
+        self.components.switch(
+            frame,
+            4,
+            1,
+            ui_state,
+            "rlhf_dpo_beta_gradient_decouple",
+        )
+
+        self.components.label(frame, 5, 0, "Beta Gradient Reference")
+        self.components.entry(
+            frame,
+            5,
+            1,
+            ui_state,
+            "rlhf_dpo_beta_gradient_reference",
+        )
+
+        self.components.label(frame, 6, 0, "Label Smoothing")
+        self.components.entry(
+            frame,
+            6,
+            1,
+            ui_state,
+            "rlhf_dpo_label_smoothing",
+        )
+
+        self.components.label(frame, 7, 0, "Supervised Mix")
+        self.components.entry(frame, 7, 1, ui_state, "rlhf_supervised_mix")
+
+        self.components.label(frame, 8, 0, "IPO Tau")
+        self.components.entry(frame, 8, 1, ui_state, "rlhf_dpo_ipo_tau")
+
+        self.components.label(
+            frame,
+            9,
+            0,
+            "Chosen Reward Anchor",
+            tooltip=(
+                "Adds chosen-side protection after the normal two-sided DPO "
+                "objective. It does not replace or detach the rejected term."
+            ),
+        )
+        self.components.switch(
+            frame,
+            9,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_anchor",
+        )
+
+        self.components.label(frame, 10, 0, "Anchor Weight")
+        self.components.entry(
+            frame,
+            10,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_anchor_weight",
+        )
+
+        self.components.label(frame, 11, 0, "Chosen Target")
+        self.components.entry(
+            frame,
+            11,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_target",
+        )
+
+        self.components.label(frame, 12, 0, "Chosen Floor")
+        self.components.entry(
+            frame,
+            12,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_floor",
+        )
+
+        self.components.label(frame, 13, 0, "Floor Multiplier")
+        self.components.entry(
+            frame,
+            13,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_floor_multiplier",
+        )
+
+        self.components.label(frame, 14, 0, "Anchor Sharpness")
+        self.components.entry(
+            frame,
+            14,
+            1,
+            ui_state,
+            "rlhf_dpo_chosen_reward_sharpness",
+        )
     def __setup_stable_diffusion_ui(self, column_0, column_1, column_2, controller, ui_state):
         self.__create_base_frame(column_0, 0, controller, ui_state)
         self.__create_text_encoder_frame(column_0, 1, ui_state, supports_layer_offloading=False)

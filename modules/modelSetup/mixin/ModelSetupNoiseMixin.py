@@ -5,7 +5,6 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 
 import torch
-import torch.distributions
 from torch import Generator, Tensor
 
 
@@ -15,7 +14,55 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         super().__init__()
 
         self.__weights = None
+        self.__weights_key = None
         self._offset_noise_psi_schedule: Tensor | None = None
+
+    @staticmethod
+    def _sample_beta_with_generator(
+            alpha: float,
+            beta: float,
+            batch_size: int,
+            generator: Generator,
+    ) -> Tensor:
+        """Sample Beta(alpha, beta) without touching the global RNG.
+
+        torch.distributions.Beta.sample() has no generator argument. DPO runs
+        the reference and policy forwards separately and relies on recreating
+        the same timestep/noise stream, so consuming global RNG here corrupts
+        the reward comparison. A beta variate is the normalized ratio of two
+        independent gamma variates; torch._standard_gamma accepts Generator.
+        """
+        device = generator.device
+        alpha_tensor = torch.full(
+            (batch_size,),
+            float(alpha),
+            dtype=torch.float32,
+            device=device,
+        )
+        beta_tensor = torch.full(
+            (batch_size,),
+            float(beta),
+            dtype=torch.float32,
+            device=device,
+        )
+
+        try:
+            x = torch._standard_gamma(alpha_tensor, generator=generator)
+            y = torch._standard_gamma(beta_tensor, generator=generator)
+        except TypeError as exc:
+            raise RuntimeError(
+                "This PyTorch build does not support generator-aware gamma "
+                "sampling required for deterministic arbitrary Beta timesteps"
+            ) from exc
+
+        denominator = x + y
+        # Extremely small concentrations can underflow both samples. Preserve
+        # a finite endpoint value rather than producing NaN.
+        return torch.where(
+            denominator > 0,
+            x / denominator.clamp_min(torch.finfo(x.dtype).tiny),
+            torch.zeros_like(denominator),
+        )
 
     def _compute_and_cache_offset_noise_psi_schedule(self, betas: Tensor) -> Tensor:
         """
@@ -76,14 +123,10 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
 
     def _apply_dpo_paired_rng(self, tensor: Tensor) -> Tensor:
-        # During a batched DPO forward the batch is [chosen; rejected] along
-        # dim 0, and each pair must be compared at the same timestep with the
-        # same noise. Sequential RNG draws would give rejected[i] draw B+i
-        # instead of draw i, so the second half is overwritten with the first.
-        # calculate_dpo_loss sets _dpo_paired_half to B around its batched
-        # predict() calls; the batch dict itself is not visible here.
+        # During a DPO batched forward, batch layout is [chosen; rejected].
+        # The rejected half must use the same timestep/noise as the matching chosen row.
         half = getattr(self, "_dpo_paired_half", None)
-        if half is not None and tensor.shape[0] == 2 * half:
+        if half is not None and isinstance(tensor, torch.Tensor) and tensor.ndim > 0 and tensor.shape[0] == 2 * half:
             tensor[half:] = tensor[:half]
         return tensor
 
@@ -245,16 +288,15 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                         timestep = u * num_timestep + min_timestep
 
                     else:
-                        # Fallback for arbitrary Beta values (Beta != 1 and Alpha != 1).
-                        # PyTorch's Beta distribution does not accept a generator directly.
-                        # This path is mathematically correct for distribution shape, but
-                        # technically bypasses the generator seed (uses global device seed).
-                        # Since B-TTDM requires Beta=1, this path is rarely taken for this specific paper.
-                        m = torch.distributions.Beta(
-                            torch.tensor(alpha, device=generator.device),
-                            torch.tensor(beta, device=generator.device)
+                        # Arbitrary Beta values must still use the supplied
+                        # generator so reference and policy DPO forwards see
+                        # exactly the same timesteps.
+                        u = self._sample_beta_with_generator(
+                            alpha=alpha,
+                            beta=beta,
+                            batch_size=batch_size,
+                            generator=generator,
                         )
-                        u = m.sample((batch_size,))
                         timestep = u * num_timestep + min_timestep
 
                 timestep = num_train_timesteps * shift * timestep / ((shift - 1) * timestep + num_train_timesteps)
@@ -271,33 +313,62 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
                 linspace_derivative = torch.linspace(0, 1, num_timestep)
                 linspace_derivative = shift / (shift + linspace_derivative - (linspace_derivative * shift)).pow(2)
 
-                # continuous implementations
-                if config.timestep_distribution == TimestepDistribution.COS_MAP:
-                    if self.__weights is None:
-                        weights = 2.0 / (math.pi - 2.0 * math.pi * linspace + 2.0 * math.pi * linspace ** 2.0)
+                weights_key = (
+                    config.timestep_distribution,
+                    int(num_timestep),
+                    float(shift),
+                    float(config.noising_bias),
+                    float(config.noising_weight),
+                    str(generator.device),
+                )
+                if self.__weights is None or self.__weights_key != weights_key:
+                    if config.timestep_distribution == TimestepDistribution.COS_MAP:
+                        weights = 2.0 / (
+                            math.pi
+                            - 2.0 * math.pi * linspace
+                            + 2.0 * math.pi * linspace ** 2.0
+                        )
                         weights *= linspace_derivative
-                        self.__weights = weights.to(device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.SIGMOID:
-                    if self.__weights is None:
+                    elif config.timestep_distribution == TimestepDistribution.SIGMOID:
                         bias = config.noising_bias + 0.5
                         weight = config.noising_weight
 
-                        weights = linspace / (shift - shift * linspace + linspace)
-                        weights = 1 / (1 + torch.exp(-weight * (weights - bias)))  # Sigmoid
+                        weights = linspace / (
+                            shift - shift * linspace + linspace
+                        )
+                        weights = 1 / (
+                            1 + torch.exp(-weight * (weights - bias))
+                        )
                         weights *= linspace_derivative
-                        self.__weights = weights.to(device=generator.device)
-                elif config.timestep_distribution == TimestepDistribution.INVERTED_PARABOLA:
-                    if self.__weights is None:
+                    elif config.timestep_distribution == TimestepDistribution.INVERTED_PARABOLA:
                         bias = config.noising_bias + 0.5
                         weight = config.noising_weight
 
-                        weights = torch.clamp(-weight * ((linspace - bias) ** 2) + 2, min=0.0)
+                        weights = torch.clamp(
+                            -weight * ((linspace - bias) ** 2) + 2,
+                            min=0.0,
+                        )
                         weights *= linspace_derivative
-                        self.__weights = weights.to(device=generator.device)
-                samples = torch.multinomial(self.__weights, num_samples=batch_size, replacement=True, generator=generator) + min_timestep
+                    else:
+                        raise ValueError(
+                            "Unsupported weighted timestep distribution: "
+                            f"{config.timestep_distribution}"
+                        )
+
+                    self.__weights = weights.to(device=generator.device)
+                    self.__weights_key = weights_key
+
+                samples = torch.multinomial(
+                    self.__weights,
+                    num_samples=batch_size,
+                    replacement=True,
+                    generator=generator,
+                ) + min_timestep
                 timestep = samples.to(dtype=torch.long, device=generator.device)
 
-            return self._apply_dpo_paired_rng(timestep.int())
+            timestep = timestep.to(dtype=torch.long, device=generator.device)
+        timestep = timestep.clamp(min=min_timestep, max=max_timestep - 1)
+        return self._apply_dpo_paired_rng(timestep)
 
     def _get_timestep_continuous(
             self,
