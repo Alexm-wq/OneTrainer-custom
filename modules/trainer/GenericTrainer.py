@@ -625,6 +625,7 @@ class GenericTrainer(BaseTrainer):
             "chosen_reward",
             "rejected_reward",
             "reward_margin",
+            "accuracy",
             "chosen_term",
             "rejected_term",
             "margin_term",

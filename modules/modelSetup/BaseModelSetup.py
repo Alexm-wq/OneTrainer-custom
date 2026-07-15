@@ -476,12 +476,6 @@ class BaseModelSetup(
             chosen_ratio,
             rejected_ratio,
             margin,
-            chosen_violation,
-            rejected_violation,
-            margin_violation,
-            chosen_term,
-            rejected_term,
-            margin_term,
     ):
         if not multi.is_master():
             return
@@ -502,12 +496,7 @@ class BaseModelSetup(
             "chosen_reward",
             "rejected_reward",
             "reward_margin",
-            "chosen_violation",
-            "rejected_violation",
-            "margin_violation",
-            "chosen_term",
-            "rejected_term",
-            "margin_term",
+            "accuracy",
             "pair_loss",
         ]
 
@@ -583,29 +572,8 @@ class BaseModelSetup(
                     margin,
                     i,
                 ),
-                "chosen_violation": self._dpo_csv_float_value(
-                    chosen_violation,
-                    i,
-                ),
-                "rejected_violation": self._dpo_csv_float_value(
-                    rejected_violation,
-                    i,
-                ),
-                "margin_violation": self._dpo_csv_float_value(
-                    margin_violation,
-                    i,
-                ),
-                "chosen_term": self._dpo_csv_float_value(
-                    chosen_term,
-                    i,
-                ),
-                "rejected_term": self._dpo_csv_float_value(
-                    rejected_term,
-                    i,
-                ),
-                "margin_term": self._dpo_csv_float_value(
-                    margin_term,
-                    i,
+                "accuracy": float(
+                    margin.detach()[i].item() > 0.0
                 ),
                 "pair_loss": self._dpo_csv_float_value(
                     pair_total_loss,
@@ -681,121 +649,10 @@ class BaseModelSetup(
         chosen_reward_floor_loss = None
         chosen_reward_aux_loss = None
         chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
-        anchored_chosen_loss = None
-        anchored_rejected_loss = None
-        anchored_margin_loss = None
-        chosen_violation = None
-        rejected_violation = None
-        margin_violation = None
-        chosen_term_per_pair = None
-        rejected_term_per_pair = None
-        margin_term_per_pair = None
 
         if config.rlhf_dpo_objective == DPOObjective.IPO:
             dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
             loss = dpo_loss
-        elif config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
-            chosen_target = float(
-                getattr(config, "rlhf_dpo_anchored_chosen_target", 0.02)
-            )
-            rejected_target = float(
-                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)
-            )
-            margin_target = float(
-                getattr(config, "rlhf_dpo_anchored_margin_target", 0.10)
-            )
-
-            chosen_weight = max(
-                float(
-                    getattr(
-                        config,
-                        "rlhf_dpo_anchored_chosen_weight",
-                        1.0,
-                    )
-                ),
-                0.0,
-            )
-            rejected_weight = max(
-                float(
-                    getattr(
-                        config,
-                        "rlhf_dpo_anchored_rejected_weight",
-                        0.5,
-                    )
-                ),
-                0.0,
-            )
-            margin_weight = max(
-                float(
-                    getattr(
-                        config,
-                        "rlhf_dpo_anchored_margin_weight",
-                        0.25,
-                    )
-                ),
-                0.0,
-            )
-            huber_delta = max(
-                float(
-                    getattr(
-                        config,
-                        "rlhf_dpo_anchored_huber_delta",
-                        0.05,
-                    )
-                ),
-                1e-8,
-            )
-
-            chosen_violation = F.relu(chosen_target - chosen_ratio)
-            rejected_violation = F.relu(
-                rejected_ratio - rejected_target
-            )
-            margin_violation = F.relu(margin_target - margin)
-
-            chosen_loss_per_pair = F.smooth_l1_loss(
-                chosen_violation,
-                torch.zeros_like(chosen_violation),
-                beta=huber_delta,
-                reduction="none",
-            )
-            rejected_loss_per_pair = F.smooth_l1_loss(
-                rejected_violation,
-                torch.zeros_like(rejected_violation),
-                beta=huber_delta,
-                reduction="none",
-            )
-            margin_loss_per_pair = F.smooth_l1_loss(
-                margin_violation,
-                torch.zeros_like(margin_violation),
-                beta=huber_delta,
-                reduction="none",
-            )
-
-            chosen_term_per_pair = (
-                chosen_weight * chosen_loss_per_pair
-            )
-            rejected_term_per_pair = (
-                rejected_weight * rejected_loss_per_pair
-            )
-            margin_term_per_pair = (
-                margin_weight * margin_loss_per_pair
-            )
-
-            anchored_pair_loss_proxy = (
-                chosen_term_per_pair
-                + rejected_term_per_pair
-                + margin_term_per_pair
-            )
-
-            # Log weighted contributions so the three component curves sum to
-            # the Anchored Reject objective loss.
-            anchored_chosen_loss = chosen_term_per_pair.mean()
-            anchored_rejected_loss = rejected_term_per_pair.mean()
-            anchored_margin_loss = margin_term_per_pair.mean()
-
-            dpo_loss = anchored_pair_loss_proxy.mean()
-            loss = dpo_loss
-
         else:
             logits = beta * margin
             dpo_loss = -F.logsigmoid(logits).mean()
@@ -825,10 +682,7 @@ class BaseModelSetup(
 
             loss = preference_loss
 
-        if (
-            config.rlhf_dpo_objective != DPOObjective.ANCHORED_REJECT
-            and getattr(config, "rlhf_dpo_chosen_reward_anchor", False)
-        ):
+        if getattr(config, "rlhf_dpo_chosen_reward_anchor", False):
             chosen_anchor_weight = float(getattr(config, "rlhf_dpo_chosen_reward_anchor_weight", 0.0))
             if chosen_anchor_weight > 0:
                 chosen_reward_target = float(getattr(config, "rlhf_dpo_chosen_reward_target", 0.05))
@@ -868,9 +722,7 @@ class BaseModelSetup(
         pair_total_loss = None
 
         try:
-            if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
-                pair_total_loss = anchored_pair_loss_proxy
-            elif config.rlhf_dpo_objective == DPOObjective.IPO:
+            if config.rlhf_dpo_objective == DPOObjective.IPO:
                 pair_total_loss = (
                     margin
                     - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)
@@ -903,12 +755,6 @@ class BaseModelSetup(
                 chosen_ratio=chosen_ratio,
                 rejected_ratio=rejected_ratio,
                 margin=margin,
-                chosen_violation=chosen_violation,
-                rejected_violation=rejected_violation,
-                margin_violation=margin_violation,
-                chosen_term=chosen_term_per_pair,
-                rejected_term=rejected_term_per_pair,
-                margin_term=margin_term_per_pair,
             )
         except Exception as e:
             print(
@@ -922,14 +768,8 @@ class BaseModelSetup(
             "chosen_reward": chosen_ratio.detach().mean().item(),
             "rejected_reward": rejected_ratio.detach().mean().item(),
             "reward_margin": margin.detach().mean().item(),
+            "accuracy": (margin.detach() > 0).float().mean().item(),
         }
-
-        if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
-            self._last_dpo_metrics.update({
-                "chosen_term": anchored_chosen_loss.detach().item(),
-                "rejected_term": anchored_rejected_loss.detach().item(),
-                "margin_term": anchored_margin_loss.detach().item(),
-            })
 
         return loss
 
@@ -998,6 +838,13 @@ class BaseModelSetup(
             )
 
         loaded_groups = None
+
+        if snapshot_path and not os.path.isfile(snapshot_path):
+            raise RuntimeError(
+                "[DPO] resume backup is missing its fixed reference: "
+                f"{snapshot_path}. Refusing to replace it with the resumed "
+                "policy because that changes the DPO objective."
+            )
         if snapshot_path and os.path.isfile(snapshot_path):
             try:
                 payload = torch.load(
@@ -1067,13 +914,14 @@ class BaseModelSetup(
 
         self._dpo_ref_params = snapshot_groups
 
+        if snapshot_path and loaded_groups is None:
+            raise RuntimeError(
+                "[DPO] failed to restore the saved fixed reference from "
+                f"{snapshot_path}. Refusing unsafe DPO resume."
+            )
+
         if loaded_groups is not None:
             print(f"[OT-RLHF] restored fixed DPO reference from {snapshot_path}")
-        elif snapshot_path:
-            print(
-                "[OT-RLHF] backup has no saved DPO reference; using the "
-                "adapter state loaded at resume as the new fixed reference"
-            )
         else:
             print("[OT-RLHF] captured fixed existing-adapter DPO reference")
 

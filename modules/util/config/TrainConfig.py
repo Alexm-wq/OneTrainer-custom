@@ -658,13 +658,6 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_chosen_reward_floor: float
     rlhf_dpo_chosen_reward_floor_multiplier: float
     rlhf_dpo_chosen_reward_sharpness: float
-    rlhf_dpo_anchored_chosen_target: float
-    rlhf_dpo_anchored_rejected_target: float
-    rlhf_dpo_anchored_margin_target: float
-    rlhf_dpo_anchored_chosen_weight: float
-    rlhf_dpo_anchored_rejected_weight: float
-    rlhf_dpo_anchored_margin_weight: float
-    rlhf_dpo_anchored_huber_delta: float
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -1358,13 +1351,6 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_chosen_reward_floor", 0.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_floor_multiplier", 4.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_sharpness", 20.0, float, False))
-        data.append(("rlhf_dpo_anchored_chosen_target", 0.02, float, False))
-        data.append(("rlhf_dpo_anchored_rejected_target", -0.05, float, False))
-        data.append(("rlhf_dpo_anchored_margin_target", 0.10, float, False))
-        data.append(("rlhf_dpo_anchored_chosen_weight", 1.0, float, False))
-        data.append(("rlhf_dpo_anchored_rejected_weight", 0.5, float, False))
-        data.append(("rlhf_dpo_anchored_margin_weight", 0.25, float, False))
-        data.append(("rlhf_dpo_anchored_huber_delta", 0.05, float, False))
         return TrainConfig(data)
 
     def effective_dpo_ref_mode(self):

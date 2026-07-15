@@ -88,7 +88,7 @@ class BaseKrea2Setup(
                 tokens=batch.get("tokens"),
                 tokens_mask=batch.get("tokens_mask"),
                 text_encoder_output=batch.get('text_encoder_hidden_state'),
-                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
+                text_encoder_dropout_probability=(0.0 if self._dpo_paired_half is not None else config.text_encoder.dropout_probability) if not deterministic else None,
             )
             if config.cep_gamma > 0 and not deterministic:
                 text_encoder_output = self._apply_conditional_embedding_perturbation(
