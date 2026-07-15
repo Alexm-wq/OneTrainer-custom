@@ -1,0 +1,187 @@
+diff --cc modules/modelSetup/BaseKrea2Setup.py
+index 37c68fad,f1f5be89..00000000
+--- a/modules/modelSetup/BaseKrea2Setup.py
++++ b/modules/modelSetup/BaseKrea2Setup.py
+@@@ -15,6 -15,7 +15,10 @@@ from modules.util.checkpointing_util im
+  )
+  from modules.util.config.TrainConfig import TrainConfig
+  from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
+++<<<<<<< ours
+++=======
++ from modules.util.enum.TrainingMethod import TrainingMethod
+++>>>>>>> theirs
+  from modules.util.quantization_util import quantize_layers
+  from modules.util.torch_util import torch_gc
+  from modules.util.TrainProgress import TrainProgress
+@@@ -46,17 -47,29 +50,40 @@@ class BaseKrea2Setup
+              model: Krea2Model,
+              config: TrainConfig,
+      ):
+++<<<<<<< ours
+ +        model.transformer_offload_conductor = enable_checkpointing_for_krea2_transformer(model.transformer, config, config.transformer)
+ +        model.text_encoder_offload_conductor = enable_checkpointing_for_qwen3vl_encoder_layers(model.text_encoder, config, config.text_encoder)
+ +
+ +        model.autocast_context, model.train_dtype = create_autocast_context(
+ +            self.train_device, config.train_dtype, config.enable_autocast_cache)
+++=======
++         if config.gradient_checkpointing.enabled():
++             model.transformer_offload_conductor = \
++                 enable_checkpointing_for_krea2_transformer(model.transformer, config)
++             if model.text_encoder is not None:
++                 model.text_encoder_offload_conductor = \
++                     enable_checkpointing_for_qwen3vl_encoder_layers(model.text_encoder, config)
++ 
++         model.autocast_context, model.train_dtype = create_autocast_context(self.train_device, config.train_dtype, [
++             config.weight_dtypes().transformer,
++             config.weight_dtypes().text_encoder,
++             config.weight_dtypes().vae,
++             config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
++         ], config.enable_autocast_cache)
+++>>>>>>> theirs
+  
+          model.text_encoder_autocast_context, model.text_encoder_train_dtype = \
+              disable_fp16_autocast_context(
+                  self.train_device,
+                  config.train_dtype,
+                  config.fallback_train_dtype,
+++<<<<<<< ours
+++=======
++                 [
++                     config.weight_dtypes().text_encoder,
++                     config.weight_dtypes().lora if config.training_method == TrainingMethod.LORA else None,
++                 ],
+++>>>>>>> theirs
+                  config.enable_autocast_cache,
+              )
+  
+@@@ -87,13 -100,10 +114,20 @@@
+                  rand=rand,
+                  tokens=batch.get("tokens"),
+                  tokens_mask=batch.get("tokens_mask"),
+++<<<<<<< ours
+ +                text_encoder_output=batch.get('text_encoder_hidden_state'),
+ +                text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
+ +            )
+ +            if config.cep_gamma > 0 and not deterministic:
+ +                text_encoder_output = self._apply_conditional_embedding_perturbation(
+ +                    text_encoder_output, config.cep_gamma, generator
+ +                )
+++=======
++                 text_encoder_output=batch['text_encoder_hidden_state'] \
++                     if 'text_encoder_hidden_state' in batch and not config.train_text_encoder_or_embedding() else None,
++                 text_encoder_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
++             )
+++>>>>>>> theirs
+  
+              latent_image = batch['latent_image']
+              scaled_latent_image = model.scale_latents(latent_image)
+@@@ -166,6 -176,31 +200,34 @@@
+  
+          return model_output_data
+  
+++<<<<<<< ours
+++=======
++     def rlhf_logp_per_sample(
++             self,
++             model: Krea2Model,
++             batch: dict,
++             data: dict,
++             config: TrainConfig,
++     ) -> Tensor:
++         # Krea-native DPO likelihood proxy.
++         #
++         # Normal Krea training uses _flow_matching_losses(...).mean().
++         # DPO needs the same native loss path before the batch mean, so the
++         # preference objective uses one negative per-sample loss as its logp
++         # proxy.
++         #
++         # This keeps DPO in Krea's own units: MSE/MAE/log-cosh/Huber stack,
++         # loss_scaler, per-sample loss_weight, mask handling, and sigma
++         # timestep weighting all match normal Krea training.
++         return -self._flow_matching_losses(
++             batch=batch,
++             data=data,
++             config=config,
++             train_device=self.train_device,
++             sigmas=model.noise_scheduler.sigmas,
++         )
++ 
+++>>>>>>> theirs
+      def calculate_loss(
+              self,
+              model: Krea2Model,
+diff --cc modules/ui/BaseConceptWindowView.py
+index 0b94e50d,37a5be78..00000000
+--- a/modules/ui/BaseConceptWindowView.py
++++ b/modules/ui/BaseConceptWindowView.py
+@@@ -81,6 -81,10 +81,13 @@@ class BaseConceptWindowView
+          self.components.label(frame, 9, 0, "Loss Weight",
+                           tooltip="The loss multiplyer for this concept.")
+          self.components.entry(frame, 9, 1, ui_state, "loss_weight")
+++<<<<<<< ours
+++=======
++         self.components.label(frame, 100, 0, "DPO Chosen Pattern", tooltip="Chosen/winner pattern relative to concept path. Use one {} placeholder, e.g. winner/{}.png")
++         self.components.entry(frame, 100, 1, ui_state, "dpo_chosen_pattern")
++         self.components.label(frame, 101, 0, "DPO Rejected Pattern", tooltip="Rejected/loser pattern relative to concept path. Use the same {} stem, e.g. loser/{}.png")
++         self.components.entry(frame, 101, 1, ui_state, "dpo_rejected_pattern")
+++>>>>>>> theirs
+  
+      def build_image_augmentation_tab(self, frame, controller, image_ui_state):
+          # header
+diff --cc modules/ui/PySide6TrainUIView.py
+index 4dbd6476,b2f60600..00000000
+--- a/modules/ui/PySide6TrainUIView.py
++++ b/modules/ui/PySide6TrainUIView.py
+@@@ -35,6 -35,8 +35,11 @@@ from modules.util.ui.PySide6UIState imp
+  from PySide6.QtCore import QTimer
+  from PySide6.QtGui import QIcon
+  from PySide6.QtWidgets import QFileDialog, QGridLayout, QMainWindow, QMessageBox, QTabWidget, QWidget
+++<<<<<<< ours
+++=======
++ from modules.ui.RLHFTabController import RLHFTabController
++ from modules.ui.PySide6RLHFTabView import PySide6RLHFTabView
+++>>>>>>> theirs
+  
+  
+  class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
+@@@ -86,7 -88,6 +91,10 @@@
+  
+          self._create_tabs()
+          self.change_training_method(self.controller.train_config.training_method)
+++<<<<<<< ours
+ +        self._update_additional_embeddings_tab(self.controller.train_config.model_type)
+++=======
+++>>>>>>> theirs
+  
+          self._profiling_controller = ProfilingWindowController()
+          self.profiling_window = self._profiling_controller.create_window(self, PySide6ProfilingWindowView)
+@@@ -264,6 -265,8 +272,11 @@@
+  
+          self.training_tab = PySide6TrainingTabView(None, TrainingTabController(self.controller.train_config), self.ui_state)
+          self.tabview.addTab(self.training_tab, "training")
+++<<<<<<< ours
+++=======
++         self.rlhf_tab = PySide6RLHFTabView(None, RLHFTabController(self.controller.train_config), self.ui_state)
++         self.tabview.addTab(self.rlhf_tab, "RLHF")
+++>>>>>>> theirs
+          self._tab_widgets["training"] = self.training_tab
+  
+          sampling_page = self.create_sampling_tab()
+@@@ -330,14 -333,6 +343,17 @@@
+              self.training_tab.refresh_ui()
+          if self.lora_tab:
+              self.lora_tab.refresh_ui()
+++<<<<<<< ours
+ +        self._update_additional_embeddings_tab(model_type)
+ +
+ +    def _update_additional_embeddings_tab(self, model_type: ModelType):
+ +        # additional embeddings only apply to models that support embedding training
+ +        supported = TrainingMethod.EMBEDDING in model_type.supported_training_methods()
+ +        page = self._tab_widgets.get("additional embeddings")
+ +        if page is not None:
+ +            self.tabview.setTabVisible(self.tabview.indexOf(page), supported)
+++=======
+++>>>>>>> theirs
+  
+      def change_training_method(self, training_method: TrainingMethod):
+          if not self.tabview:
