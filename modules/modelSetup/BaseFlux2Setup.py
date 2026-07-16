@@ -92,7 +92,7 @@ class BaseFlux2Setup(
                 text_encoder_output=batch.get('text_encoder_hidden_state'),
                 text_encoder_dropout_probability=(0.0 if self._dpo_paired_half is not None else config.text_encoder.dropout_probability) if not deterministic else None,
             )
-            if config.cep_gamma > 0 and not deterministic:
+            if config.cep_gamma > 0 and not deterministic and self._dpo_paired_half is None:
                 text_encoder_output = self._apply_conditional_embedding_perturbation(
                     text_encoder_output, config.cep_gamma, generator
                 )

@@ -84,6 +84,11 @@ class GenericTrainer(BaseTrainer):
         self.grad_hook_handles = []
         self._dpo_reference_snapshot_path = None
         self._dpo_reference_initialized = False
+        self._resume_integrity_payload = None
+        self._resume_saved_gradient_accumulation_steps = None
+        self._gradient_accumulation_dirty = False
+        self._dpo_metric_sums: dict[str, float] = {}
+        self._dpo_metric_weight = 0.0
 
     def start(self):
         if multi.is_master():
@@ -117,6 +122,7 @@ class GenericTrainer(BaseTrainer):
                     model_names.base_model = last_backup_path
 
                 print(f"Continuing training from backup '{last_backup_path}'...")
+                self.__validate_resume_backup_files(last_backup_path)
             else:
                 print("No backup found, continuing without backup...")
 
@@ -138,6 +144,9 @@ class GenericTrainer(BaseTrainer):
             quantization=self.config.quantization,
         )
         self.model.train_config = self.config
+
+        if last_backup_path:
+            self.__validate_loaded_resume_progress(last_backup_path)
 
         self.callbacks.on_update_status("running model setup")
 
@@ -174,6 +183,144 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+    def __validate_resume_backup_files(self, backup_path: str):
+        optimizer_path = os.path.join(
+            backup_path,
+            "optimizer",
+            "optimizer.pt",
+        )
+        if not os.path.isfile(optimizer_path):
+            raise RuntimeError(
+                "[OT-RESUME] backup is missing optimizer state: "
+                f"{optimizer_path}"
+            )
+
+        args_path = os.path.join(
+            backup_path,
+            "onetrainer_config",
+            "args.json",
+        )
+        saved_ga = None
+        if os.path.isfile(args_path):
+            try:
+                with open(args_path, "r", encoding="utf-8") as handle:
+                    saved_args = json.load(handle)
+                saved_ga = int(
+                    saved_args.get(
+                        "gradient_accumulation_steps",
+                        self.config.gradient_accumulation_steps,
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "[OT-RESUME] failed to read saved training config: "
+                    f"{args_path}"
+                ) from exc
+
+        if saved_ga is None or saved_ga <= 0:
+            saved_ga = int(self.config.gradient_accumulation_steps)
+        self._resume_saved_gradient_accumulation_steps = saved_ga
+
+        current_ga = int(self.config.gradient_accumulation_steps)
+        if (
+            saved_ga != current_ga
+            and os.environ.get("OT_ALLOW_RESUME_GA_CHANGE", "0") != "1"
+        ):
+            raise RuntimeError(
+                "[OT-RESUME] gradient accumulation changed across resume: "
+                f"backup={saved_ga}, current={current_ga}. Exact resume "
+                "requires the same value. Set OT_ALLOW_RESUME_GA_CHANGE=1 "
+                "only if this discontinuity is intentional."
+            )
+
+        integrity_path = os.path.join(
+            backup_path,
+            "onetrainer_resume_integrity.json",
+        )
+        if os.path.isfile(integrity_path):
+            try:
+                with open(integrity_path, "r", encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            except Exception as exc:
+                raise RuntimeError(
+                    "[OT-RESUME] failed to read resume-integrity metadata: "
+                    f"{integrity_path}"
+                ) from exc
+
+            if not bool(payload.get("optimizer_boundary", False)):
+                raise RuntimeError(
+                    "[OT-RESUME] backup was not written at a completed "
+                    "optimizer/gradient-accumulation boundary."
+                )
+            self._resume_integrity_payload = payload
+        else:
+            self._resume_integrity_payload = None
+            print(
+                "[OT-RESUME] legacy backup has no resume-integrity marker; "
+                "the loaded global step will be checked against its saved GA."
+            )
+
+        ref_mode = str(self.config.effective_dpo_ref_mode())
+        if (
+            self.config.rlhf_enabled
+            and ref_mode == "EXISTING_ADAPTER"
+        ):
+            reference_path = os.path.join(
+                backup_path,
+                "onetrainer_dpo_reference.pt",
+            )
+            if not os.path.isfile(reference_path):
+                raise RuntimeError(
+                    "[OT-RESUME] DPO backup is missing its fixed reference: "
+                    f"{reference_path}"
+                )
+
+    def __validate_loaded_resume_progress(self, backup_path: str):
+        global_step = int(self.model.train_progress.global_step)
+        saved_ga = int(
+            self._resume_saved_gradient_accumulation_steps
+            or self.config.gradient_accumulation_steps
+        )
+
+        payload = self._resume_integrity_payload
+        if payload is not None:
+            saved_step = int(payload.get("global_step", -1))
+            if saved_step != global_step:
+                raise RuntimeError(
+                    "[OT-RESUME] backup progress does not match its integrity "
+                    f"marker: model={global_step}, marker={saved_step}"
+                )
+        elif saved_ga > 1 and global_step % saved_ga != 0:
+            raise RuntimeError(
+                "[OT-RESUME] legacy backup was captured inside a gradient-"
+                "accumulation window: "
+                f"global_step={global_step}, saved_GA={saved_ga}. Its in-flight "
+                "gradients were never stored, so resuming it is unsafe."
+            )
+
+    def __write_resume_integrity(
+            self,
+            backup_path: str,
+            train_progress: TrainProgress,
+    ):
+        payload = {
+            "version": 1,
+            "global_step": int(train_progress.global_step),
+            "gradient_accumulation_steps": int(
+                self.config.gradient_accumulation_steps
+            ),
+            "optimizer_boundary": True,
+            "rlhf_enabled": bool(self.config.rlhf_enabled),
+            "dpo_ref_mode": str(self.config.effective_dpo_ref_mode()),
+        }
+        path = os.path.join(
+            backup_path,
+            "onetrainer_resume_integrity.json",
+        )
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
@@ -443,6 +590,12 @@ class GenericTrainer(BaseTrainer):
             shutil.copy2(self.config.sample_definition_file_name, samples_path)
 
     def __backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        if self._gradient_accumulation_dirty:
+            raise RuntimeError(
+                "[OT-RESUME] refusing to write a backup inside an unfinished "
+                "gradient-accumulation window."
+            )
+
         torch_gc()
 
         self.callbacks.on_update_status("Creating backup")
@@ -471,6 +624,10 @@ class GenericTrainer(BaseTrainer):
             self.model_setup.save_dpo_reference(
                 os.path.join(backup_path, "onetrainer_dpo_reference.pt")
             )
+            self.__write_resume_integrity(
+                backup_path,
+                train_progress,
+            )
         except Exception:
             traceback.print_exc()
             print("Could not save backup. Check your disk space!")
@@ -493,6 +650,12 @@ class GenericTrainer(BaseTrainer):
         torch_gc()
 
     def __save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
+        if self._gradient_accumulation_dirty:
+            raise RuntimeError(
+                "[OT-TRAIN] refusing to save inside an unfinished "
+                "gradient-accumulation window."
+            )
+
         torch_gc()
 
         self.callbacks.on_update_status("Saving")
@@ -626,10 +789,42 @@ class GenericTrainer(BaseTrainer):
             "rejected_reward",
             "reward_margin",
             "accuracy",
-            "chosen_term",
-            "rejected_term",
-            "margin_term",
         }
+
+    def __accumulate_dpo_metrics(
+            self,
+            metrics: dict,
+            pair_count: int,
+    ):
+        weight = float(pair_count)
+        if weight <= 0:
+            return
+
+        for name, value in metrics.items():
+            if (
+                name in self.__dpo_tensorboard_metric_names()
+                and isinstance(value, (int, float))
+            ):
+                self._dpo_metric_sums[name] = (
+                    self._dpo_metric_sums.get(name, 0.0)
+                    + float(value) * weight
+                )
+        self._dpo_metric_weight += weight
+
+    def __flush_dpo_tensorboard_metrics(self, global_step: int):
+        if self._dpo_metric_weight <= 0:
+            return
+
+        if hasattr(self, "tensorboard"):
+            for name, total in self._dpo_metric_sums.items():
+                self.tensorboard.add_scalar(
+                    f"dpo/{name}",
+                    total / self._dpo_metric_weight,
+                    global_step,
+                )
+
+        self._dpo_metric_sums.clear()
+        self._dpo_metric_weight = 0.0
 
     def __batch_len(self, batch: dict) -> int:
         preferred_keys = (
@@ -819,10 +1014,10 @@ class GenericTrainer(BaseTrainer):
             add_loss(dpo_loss, len(dpo_indices))
 
             dpo_metrics = self.model_setup.get_last_dpo_metrics()
-            if hasattr(self, "tensorboard"):
-                for name, value in dpo_metrics.items():
-                    if isinstance(value, (int, float)) and name in self.__dpo_tensorboard_metric_names():
-                        self.tensorboard.add_scalar(f"dpo/{name}", float(value), train_progress.global_step)
+            self.__accumulate_dpo_metrics(
+                dpo_metrics,
+                len(dpo_indices),
+            )
 
         if loss_sum is None:
             return self.__calculate_standard_only_training_loss(batch, train_progress)
@@ -1234,6 +1429,7 @@ class GenericTrainer(BaseTrainer):
                         raise
 
                     loss = loss / self.config.gradient_accumulation_steps
+                    self._gradient_accumulation_dirty = True
                     if scaler:
                         scaler.scale(loss).backward()
                     else:
@@ -1267,6 +1463,10 @@ class GenericTrainer(BaseTrainer):
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
                         has_gradient = False
+                        self._gradient_accumulation_dirty = False
+                        self.__flush_dpo_tensorboard_metrics(
+                            train_progress.global_step
+                        )
 
                         if multi.is_master():
                             self.model_setup.report_to_tensorboard(
@@ -1312,14 +1512,30 @@ class GenericTrainer(BaseTrainer):
                 train_progress.next_step(self.config.batch_size)
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
-                if self.commands.get_stop_command():
+                if (
+                    self.commands.get_stop_command()
+                    and not has_gradient
+                ):
                     return
 
             train_progress.next_epoch()
             self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
 
-            if self.commands.get_stop_command():
+            if (
+                self.commands.get_stop_command()
+                and not has_gradient
+            ):
                 return
+
+        if self._gradient_accumulation_dirty:
+            self.model.optimizer.zero_grad(set_to_none=True)
+            self._gradient_accumulation_dirty = False
+            self._dpo_metric_sums.clear()
+            self._dpo_metric_weight = 0.0
+            print(
+                "[OT-TRAIN] discarded an incomplete final gradient-"
+                "accumulation window; no resumable backup was written for it."
+            )
 
     def end(self):
         if self.one_step_trained:

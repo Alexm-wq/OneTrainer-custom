@@ -213,12 +213,20 @@ class BaseFluxSetup(
                     if 'text_encoder_1_pooled_state' in batch and not config.train_text_encoder_or_embedding() else None,
                 text_encoder_2_output=batch['text_encoder_2_hidden_state'] \
                     if 'text_encoder_2_hidden_state' in batch and not config.train_text_encoder_2_or_embedding() else None,
-                text_encoder_1_dropout_probability=config.text_encoder.dropout_probability if not deterministic else None,
-                text_encoder_2_dropout_probability=config.text_encoder_2.dropout_probability if not deterministic else None,
+                text_encoder_1_dropout_probability=(
+                    0.0
+                    if self._dpo_paired_half is not None
+                    else config.text_encoder.dropout_probability
+                ) if not deterministic else None,
+                text_encoder_2_dropout_probability=(
+                    0.0
+                    if self._dpo_paired_half is not None
+                    else config.text_encoder_2.dropout_probability
+                ) if not deterministic else None,
                 apply_attention_mask=config.transformer.attention_mask,
             )
 
-            if config.cep_gamma > 0 and not deterministic:
+            if config.cep_gamma > 0 and not deterministic and self._dpo_paired_half is None:
                 text_encoder_output = self._apply_conditional_embedding_perturbation(
                     text_encoder_output, config.cep_gamma, generator
                 )
