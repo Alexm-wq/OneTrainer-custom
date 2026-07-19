@@ -223,7 +223,16 @@ class BaseFieldValidator(ABC):
                 v = int(value)
             elif declared_type is float:
                 v = float(value)
-                if v < 0:
+
+                # Reward targets are signed relative to the reference model.
+                signed_float_fields = {
+                    "rlhf_dpo_chosen_reward_target",
+                    "rlhf_dpo_chosen_reward_floor",
+                    "rlhf_dpo_anchored_chosen_target",
+                    "rlhf_dpo_anchored_rejected_target",
+                }
+
+                if v < 0 and self.var_name not in signed_float_fields:
                     return "Value must be non-negative"
             elif declared_type is bool:
                 if value.lower() not in ("true", "false", "0", "1"):

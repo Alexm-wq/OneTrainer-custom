@@ -1,5 +1,6 @@
 import os
 import csv
+import json
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
@@ -41,6 +42,14 @@ class BaseModelSetup(
         self._last_dpo_metrics = None
         self._dpo_paired_half = None
         self._dpo_runtime_beta = None
+        # Previous per-pair rewards are kept only for the current process so the
+        # separate bad-pair CSV can detect sudden wrong-direction jumps.
+        self._dpo_bad_pair_previous_rewards: dict[str, tuple[float, float, int]] = {}
+        # Hard-pair curriculum state is committed only after a successful
+        # optimizer step. Pending observations belong to the current gradient-
+        # accumulation window and are never written into a backup.
+        self._dpo_curriculum_state: dict[str, dict[str, float | int]] = {}
+        self._dpo_curriculum_pending: dict[str, dict[str, float | int]] = {}
         self.frozen_parameters = {}
 
     @abstractmethod
@@ -149,6 +158,293 @@ class BaseModelSetup(
             stats = model.optimizer.kourkoutas_helper.last_beta2_stats
             if stats:
                 tensorboard.add_scalar("kourkoutas/beta2_mean", stats['mean'], model.train_progress.global_step)
+
+    @staticmethod
+    def _dpo_hard_pair_curriculum_enabled(config: TrainConfig) -> bool:
+        return bool(
+            getattr(config, "rlhf_dpo_hard_pair_curriculum", False)
+            and getattr(config, "rlhf_dpo_objective", None)
+            == DPOObjective.ANCHORED_REJECT
+        )
+
+    @staticmethod
+    def _dpo_curriculum_settings(config: TrainConfig) -> dict[str, float]:
+        ema_decay = float(
+            getattr(config, "rlhf_dpo_hard_pair_curriculum_ema", 0.9)
+        )
+        minimum_weight = float(
+            getattr(config, "rlhf_dpo_hard_pair_curriculum_min_weight", 0.1)
+        )
+        full_margin = float(
+            getattr(config, "rlhf_dpo_hard_pair_curriculum_full_margin", 0.05)
+        )
+        margin_target = float(
+            getattr(config, "rlhf_dpo_anchored_margin_target", 0.05)
+        )
+        margin_weight = float(
+            getattr(config, "rlhf_dpo_anchored_margin_weight", 0.5)
+        )
+        wrong_order_weight = float(
+            getattr(config, "rlhf_dpo_anchored_wrong_order_weight", 0.5)
+        )
+
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError(
+                "Hard-Pair Curriculum EMA must satisfy 0 <= EMA < 1, "
+                f"got {ema_decay}"
+            )
+        if not 0.0 <= minimum_weight <= 1.0:
+            raise ValueError(
+                "Hard-Pair Curriculum Minimum Weight must satisfy "
+                f"0 <= weight <= 1, got {minimum_weight}"
+            )
+        if full_margin <= 0.0:
+            raise ValueError(
+                "Hard-Pair Curriculum Full Margin must be > 0, "
+                f"got {full_margin}"
+            )
+        if margin_target < 0.0:
+            raise ValueError(
+                "Anchored Reject Margin Target must be >= 0, "
+                f"got {margin_target}"
+            )
+        if margin_weight < 0.0:
+            raise ValueError(
+                "Anchored Reject Margin Weight must be >= 0, "
+                f"got {margin_weight}"
+            )
+        if wrong_order_weight < 0.0:
+            raise ValueError(
+                "Anchored Reject Wrong-Order Weight must be >= 0, "
+                f"got {wrong_order_weight}"
+            )
+
+        world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size != 1:
+            raise RuntimeError(
+                "Hard-Pair Curriculum currently requires single-GPU training. "
+                "Per-pair EMA state cannot be resumed exactly across multiple "
+                "ranks with OneTrainer's master-only backup path."
+            )
+
+        return {
+            "ema_decay": ema_decay,
+            "minimum_weight": minimum_weight,
+            "full_margin": full_margin,
+            "margin_target": margin_target,
+            "margin_weight": margin_weight,
+            "wrong_order_weight": wrong_order_weight,
+        }
+
+    def _dpo_curriculum_pair_key(self, batch: dict, index: int) -> str:
+        pair_key = str(
+            self._dpo_csv_batch_value(batch, ("dpo_pair_key",), index)
+            or ""
+        ).strip()
+        if pair_key:
+            return pair_key
+
+        chosen_path = str(
+            self._dpo_csv_batch_value(
+                batch,
+                (
+                    "image_path",
+                    "chosen_image_path",
+                    "chosen_source_path",
+                    "chosen_image_path_raw",
+                ),
+                index,
+            )
+            or ""
+        ).strip()
+        rejected_path = str(
+            self._dpo_csv_batch_value(
+                batch,
+                (
+                    "image_path_rejected",
+                    "rejected_image_path",
+                    "rejected_source_path",
+                    "rejected_image_path_raw",
+                ),
+                index,
+            )
+            or ""
+        ).strip()
+
+        if chosen_path or rejected_path:
+            return f"chosen={chosen_path}\nrejected={rejected_path}"
+
+        raise RuntimeError(
+            "Hard-Pair Curriculum requires a stable dpo_pair_key or chosen/"
+            "rejected image paths for every pair. None were present in the batch."
+        )
+
+    def _stage_dpo_curriculum_observations(
+            self,
+            batch: dict,
+            config: TrainConfig,
+            margin: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        settings = self._dpo_curriculum_settings(config)
+        ema_decay = settings["ema_decay"]
+        minimum_weight = settings["minimum_weight"]
+        full_margin = settings["full_margin"]
+
+        detached_margin = margin.detach().float().reshape(-1)
+        weights: list[float] = []
+        margin_emas: list[float] = []
+        observations: list[float] = []
+
+        for index, current_tensor in enumerate(detached_margin):
+            pair_key = self._dpo_curriculum_pair_key(batch, index)
+            current_margin = float(current_tensor.cpu().item())
+
+            previous = self._dpo_curriculum_pending.get(pair_key)
+            if previous is None:
+                previous = self._dpo_curriculum_state.get(pair_key)
+
+            if previous is None:
+                margin_ema = current_margin
+                count = 1
+            else:
+                old_ema = float(previous["margin_ema"])
+                count = int(previous["observations"]) + 1
+                margin_ema = (
+                    ema_decay * old_ema
+                    + (1.0 - ema_decay) * current_margin
+                )
+
+            self._dpo_curriculum_pending[pair_key] = {
+                "margin_ema": margin_ema,
+                "observations": count,
+            }
+
+            progress = max(0.0, min(1.0, margin_ema / full_margin))
+            smooth_progress = progress * progress * (3.0 - 2.0 * progress)
+            weight = minimum_weight + (1.0 - minimum_weight) * smooth_progress
+
+            weights.append(weight)
+            margin_emas.append(margin_ema)
+            observations.append(float(count))
+
+        return (
+            torch.tensor(weights, device=margin.device, dtype=margin.dtype),
+            torch.tensor(
+                margin_emas,
+                device=margin.device,
+                dtype=margin.dtype,
+            ),
+            torch.tensor(
+                observations,
+                device=margin.device,
+                dtype=margin.dtype,
+            ),
+        )
+
+    def commit_dpo_curriculum_state(self):
+        if not self._dpo_curriculum_pending:
+            return
+        self._dpo_curriculum_state.update(self._dpo_curriculum_pending)
+        self._dpo_curriculum_pending.clear()
+
+    def discard_dpo_curriculum_pending(self):
+        self._dpo_curriculum_pending.clear()
+
+    def save_dpo_curriculum_state(self, path: str, config: TrainConfig):
+        if not self._dpo_hard_pair_curriculum_enabled(config):
+            return
+        if self._dpo_curriculum_pending:
+            raise RuntimeError(
+                "Refusing to save Hard-Pair Curriculum state with uncommitted "
+                "gradient-accumulation observations."
+            )
+
+        payload = {
+            "version": 2,
+            "settings": self._dpo_curriculum_settings(config),
+            "pairs": {
+                key: {
+                    "margin_ema": float(value["margin_ema"]),
+                    "observations": int(value["observations"]),
+                }
+                for key, value in sorted(self._dpo_curriculum_state.items())
+            },
+        }
+        temp_path = f"{path}.tmp"
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_path, path)
+
+    def load_dpo_curriculum_state(self, path: str, config: TrainConfig):
+        self._dpo_curriculum_state.clear()
+        self._dpo_curriculum_pending.clear()
+        if not self._dpo_hard_pair_curriculum_enabled(config):
+            return
+        if not os.path.isfile(path):
+            raise RuntimeError(
+                "Hard-Pair Curriculum is enabled, but the resume backup is "
+                f"missing its state file: {path}"
+            )
+
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        state_version = int(payload.get("version", -1))
+        if state_version not in (1, 2):
+            raise RuntimeError(
+                "Unsupported Hard-Pair Curriculum state version: "
+                f"{payload.get('version')}"
+            )
+
+        expected = self._dpo_curriculum_settings(config)
+        saved = payload.get("settings", {})
+        settings_to_check = (
+            ("ema_decay", "minimum_weight", "full_margin")
+            if state_version == 1
+            else tuple(expected.keys())
+        )
+        for name in settings_to_check:
+            expected_value = expected[name]
+            if name not in saved or abs(float(saved[name]) - expected_value) > 1e-12:
+                raise RuntimeError(
+                    "Hard-Pair Curriculum settings changed across resume: "
+                    f"{name}: backup={saved.get(name)!r}, current={expected_value!r}. "
+                    "Exact resume requires identical curriculum settings."
+                )
+        if state_version == 1:
+            print(
+                "[OT-DPO-CURRICULUM] Loading legacy v1 EMA state. Pairwise "
+                "margin penalties use the current configuration; backups "
+                "created after this point will use strict v2 settings."
+            )
+
+        pairs = payload.get("pairs", {})
+        if not isinstance(pairs, dict):
+            raise RuntimeError("Hard-Pair Curriculum state has an invalid pairs map")
+
+        restored: dict[str, dict[str, float | int]] = {}
+        for key, value in pairs.items():
+            margin_ema = float(value["margin_ema"])
+            observations = int(value["observations"])
+            if observations < 1:
+                raise RuntimeError(
+                    f"Invalid curriculum observation count for pair {key!r}: "
+                    f"{observations}"
+                )
+            if not torch.isfinite(torch.tensor(margin_ema)):
+                raise RuntimeError(
+                    f"Non-finite curriculum EMA for pair {key!r}: {margin_ema}"
+                )
+            restored[str(key)] = {
+                "margin_ema": margin_ema,
+                "observations": observations,
+            }
+
+        self._dpo_curriculum_state = restored
+        print(
+            "[OT-DPO-CURRICULUM] restored "
+            f"{len(restored)} per-pair EMA states"
+        )
 
     @staticmethod
     def _is_dpo_rejected_key(key: str) -> bool:
@@ -476,6 +772,14 @@ class BaseModelSetup(
             chosen_ratio,
             rejected_ratio,
             margin,
+            raw_pair_total_loss=None,
+            curriculum_weight=None,
+            curriculum_margin_ema=None,
+            curriculum_observations=None,
+            margin_penalty_loss=None,
+            wrong_order_penalty_loss=None,
+            margin_target_violation=None,
+            wrong_order_violation=None,
     ):
         if not multi.is_master():
             return
@@ -497,6 +801,14 @@ class BaseModelSetup(
             "rejected_reward",
             "reward_margin",
             "accuracy",
+            "raw_pair_loss",
+            "curriculum_weight",
+            "curriculum_margin_ema",
+            "curriculum_observations",
+            "margin_penalty_loss",
+            "wrong_order_penalty_loss",
+            "margin_target_violation",
+            "wrong_order_violation",
             "pair_loss",
         ]
 
@@ -575,12 +887,315 @@ class BaseModelSetup(
                 "accuracy": float(
                     margin.detach()[i].item() > 0.0
                 ),
+                "raw_pair_loss": self._dpo_csv_float_value(
+                    raw_pair_total_loss,
+                    i,
+                ),
+                "curriculum_weight": self._dpo_csv_float_value(
+                    curriculum_weight,
+                    i,
+                ),
+                "curriculum_margin_ema": self._dpo_csv_float_value(
+                    curriculum_margin_ema,
+                    i,
+                ),
+                "curriculum_observations": self._dpo_csv_float_value(
+                    curriculum_observations,
+                    i,
+                ),
+                "margin_penalty_loss": self._dpo_csv_float_value(
+                    margin_penalty_loss,
+                    i,
+                ),
+                "wrong_order_penalty_loss": self._dpo_csv_float_value(
+                    wrong_order_penalty_loss,
+                    i,
+                ),
+                "margin_target_violation": self._dpo_csv_float_value(
+                    margin_target_violation,
+                    i,
+                ),
+                "wrong_order_violation": self._dpo_csv_float_value(
+                    wrong_order_violation,
+                    i,
+                ),
                 "pair_loss": self._dpo_csv_float_value(
                     pair_total_loss,
                     i,
                 ),
             })
 
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+            )
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+
+    @staticmethod
+    def _dpo_bad_pair_csv_path() -> str:
+        path = os.environ.get("OT_DPO_BAD_PAIR_CSV_PATH", "").strip()
+        if path:
+            return path
+        return os.path.join(os.getcwd(), "dpo_bad_pairs.csv")
+
+    def _write_dpo_bad_pair_csv_log(
+            self,
+            batch: dict,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+            chosen_b: int,
+            policy_timestep,
+            pair_total_loss,
+            chosen_ratio: Tensor,
+            rejected_ratio: Tensor,
+            margin: Tensor,
+    ):
+        """Write only severe DPO outliers to a separate CSV.
+
+        This logger is intentionally independent of TensorBoard and of the
+        all-pairs dpo_pair_log.csv. A row is emitted when at least one of these
+        occurs:
+          * non-finite reward/loss
+          * chosen target violation exceeds the configured threshold
+          * rejected target violation exceeds the configured threshold
+          * per-pair objective loss exceeds the configured threshold
+          * the same pair suddenly moves in the wrong direction compared with
+            its previous observation in this process
+        """
+        if not multi.is_master():
+            return
+        if not bool(getattr(config, "rlhf_dpo_bad_pair_logging", True)):
+            return
+
+        chosen_b = int(chosen_b)
+        if chosen_b <= 0:
+            return
+
+        chosen_target = float(
+            getattr(config, "rlhf_dpo_anchored_chosen_target", 0.0)
+        )
+        rejected_target = float(
+            getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)
+        )
+        violation_threshold = max(
+            float(
+                getattr(
+                    config,
+                    "rlhf_dpo_bad_pair_reward_violation_threshold",
+                    2.0,
+                )
+            ),
+            0.0,
+        )
+        change_threshold = max(
+            float(
+                getattr(
+                    config,
+                    "rlhf_dpo_bad_pair_reward_change_threshold",
+                    2.0,
+                )
+            ),
+            0.0,
+        )
+        loss_threshold = max(
+            float(
+                getattr(config, "rlhf_dpo_bad_pair_loss_threshold", 2.0)
+            ),
+            0.0,
+        )
+
+        chosen_values = chosen_ratio.detach().float().cpu().tolist()
+        rejected_values = rejected_ratio.detach().float().cpu().tolist()
+        margin_values = margin.detach().float().cpu().tolist()
+        if pair_total_loss is None:
+            loss_values = [float("nan")] * chosen_b
+        else:
+            loss_values = (
+                pair_total_loss.detach().float().reshape(-1).cpu().tolist()
+            )
+            if len(loss_values) != chosen_b:
+                loss_values = [float("nan")] * chosen_b
+
+        fieldnames = [
+            "global_step",
+            "epoch",
+            "pair_index",
+            "objective",
+            "reason",
+            "chosen_image_path",
+            "rejected_image_path",
+            "dpo_pair_key",
+            "timestep",
+            "chosen_reward",
+            "rejected_reward",
+            "reward_margin",
+            "previous_chosen_reward",
+            "previous_rejected_reward",
+            "chosen_reward_change",
+            "rejected_reward_change",
+            "chosen_target",
+            "rejected_target",
+            "chosen_target_violation",
+            "rejected_target_violation",
+            "pair_loss",
+        ]
+
+        rows = []
+        global_step = int(getattr(train_progress, "global_step", 0))
+        epoch = getattr(train_progress, "epoch", "")
+
+        for i in range(chosen_b):
+            chosen_path = str(
+                self._dpo_csv_batch_value(
+                    batch,
+                    (
+                        "image_path",
+                        "chosen_image_path",
+                        "chosen_source_path",
+                        "chosen_image_path_raw",
+                    ),
+                    i,
+                )
+            )
+            rejected_path = str(
+                self._dpo_csv_batch_value(
+                    batch,
+                    (
+                        "image_path_rejected",
+                        "rejected_image_path",
+                        "rejected_source_path",
+                        "rejected_image_path_raw",
+                    ),
+                    i,
+                )
+            )
+            pair_key = str(
+                self._dpo_csv_batch_value(batch, ("dpo_pair_key",), i)
+            ).strip()
+            history_key = pair_key or f"{chosen_path}\n{rejected_path}"
+
+            chosen_value = float(chosen_values[i])
+            rejected_value = float(rejected_values[i])
+            margin_value = float(margin_values[i])
+            pair_loss_value = float(loss_values[i])
+
+            chosen_violation = max(chosen_target - chosen_value, 0.0)
+            rejected_violation = max(rejected_value - rejected_target, 0.0)
+
+            previous = self._dpo_bad_pair_previous_rewards.get(history_key)
+            previous_chosen = previous[0] if previous is not None else None
+            previous_rejected = previous[1] if previous is not None else None
+            chosen_change = (
+                chosen_value - previous_chosen
+                if previous_chosen is not None
+                else None
+            )
+            rejected_change = (
+                rejected_value - previous_rejected
+                if previous_rejected is not None
+                else None
+            )
+
+            reasons = []
+            finite_values = (
+                torch.isfinite(torch.tensor(chosen_value)).item()
+                and torch.isfinite(torch.tensor(rejected_value)).item()
+                and torch.isfinite(torch.tensor(margin_value)).item()
+                and torch.isfinite(torch.tensor(pair_loss_value)).item()
+            )
+            if not finite_values:
+                reasons.append("non_finite")
+            if chosen_violation >= violation_threshold and violation_threshold > 0:
+                reasons.append("chosen_target_violation")
+            if rejected_violation >= violation_threshold and violation_threshold > 0:
+                reasons.append("rejected_target_violation")
+            if pair_loss_value >= loss_threshold and loss_threshold > 0:
+                reasons.append("pair_loss")
+            if (
+                chosen_change is not None
+                and chosen_change <= -change_threshold
+                and change_threshold > 0
+            ):
+                reasons.append("chosen_reward_drop")
+            if (
+                rejected_change is not None
+                and rejected_change >= change_threshold
+                and change_threshold > 0
+            ):
+                reasons.append("rejected_reward_rise")
+
+            # Always update history, including normal observations, so a later
+            # catastrophic jump is measured against the immediately preceding
+            # observation of this exact pair.
+            self._dpo_bad_pair_previous_rewards[history_key] = (
+                chosen_value,
+                rejected_value,
+                global_step,
+            )
+
+            if not reasons:
+                continue
+
+            rows.append({
+                "global_step": global_step,
+                "epoch": epoch,
+                "pair_index": i,
+                "objective": str(
+                    getattr(config, "rlhf_dpo_objective", "")
+                ),
+                "reason": "|".join(reasons),
+                "chosen_image_path": chosen_path,
+                "rejected_image_path": rejected_path,
+                "dpo_pair_key": pair_key,
+                "timestep": self._dpo_csv_index_value(policy_timestep, i),
+                "chosen_reward": chosen_value,
+                "rejected_reward": rejected_value,
+                "reward_margin": margin_value,
+                "previous_chosen_reward": (
+                    "" if previous_chosen is None else previous_chosen
+                ),
+                "previous_rejected_reward": (
+                    "" if previous_rejected is None else previous_rejected
+                ),
+                "chosen_reward_change": (
+                    "" if chosen_change is None else chosen_change
+                ),
+                "rejected_reward_change": (
+                    "" if rejected_change is None else rejected_change
+                ),
+                "chosen_target": chosen_target,
+                "rejected_target": rejected_target,
+                "chosen_target_violation": chosen_violation,
+                "rejected_target_violation": rejected_violation,
+                "pair_loss": pair_loss_value,
+            })
+
+        if not rows:
+            return
+
+        path = self._dpo_bad_pair_csv_path()
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            with open(path, "r", newline="", encoding="utf-8") as f:
+                current_header = next(csv.reader(f), [])
+            if current_header != fieldnames:
+                legacy_index = 1
+                legacy_path = f"{path}.legacy-{legacy_index}"
+                while os.path.exists(legacy_path):
+                    legacy_index += 1
+                    legacy_path = f"{path}.legacy-{legacy_index}"
+                os.replace(path, legacy_path)
+                print(
+                    f"[OT-DPO-BAD-PAIR-CSV] moved old-schema log to "
+                    f"{legacy_path}"
+                )
+
+        write_header = not os.path.exists(path) or os.path.getsize(path) == 0
         with open(path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
                 f,
@@ -648,9 +1263,123 @@ class BaseModelSetup(
         chosen_reward_push_loss = None
         chosen_reward_floor_loss = None
         chosen_reward_aux_loss = None
+        chosen_anchor_weight = 0.0
         chosen_reward_floor_value = float(getattr(config, "rlhf_dpo_chosen_reward_floor", 0.0))
+        pair_total_loss = None
+        raw_pair_total_loss = None
+        curriculum_weight = torch.ones_like(margin)
+        curriculum_margin_ema = margin.detach()
+        curriculum_observations = torch.zeros_like(margin)
+        margin_penalty_loss = torch.zeros_like(margin)
+        wrong_order_penalty_loss = torch.zeros_like(margin)
+        margin_target_violation = torch.zeros_like(margin)
+        wrong_order_violation = torch.zeros_like(margin)
 
-        if config.rlhf_dpo_objective == DPOObjective.IPO:
+        if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
+            # Independent chosen/rejected anchors remain the primary safety
+            # constraints. Two bounded pairwise terms additionally require a
+            # positive target margin and add extra rescue pressure while the
+            # rejected sample is ranked above the chosen sample.
+            chosen_target = float(
+                getattr(config, "rlhf_dpo_anchored_chosen_target", 0.0)
+            )
+            rejected_target = float(
+                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)
+            )
+            chosen_weight = max(
+                float(getattr(config, "rlhf_dpo_anchored_chosen_weight", 1.0)),
+                0.0,
+            )
+            rejected_weight = max(
+                float(getattr(config, "rlhf_dpo_anchored_rejected_weight", 1.0)),
+                0.0,
+            )
+            huber_delta = max(
+                float(getattr(config, "rlhf_dpo_anchored_huber_delta", 0.1)),
+                1e-8,
+            )
+            margin_target = max(
+                float(getattr(config, "rlhf_dpo_anchored_margin_target", 0.05)),
+                0.0,
+            )
+            margin_weight = max(
+                float(getattr(config, "rlhf_dpo_anchored_margin_weight", 0.5)),
+                0.0,
+            )
+            wrong_order_weight = max(
+                float(getattr(config, "rlhf_dpo_anchored_wrong_order_weight", 0.5)),
+                0.0,
+            )
+
+            chosen_violation = F.relu(chosen_target - chosen_ratio)
+            rejected_violation = F.relu(rejected_ratio - rejected_target)
+
+            chosen_pair_loss = chosen_weight * F.smooth_l1_loss(
+                chosen_violation,
+                torch.zeros_like(chosen_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+            rejected_pair_loss = rejected_weight * F.smooth_l1_loss(
+                rejected_violation,
+                torch.zeros_like(rejected_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+            # Positive-margin term: active whenever the current policy
+            # margin is below the configured target, including small positive
+            # margins that are correctly ordered but not yet decisive.
+            margin_target_violation = F.relu(margin_target - margin)
+            margin_penalty_loss = margin_weight * F.smooth_l1_loss(
+                margin_target_violation,
+                torch.zeros_like(margin_target_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+
+            # Wrong-order rescue: an additional bounded penalty only while the
+            # rejected image is preferred over the chosen image. Negative
+            # margins therefore receive both the target-margin term and this
+            # extra correction.
+            wrong_order_violation = F.relu(-margin)
+            wrong_order_penalty_loss = wrong_order_weight * F.smooth_l1_loss(
+                wrong_order_violation,
+                torch.zeros_like(wrong_order_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+
+            raw_pair_total_loss = (
+                chosen_pair_loss
+                + rejected_pair_loss
+                + margin_penalty_loss
+                + wrong_order_penalty_loss
+            )
+
+            if self._dpo_hard_pair_curriculum_enabled(config):
+                (
+                    curriculum_weight,
+                    curriculum_margin_ema,
+                    curriculum_observations,
+                ) = self._stage_dpo_curriculum_observations(
+                    batch,
+                    config,
+                    margin,
+                )
+                # The curriculum weight is detached state derived from
+                # a per-pair EMA. There is no gradient path through confidence,
+                # so the model cannot reduce its loss by intentionally keeping
+                # confidence low.
+                pair_total_loss = (
+                    raw_pair_total_loss * curriculum_weight.detach()
+                )
+            else:
+                pair_total_loss = raw_pair_total_loss
+
+            dpo_loss = pair_total_loss.mean()
+            loss = dpo_loss
+
+        elif config.rlhf_dpo_objective == DPOObjective.IPO:
             dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
             loss = dpo_loss
         else:
@@ -682,7 +1411,12 @@ class BaseModelSetup(
 
             loss = preference_loss
 
-        if getattr(config, "rlhf_dpo_chosen_reward_anchor", False):
+        # The legacy chosen anchor remains available for SIGMOID/IPO configs,
+        # but is never stacked on top of the independent Anchored Reject loss.
+        if (
+            config.rlhf_dpo_objective != DPOObjective.ANCHORED_REJECT
+            and getattr(config, "rlhf_dpo_chosen_reward_anchor", False)
+        ):
             chosen_anchor_weight = float(getattr(config, "rlhf_dpo_chosen_reward_anchor_weight", 0.0))
             if chosen_anchor_weight > 0:
                 chosen_reward_target = float(getattr(config, "rlhf_dpo_chosen_reward_target", 0.05))
@@ -719,10 +1453,11 @@ class BaseModelSetup(
             loss = loss + config.rlhf_supervised_mix * supervised_loss
             del supervised_loss
 
-        pair_total_loss = None
-
         try:
-            if config.rlhf_dpo_objective == DPOObjective.IPO:
+            if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
+                # Already computed above as the exact per-pair objective.
+                pass
+            elif config.rlhf_dpo_objective == DPOObjective.IPO:
                 pair_total_loss = (
                     margin
                     - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)
@@ -744,8 +1479,37 @@ class BaseModelSetup(
                 f"{type(e).__name__}: {e}"
             )
 
+        if raw_pair_total_loss is None:
+            raw_pair_total_loss = pair_total_loss
+
         try:
             self._write_dpo_pair_csv_log(
+                batch=batch,
+                config=config,
+                train_progress=train_progress,
+                chosen_b=chosen_b,
+                policy_timestep=policy_timestep,
+                pair_total_loss=pair_total_loss,
+                chosen_ratio=chosen_ratio,
+                rejected_ratio=rejected_ratio,
+                margin=margin,
+                raw_pair_total_loss=raw_pair_total_loss,
+                curriculum_weight=curriculum_weight,
+                curriculum_margin_ema=curriculum_margin_ema,
+                curriculum_observations=curriculum_observations,
+                margin_penalty_loss=margin_penalty_loss,
+                wrong_order_penalty_loss=wrong_order_penalty_loss,
+                margin_target_violation=margin_target_violation,
+                wrong_order_violation=wrong_order_violation,
+            )
+        except Exception as e:
+            print(
+                "[OT-DPO-PAIR-CSV] failed to write row: "
+                f"{type(e).__name__}: {e}"
+            )
+
+        try:
+            self._write_dpo_bad_pair_csv_log(
                 batch=batch,
                 config=config,
                 train_progress=train_progress,
@@ -758,10 +1522,9 @@ class BaseModelSetup(
             )
         except Exception as e:
             print(
-                "[OT-DPO-PAIR-CSV] failed to write row: "
+                "[OT-DPO-BAD-PAIR-CSV] failed to write row: "
                 f"{type(e).__name__}: {e}"
             )
-
 
         self._last_dpo_metrics = {
             "objective_loss": dpo_logged_loss.detach().item(),
@@ -769,6 +1532,33 @@ class BaseModelSetup(
             "rejected_reward": rejected_ratio.detach().mean().item(),
             "reward_margin": margin.detach().mean().item(),
             "accuracy": (margin.detach() > 0).float().mean().item(),
+            "hard_pair_curriculum_weight": curriculum_weight.detach().mean().item(),
+            "hard_pair_margin_ema": curriculum_margin_ema.detach().mean().item(),
+            "hard_pair_observations": curriculum_observations.detach().mean().item(),
+            "margin_penalty_loss": margin_penalty_loss.detach().mean().item(),
+            "wrong_order_penalty_loss": wrong_order_penalty_loss.detach().mean().item(),
+            "margin_target_violation": margin_target_violation.detach().mean().item(),
+            "wrong_order_violation": wrong_order_violation.detach().mean().item(),
+            "chosen_anchor_active": float(
+                chosen_reward_aux_loss is not None
+            ),
+            "chosen_anchor_weight": float(chosen_anchor_weight),
+            "chosen_anchor_floor": float(chosen_reward_floor_value),
+            "chosen_anchor_push_loss": (
+                chosen_reward_push_loss.detach().item()
+                if chosen_reward_push_loss is not None
+                else 0.0
+            ),
+            "chosen_anchor_floor_loss": (
+                chosen_reward_floor_loss.detach().item()
+                if chosen_reward_floor_loss is not None
+                else 0.0
+            ),
+            "chosen_anchor_aux_loss": (
+                chosen_reward_aux_loss.detach().item()
+                if chosen_reward_aux_loss is not None
+                else 0.0
+            ),
         }
 
         return loss
@@ -1093,11 +1883,17 @@ class BaseModelSetup(
         match attn:
             case AttentionMechanism.SDP:
                 component.set_attention_backend("native")
+
             case AttentionMechanism.FLASH:
-                if mask:
-                    print("Warning: FLASH attention might fail for this model, depending on other configuration (batch size > 1, etc.)")
-                component.set_attention_backend("flash")
+                backend = "flash" if mask else "flash"
+                print(f"Attention backend: {backend}")
+                component.set_attention_backend(backend)
+
             case AttentionMechanism.CUDNN:
                 component.set_attention_backend("_native_cudnn")
+
             case _:
-                raise NotImplementedError(f"attention mechanism {str(attn)} not implemented")
+                raise NotImplementedError(
+                    f"attention mechanism {str(attn)} not implemented"
+                )
+

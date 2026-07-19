@@ -69,6 +69,14 @@ class GenericTrainer(BaseTrainer):
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
         super().__init__(config, callbacks, commands)
+        # cuDNN SDPA can produce invalid MHA execution plans under
+        # torch.compile, especially with variable diffusion token shapes.
+        # Keep Flash/Efficient/Math SDPA available, but never select cuDNN SDPA.
+        torch.backends.cuda.enable_cudnn_sdp(False)
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(True)
+
         # torch._dynamo.config overrides are thread-local, so init_compile() must be called in the training thread/process.
         init_compile()
 
@@ -127,9 +135,8 @@ class GenericTrainer(BaseTrainer):
                 print("No backup found, continuing without backup...")
 
         if self.config.secrets.huggingface_token != "":
-            self.callbacks.on_update_status("logging into Hugging Face")
-            with contextlib.suppress(ConnectionError):
-                huggingface_hub.login(token=self.config.secrets.huggingface_token)
+            self.callbacks.on_update_status("configuring Hugging Face token")
+            os.environ["HF_TOKEN"] = self.config.secrets.huggingface_token
 
         self.callbacks.on_update_status("loading the model")
 
@@ -161,6 +168,13 @@ class GenericTrainer(BaseTrainer):
             self._dpo_reference_snapshot_path = os.path.join(
                 last_backup_path,
                 "onetrainer_dpo_reference.pt",
+            )
+            self.model_setup.load_dpo_curriculum_state(
+                os.path.join(
+                    last_backup_path,
+                    "onetrainer_dpo_hard_pair_curriculum.json",
+                ),
+                self.config,
             )
 
         if self.config.rlhf_enabled and self.config.training_method != TrainingMethod.LORA:
@@ -274,6 +288,23 @@ class GenericTrainer(BaseTrainer):
                 raise RuntimeError(
                     "[OT-RESUME] DPO backup is missing its fixed reference: "
                     f"{reference_path}"
+                )
+
+        if (
+            self.config.rlhf_enabled
+            and self.model_setup._dpo_hard_pair_curriculum_enabled(
+                self.config
+            )
+        ):
+            curriculum_path = os.path.join(
+                backup_path,
+                "onetrainer_dpo_hard_pair_curriculum.json",
+            )
+            if not os.path.isfile(curriculum_path):
+                raise RuntimeError(
+                    "[OT-RESUME] Hard-Pair Curriculum is enabled, but the "
+                    "backup is missing its exact per-pair EMA state: "
+                    f"{curriculum_path}"
                 )
 
     def __validate_loaded_resume_progress(self, backup_path: str):
@@ -621,6 +652,13 @@ class GenericTrainer(BaseTrainer):
             )
 
             self.__save_backup_config(backup_path)
+            self.model_setup.save_dpo_curriculum_state(
+                os.path.join(
+                    backup_path,
+                    "onetrainer_dpo_hard_pair_curriculum.json",
+                ),
+                self.config,
+            )
             self.model_setup.save_dpo_reference(
                 os.path.join(backup_path, "onetrainer_dpo_reference.pt")
             )
@@ -789,6 +827,19 @@ class GenericTrainer(BaseTrainer):
             "rejected_reward",
             "reward_margin",
             "accuracy",
+            "hard_pair_curriculum_weight",
+            "hard_pair_margin_ema",
+            "hard_pair_observations",
+            "margin_penalty_loss",
+            "wrong_order_penalty_loss",
+            "margin_target_violation",
+            "wrong_order_violation",
+            "chosen_anchor_active",
+            "chosen_anchor_weight",
+            "chosen_anchor_floor",
+            "chosen_anchor_push_loss",
+            "chosen_anchor_floor_loss",
+            "chosen_anchor_aux_loss",
         }
 
     def __accumulate_dpo_metrics(
@@ -1462,6 +1513,7 @@ class GenericTrainer(BaseTrainer):
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
+                        self.model_setup.commit_dpo_curriculum_state()
                         has_gradient = False
                         self._gradient_accumulation_dirty = False
                         self.__flush_dpo_tensorboard_metrics(
@@ -1532,6 +1584,7 @@ class GenericTrainer(BaseTrainer):
             self._gradient_accumulation_dirty = False
             self._dpo_metric_sums.clear()
             self._dpo_metric_weight = 0.0
+            self.model_setup.discard_dpo_curriculum_pending()
             print(
                 "[OT-TRAIN] discarded an incomplete final gradient-"
                 "accumulation window; no resumable backup was written for it."

@@ -50,3 +50,14 @@ training_presets/*
 
 # #.json is an exception (from the exception). This file stores the ui state from a previous run.
 training_presets/\#.json
+
+# Local logs, backups, and patch artifacts
+.ipynb_checkpoints/
+.ot_patch_backups/
+.ot_rlhf_repair_backups/
+anchored_reject_backup_*/
+dpo_pair_log.csv
+dpo_pair_log.csv.*
+*.before_*
+*.patch
+install_anchored_reject_curriculum.py

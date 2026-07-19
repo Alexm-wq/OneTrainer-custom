@@ -17,6 +17,7 @@ from modules.ui.CtkConvertModelUIView import CtkConvertModelUIView
 from modules.ui.CtkLoraTabView import CtkLoraTabView
 from modules.ui.CtkModelTabView import CtkModelTabView
 from modules.ui.CtkProfilingWindowView import CtkProfilingWindowView
+from modules.ui.CtkRLHFTabView import CtkRLHFTabView
 from modules.ui.CtkSampleWindowView import CtkSampleWindowView
 from modules.ui.CtkSamplingTabView import CtkSamplingTabView
 from modules.ui.CtkTopBarView import CtkTopBarView
@@ -25,6 +26,7 @@ from modules.ui.CtkVideoToolUIView import CtkVideoToolUIView
 from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
+from modules.ui.RLHFTabController import RLHFTabController
 from modules.ui.SamplingTabController import SamplingTabController
 from modules.ui.TopBarController import TopBarController
 from modules.ui.TrainingTabController import TrainingTabController
@@ -112,6 +114,7 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
 
         self.model_tab = None
         self.training_tab = None
+        self.rlhf_tab = None
         self.lora_tab = None
         self.cloud_tab = None
         self.additional_embeddings_tab = None
@@ -255,6 +258,7 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
         self.data_tab = self.create_data_tab(self.tabview.add("data"))
         self.concepts_tab = self.create_concepts_tab(self.tabview.add("concepts"))
         self.training_tab = self.create_training_tab(self.tabview.add("training"))
+        self.rlhf_tab = self.create_rlhf_tab(self.tabview.add("RLHF"))
         self.sampling_tab = self.create_sampling_tab(self.tabview.add("sampling"))
         self.backup_tab = self.create_backup_tab(self.tabview.add("backup"))
         self.tools_tab = self.create_tools_tab(self.tabview.add("tools"))
@@ -295,6 +299,13 @@ class CtkTrainUIView(BaseTrainUIView, ctk.CTk):
 
     def create_training_tab(self, master) -> CtkTrainingTabView:
         return CtkTrainingTabView(master, TrainingTabController(self.controller.train_config), self.ui_state)
+
+    def create_rlhf_tab(self, master) -> CtkRLHFTabView:
+        return CtkRLHFTabView(
+            master,
+            RLHFTabController(self.controller.train_config),
+            self.ui_state,
+        )
 
     def create_cloud_tab(self, master) -> CtkCloudTabView:
         return CtkCloudTabView(master, CloudTabController(self.controller.train_config, parent=self), self.ui_state)

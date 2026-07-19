@@ -658,6 +658,33 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_chosen_reward_floor: float
     rlhf_dpo_chosen_reward_floor_multiplier: float
     rlhf_dpo_chosen_reward_sharpness: float
+
+    # Anchored Reject: independently protect the chosen side and suppress the
+    # rejected side. There is deliberately no explicit margin objective.
+    rlhf_dpo_anchored_chosen_target: float
+    rlhf_dpo_anchored_rejected_target: float
+    rlhf_dpo_anchored_chosen_weight: float
+    rlhf_dpo_anchored_rejected_weight: float
+    rlhf_dpo_anchored_huber_delta: float
+    rlhf_dpo_anchored_margin_target: float
+    rlhf_dpo_anchored_margin_weight: float
+    rlhf_dpo_anchored_wrong_order_weight: float
+
+    # Optional competence-gated curriculum for Anchored Reject. Close or
+    # incorrectly ranked pairs receive a small gradient until their detached
+    # per-pair EMA margin shows that the model can distinguish them.
+    rlhf_dpo_hard_pair_curriculum: bool
+    rlhf_dpo_hard_pair_curriculum_ema: float
+    rlhf_dpo_hard_pair_curriculum_min_weight: float
+    rlhf_dpo_hard_pair_curriculum_full_margin: float
+
+    # Separate CSV diagnostics for catastrophic/outlier pairs. These are never
+    # sent to TensorBoard.
+    rlhf_dpo_bad_pair_logging: bool
+    rlhf_dpo_bad_pair_reward_violation_threshold: float
+    rlhf_dpo_bad_pair_reward_change_threshold: float
+    rlhf_dpo_bad_pair_loss_threshold: float
+
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -911,6 +938,12 @@ class TrainConfig(BaseConfig):
                 migrated_data["output_model_format"] = "LEGACY_SAFETENSORS"
 
         return migrated_data
+
+    def model_part_configs(self) -> list[TrainModelPartConfig]:
+        return [
+            getattr(self, name)
+            for name in self.model_type.model_parts()
+        ]
 
     def weight_dtypes(self) -> ModelWeightDtypes:
         return ModelWeightDtypes(
@@ -1351,6 +1384,33 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_chosen_reward_floor", 0.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_floor_multiplier", 4.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_sharpness", 20.0, float, False))
+
+        # Anchored Reject defaults. A zero chosen target prevents chosen-side
+        # degradation relative to the reference. A slightly negative rejected
+        # target asks the policy to make the rejected sample worse than the
+        # reference without continuously widening a pairwise margin.
+        data.append(("rlhf_dpo_anchored_chosen_target", 0.0, float, False))
+        data.append(("rlhf_dpo_anchored_rejected_target", -0.05, float, False))
+        data.append(("rlhf_dpo_anchored_chosen_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_anchored_huber_delta", 0.1, float, False))
+        data.append(("rlhf_dpo_anchored_margin_target", 0.05, float, False))
+        data.append(("rlhf_dpo_anchored_margin_weight", 0.5, float, False))
+        data.append(("rlhf_dpo_anchored_wrong_order_weight", 0.5, float, False))
+
+        # Disabled by default. At margin <= 0 the pair uses Minimum Weight;
+        # Smoothstep ramps it to full strength at Full Margin.
+        data.append(("rlhf_dpo_hard_pair_curriculum", False, bool, False))
+        data.append(("rlhf_dpo_hard_pair_curriculum_ema", 0.9, float, False))
+        data.append(("rlhf_dpo_hard_pair_curriculum_min_weight", 0.1, float, False))
+        data.append(("rlhf_dpo_hard_pair_curriculum_full_margin", 0.05, float, False))
+
+        # Only severe outliers are written to dpo_bad_pairs.csv. The change
+        # threshold compares a pair with its previous occurrence in this run.
+        data.append(("rlhf_dpo_bad_pair_logging", True, bool, False))
+        data.append(("rlhf_dpo_bad_pair_reward_violation_threshold", 2.0, float, False))
+        data.append(("rlhf_dpo_bad_pair_reward_change_threshold", 2.0, float, False))
+        data.append(("rlhf_dpo_bad_pair_loss_threshold", 2.0, float, False))
         return TrainConfig(data)
 
     def effective_dpo_ref_mode(self):

@@ -8,6 +8,7 @@ from modules.ui.ConceptTabController import ConceptTabController
 from modules.ui.LoraTabController import LoraTabController
 from modules.ui.ModelTabController import ModelTabController
 from modules.ui.ProfilingWindowController import ProfilingWindowController
+from modules.ui.RLHFTabController import RLHFTabController
 from modules.ui.PySide6AdditionalEmbeddingsTabView import PySide6AdditionalEmbeddingsTabView
 from modules.ui.PySide6CaptionUIView import PySide6CaptionUIView
 from modules.ui.PySide6CloudTabView import PySide6CloudTabView
@@ -16,6 +17,7 @@ from modules.ui.PySide6ConvertModelUIView import PySide6ConvertModelUIView
 from modules.ui.PySide6LoraTabView import PySide6LoraTabView
 from modules.ui.PySide6ModelTabView import PySide6ModelTabView
 from modules.ui.PySide6ProfilingWindowView import PySide6ProfilingWindowView
+from modules.ui.PySide6RLHFTabView import PySide6RLHFTabView
 from modules.ui.PySide6SampleWindowView import PySide6SampleWindowView
 from modules.ui.PySide6SamplingTabView import PySide6SamplingTabView
 from modules.ui.PySide6TopBarView import PySide6TopBarView
@@ -61,6 +63,7 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
 
         self.model_tab = None
         self.training_tab = None
+        self.rlhf_tab = None
         self.lora_tab = None
         self.cloud_tab = None
         self.concepts_tab = None
@@ -265,6 +268,14 @@ class PySide6TrainView(BaseTrainUIView, QMainWindow, metaclass=QtABCMeta):
         self.training_tab = PySide6TrainingTabView(None, TrainingTabController(self.controller.train_config), self.ui_state)
         self.tabview.addTab(self.training_tab, "training")
         self._tab_widgets["training"] = self.training_tab
+
+        self.rlhf_tab = PySide6RLHFTabView(
+            None,
+            RLHFTabController(self.controller.train_config),
+            self.ui_state,
+        )
+        self.tabview.addTab(self.rlhf_tab, "RLHF")
+        self._tab_widgets["RLHF"] = self.rlhf_tab
 
         sampling_page = self.create_sampling_tab()
         self.tabview.addTab(sampling_page, "sampling")

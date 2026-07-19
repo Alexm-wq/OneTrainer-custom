@@ -2,6 +2,7 @@ import copy
 import inspect
 import math
 from collections.abc import Callable
+from contextlib import contextmanager
 
 from modules.model.Krea2Model import Krea2Model
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
@@ -36,6 +37,40 @@ class Krea2Sampler(BaseModelSampler):
         self.model = model
         self.model_type = model_type
         self.pipeline = model.create_pipeline()
+
+    @staticmethod
+    def __get_attention_backend(transformer) -> str | None:
+        # Diffusers stores the selected backend on every attention processor.
+        # OneTrainer sets all processors to the same backend, so the first one
+        # with an explicit value is sufficient for restoring the training path.
+        for module in transformer.modules():
+            processor = getattr(module, "processor", None)
+            backend = getattr(processor, "_attention_backend", None)
+            if backend is not None:
+                return backend.value if hasattr(backend, "value") else str(backend)
+
+        return None
+
+    @staticmethod
+    @contextmanager
+    def __sampling_attention_backend(transformer, enabled: bool):
+        if not enabled:
+            yield
+            return
+
+        previous_backend = Krea2Sampler.__get_attention_backend(transformer)
+        transformer.set_attention_backend("_native_cudnn")
+
+        try:
+            yield
+        finally:
+            # Restore the exact backend selected for training. This also updates
+            # Diffusers' global attention registry, which set_attention_backend()
+            # modifies in addition to the per-layer processors.
+            if previous_backend is None:
+                transformer.reset_attention_backend()
+            else:
+                transformer.set_attention_backend(previous_backend)
 
     @torch.no_grad()
     def __sample_base(
@@ -76,6 +111,13 @@ class Krea2Sampler(BaseModelSampler):
                 train_device=self.train_device,
             )
 
+            # encode_text() has already removed all padded tokens. For the normal
+            # batch-size-1 sampling path this mask is therefore entirely True.
+            # Passing that redundant mask to SDPA can prevent the fused native
+            # FlashAttention kernel from being selected.
+            if text_attention_mask is not None and bool(torch.all(text_attention_mask)):
+                text_attention_mask = None
+
             self.model.text_encoder_to(self.temp_device)
             torch_gc()
 
@@ -105,27 +147,44 @@ class Krea2Sampler(BaseModelSampler):
                 extra_step_kwargs["generator"] = generator
 
             self.model.transformer_to(self.train_device)
-            for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
-                latent_model_input = torch.cat([latent_image] * batch_size)
-                expanded_timestep = timestep.expand(batch_size)
-                noise_pred = transformer(
-                    hidden_states=latent_model_input.to(dtype=self.model.train_dtype.torch_dtype()),
-                    encoder_hidden_states=combined_prompt_embedding.to(dtype=self.model.train_dtype.torch_dtype()),
-                    timestep=expanded_timestep / 1000,
-                    position_ids=position_ids,
-                    encoder_attention_mask=text_attention_mask,
-                    return_dict=False,
-                )[0]
 
-                if cfg_scale > 1.0:
-                    noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
-                    noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
+            # Force PyTorch's fused Flash SDPA kernel for the unmasked sampling
+            # path. Keep generic native SDPA when a real padding mask is present
+            # (normally only a CFG batch with unequal prompt lengths), because a
+            # forced fused backend may not support every masked shape.
+            # Force cuDNN SDPA for sampling even when a real attention mask
+            # remains, rather than silently falling back to the training backend.
+            use_native_cudnn = True
+            print(
+                "Sampling attention backend: _native_cudnn "
+                f"(mask={'none' if text_attention_mask is None else tuple(text_attention_mask.shape)})"
+            )
 
-                latent_image = noise_scheduler.step(noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs)[0]
+            try:
+                with self.__sampling_attention_backend(transformer, use_native_cudnn):
+                    for i, timestep in enumerate(tqdm(timesteps, desc="sampling")):
+                        latent_model_input = torch.cat([latent_image] * batch_size)
+                        expanded_timestep = timestep.expand(batch_size)
+                        noise_pred = transformer(
+                            hidden_states=latent_model_input.to(dtype=self.model.train_dtype.torch_dtype()),
+                            encoder_hidden_states=combined_prompt_embedding.to(dtype=self.model.train_dtype.torch_dtype()),
+                            timestep=expanded_timestep / 1000,
+                            position_ids=position_ids,
+                            encoder_attention_mask=text_attention_mask,
+                            return_dict=False,
+                        )[0]
 
-                on_update_progress(i + 1, len(timesteps))
+                        if cfg_scale > 1.0:
+                            noise_pred_positive, noise_pred_negative = noise_pred.chunk(2)
+                            noise_pred = noise_pred_negative + cfg_scale * (noise_pred_positive - noise_pred_negative)
 
-            self.model.transformer_to(self.temp_device)
+                        latent_image = noise_scheduler.step(
+                            noise_pred, timestep, latent_image, return_dict=False, **extra_step_kwargs
+                        )[0]
+
+                        on_update_progress(i + 1, len(timesteps))
+            finally:
+                self.model.transformer_to(self.temp_device)
 
             torch_gc()
             latent_image = self.model.unpack_latents(
