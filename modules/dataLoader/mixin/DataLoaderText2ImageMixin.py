@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from abc import ABCMeta, abstractmethod
@@ -8,7 +9,10 @@ from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
 from modules.util import path_util
+from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.CacheEncryptionScope import CacheEncryptionScope
+from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DataType import DataType
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -20,6 +24,7 @@ from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
 from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModules.DiskCache import DiskCache
+from mgds.pipelineModules.MultiResolutionDiskCache import MultiResolutionDiskCache
 from mgds.pipelineModules.DistributedSampler import DistributedSampler
 from mgds.pipelineModules.DownloadHuggingfaceDatasets import DownloadHuggingfaceDatasets
 from mgds.pipelineModules.DropTags import DropTags
@@ -60,6 +65,30 @@ from modules.dataLoader.dpo.EncodeDPORejectedOrDummyLatent import EncodeDPORejec
 
 
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
+    @staticmethod
+    def _cache_only_concepts(config: TrainConfig) -> list[dict]:
+        concepts = config.concepts
+        if concepts is None:
+            with open(config.concept_file_name, "r", encoding="utf-8") as handle:
+                concepts = [
+                    ConceptConfig.default_values().from_dict(item)
+                    for item in json.load(handle)
+                ]
+        concept_dicts = [
+            concept.to_dict() if hasattr(concept, "to_dict") else concept
+            for concept in concepts
+        ]
+        is_validation = bool(
+            getattr(config, "_cache_only_is_validation", False)
+        )
+        return [
+            concept
+            for concept in concept_dicts
+            if (
+                ConceptType(concept["type"]) == ConceptType.VALIDATION
+            ) == is_validation
+        ]
+
     def _enumerate_input_modules(self, config: TrainConfig, allow_videos: bool = False) -> list:
         supported_extensions = set()
         supported_extensions |= path_util.supported_image_extensions()
@@ -182,7 +211,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             frame_dim_enabled=frame_dim_enabled,
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            resolution_variants_out_name='resolution_variants',
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -192,7 +222,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             target_resolutions_override_in_name='concept.image.resolution_override',
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            resolution_variants_out_name='resolution_variants',
         )
 
         modules = [calc_aspect]
@@ -411,12 +442,67 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 if _dpo_name not in sort_names:
                     sort_names = sort_names + [_dpo_name]
 
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
-                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'],
-                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+        cache_only_concepts = (
+            self._cache_only_concepts(config)
+            if config.use_cache_only
+            else None
+        )
+        if config.use_cache_only:
+            # Existing cache manifests contain every tensor needed for
+            # training, but older manifests intentionally omitted the prompt
+            # string and concept object. The cache module reconstructs the
+            # concept from the current config and supplies an empty display
+            # prompt; cached tokens/hidden states remain the training input.
+            for metadata_name in ["prompt", "concept"]:
+                if metadata_name not in image_aggregate_names:
+                    image_aggregate_names = image_aggregate_names + [metadata_name]
+
+        image_encryption_source_names = ['image_path']
+        if config.rlhf_enabled:
+            image_encryption_source_names.append('image_path_rejected')
+        if config.masked_training:
+            image_encryption_source_names.append('mask_path')
+        if config.custom_conditioning_image:
+            image_encryption_source_names.append('cond_path')
+
+        encrypt_all_cache_files = (
+            config.cache_encryption_scope == CacheEncryptionScope.ALL
+        )
+
+        image_disk_cache = MultiResolutionDiskCache(
+            cache_dir=image_cache_dir,
+            split_names=image_split_names,
+            aggregate_names=image_aggregate_names,
+            resolution_variants_in_name='resolution_variants',
+            selection_key_in_names=['dpo_pair_key', 'image_path'],
+            variations_in_name='concept.image_variations',
+            balancing_in_name='concept.balancing',
+            balancing_strategy_in_name='concept.balancing_strategy',
+            variations_group_in_name=[
+                'concept.path',
+                'concept.seed',
+                'concept.include_subdirectories',
+                'concept.image',
+                'concept.dpo_chosen_pattern',
+                'concept.dpo_rejected_pattern',
+            ],
+            group_enabled_in_name='concept.enabled',
+            before_cache_fun=before_cache_image_fun,
+            encrypted=config.cache_encryption_enabled,
+            encryption_context="image",
+            encrypt_all=encrypt_all_cache_files,
+            encryption_source_path_in_name=image_encryption_source_names,
+            cache_only=config.use_cache_only,
+            cache_only_concepts=cache_only_concepts,
+        )
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun,
+                                    encrypted=config.cache_encryption_enabled, encryption_context="text",
+                                    encrypt_all=encrypt_all_cache_files,
+                                    encryption_source_path_in_name=['sample_prompt_path', 'concept.text.prompt_path'],
+                                    cache_only=config.use_cache_only,
+                                    cache_only_concepts=cache_only_concepts)
 
         modules = []
 
@@ -431,6 +517,11 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             sort_names = [x for x in sort_names if x not in text_split_names]
 
         if len(sort_names) > 0:
+            if config.use_cache_only:
+                raise RuntimeError(
+                    "Use Cache Only cannot provide these uncached pipeline "
+                    f"values: {', '.join(sort_names)}"
+                )
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                                  variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled')
 
@@ -452,6 +543,31 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             vae_frame_dim: bool=False,
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
+        if config.use_cache_only:
+            if not config.image_caching or not config.text_caching:
+                raise RuntimeError(
+                    "Use Cache Only requires both Image Caching and Text "
+                    "Caching to be enabled."
+                )
+            if config.train_text_encoder_or_embedding():
+                raise RuntimeError(
+                    "Use Cache Only cannot train a text encoder or embedding; "
+                    "the source captions are intentionally unavailable. Use a "
+                    "fully cached LoRA/fine-tune configuration."
+                )
+
+            # Cache constructors need the same train/validation concept subset
+            # that MGDS will use after it builds the pipeline.
+            config._cache_only_is_validation = is_validation
+            cache_modules = self._cache_modules(config, model, model_setup)
+            output_modules = self._output_modules(config, model, model_setup)
+            return self._create_mgds(
+                config,
+                [cache_modules, output_modules],
+                train_progress,
+                is_validation,
+            )
+
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
         load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
@@ -467,7 +583,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 latent_image_in_name='latent_image',
                 is_paired_in_name='dpo_is_paired',
                 latent_out_name='latent_image_rejected',
-                vae=model.vae,
+                vae=getattr(model, "vae", None),
                 autocast_contexts=[model.autocast_context],
                 dtype=model.train_dtype.torch_dtype(),
                 dummy_mode='zeros',

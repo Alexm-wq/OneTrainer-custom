@@ -203,10 +203,13 @@ def entry(
         validator_factory: Callable[..., PySide6FieldValidator] | None = None,
         extra_validate: Callable[[str], str | None] | None = None,
         required: bool = False,
+        password: bool = False,
 ) -> QLineEdit:
     var = ui_state.get_var(var_name)
 
     component = QLineEdit(master)
+    if password:
+        component.setEchoMode(QLineEdit.Password)
     component.setMinimumWidth(width)
     _add(_layout(master), component, row, column, sticky=sticky)
 

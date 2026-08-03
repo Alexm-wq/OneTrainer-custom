@@ -12,8 +12,9 @@ class EncodeDPORejectedOrDummyLatent(
 ):
     """Emits latent_image_rejected for homogeneous mixed RLHF.
 
-    DPO rows VAE-encode image_rejected.
-    Normal rows do not VAE-encode anything and emit zeros_like(latent_image).
+    DPO rows VAE-encode image_rejected for latent models. If ``vae`` is
+    ``None``, image_rejected is normalized directly into pixel space.
+    Normal rows emit zeros_like(latent_image).
     """
 
     def __init__(
@@ -81,6 +82,9 @@ class EncodeDPORejectedOrDummyLatent(
     def _encode_rejected(self, image: torch.Tensor) -> torch.Tensor:
         image = image * 2.0 - 1.0
 
+        if self.vae is None:
+            return image.detach()
+
         try:
             vae_param = next(self.vae.parameters())
             vae_device = vae_param.device
@@ -112,9 +116,6 @@ class EncodeDPORejectedOrDummyLatent(
         if not is_paired:
             dummy = latent_image if self.dummy_mode == "copy" else torch.zeros_like(latent_image)
             return {self.latent_out_name: dummy}
-
-        if self.vae is None:
-            raise RuntimeError("EncodeDPORejectedOrDummyLatent needs a VAE for paired DPO rows")
 
         image_rejected = self._get_previous_item(variation, self.image_in_name, index)
         if image_rejected is None:

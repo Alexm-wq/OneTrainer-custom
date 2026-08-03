@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 
 from modules.util import path_util
+from modules.util.enum.CacheEncryptionScope import CacheEncryptionScope
 from modules.util.enum.DataType import DataType
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
@@ -238,19 +239,82 @@ class BaseTrainUIView(ABC):
         self.components.switch(frame, 2, 1, ui_state, "text_caching")
 
         # caching threads
-        self.components.label(frame, 2, 0, "Caching Threads",
+        self.components.label(frame, 3, 0, "Caching Threads",
                          tooltip="Number of threads used while building the latent and text caches. Increase if your GPU has room during caching, decrease if it's going out of memory during caching. Only affects performance while the cache is being built.")
-        self.components.entry(frame, 2, 1, ui_state, "caching_threads", width=100, sticky="nw", required=True)
+        self.components.entry(frame, 3, 1, ui_state, "caching_threads", width=100, sticky="nw", required=True)
 
         # prefetch next batch
-        self.components.label(frame, 3, 0, "Prefetch Next Batch",
+        self.components.label(frame, 4, 0, "Prefetch Next Batch",
                          tooltip="Load the next batch on a background thread, overlapping disk reads with the current training step. Most beneficial when caching is enabled, since the prefetch thread then only does disk reads. With caching disabled, the text encoder / VAE forward passes run concurrently with training, increasing peak VRAM.")
-        self.components.switch(frame, 3, 1, ui_state, "prefetch_next_batch")
+        self.components.switch(frame, 4, 1, ui_state, "prefetch_next_batch")
 
         # clear cache before training
-        self.components.label(frame, 4, 0, "Clear cache before training",
+        self.components.label(frame, 5, 0, "Clear cache before training",
                          tooltip="Clears the cache directory before starting to train. Only disable this if you want to continue using the same cached data. Disabling this can lead to errors, if other settings are changed during a restart")
-        self.components.switch(frame, 4, 1, ui_state, "clear_cache_before_training")
+        self.components.switch(frame, 5, 1, ui_state, "clear_cache_before_training")
+
+        self.components.label(
+            frame,
+            6,
+            0,
+            "Use Cache Only",
+            tooltip="Train exclusively from existing image/text cache files. Source folders, images, and captions are not enumerated or opened. Missing or incompatible cache data is a hard error and is never rebuilt.",
+        )
+        self.components.switch(frame, 6, 1, ui_state, "use_cache_only")
+
+        self.components.label(
+            frame,
+            7,
+            0,
+            "Encrypted Dataset",
+            tooltip="Auto-detect and decrypt encrypted images, captions, masks, and DPO rejected images in memory. Encrypted and ordinary files may be mixed.",
+        )
+        self.components.switch(frame, 7, 1, ui_state, "dataset_encryption_enabled")
+
+        self.components.label(
+            frame,
+            8,
+            0,
+            "Encrypt Cache Files",
+            tooltip="Enable authenticated AES-256-GCM encryption for image, text, multi-resolution, and DPO cache payloads.",
+        )
+        self.components.switch(frame, 8, 1, ui_state, "cache_encryption_enabled")
+
+        self.components.label(
+            frame,
+            9,
+            0,
+            "Cache Encryption Scope",
+            tooltip="Encrypted sources only: encrypt a cache entry only when its source image/caption is encrypted. All cache files: encrypt every cache payload. Existing entries are converted directly without rerunning the VAE or text encoder.",
+        )
+        self.components.options_kv(
+            frame,
+            9,
+            1,
+            [
+                ("Encrypted image/text sources only", CacheEncryptionScope.ENCRYPTED_SOURCES),
+                ("All cache files", CacheEncryptionScope.ALL),
+            ],
+            ui_state,
+            "cache_encryption_scope",
+        )
+
+        self.components.label(
+            frame,
+            10,
+            0,
+            "Dataset Encryption Key",
+            tooltip="Session-only key used for encrypted source and cache files. It is not saved in presets, config JSON, secrets.json, or backups.",
+        )
+        self.components.entry(
+            frame,
+            10,
+            1,
+            ui_state,
+            "secrets.dataset_encryption_key",
+            width=260,
+            password=True,
+        )
 
     def build_sampling_tab_header(self, top_frame, sub_frame, controller, ui_state):
         self.components.label(top_frame, 0, 0, "Sample After",

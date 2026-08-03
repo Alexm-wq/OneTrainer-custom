@@ -18,7 +18,15 @@ from modules.util.enum.CloudType import CloudType
 class CloudTrainer(BaseTrainer):
 
     def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands, reattach: bool=False):
-        super().__init__(config, callbacks, commands)
+        # A detached remote trainer already has its key in its process
+        # environment. Reattaching must not require storing or re-entering that
+        # key on the local client.
+        super().__init__(
+            config,
+            callbacks,
+            commands,
+            require_encryption_key=not reattach,
+        )
         self.error_caught=False
         self.callback_thread=None
         self.sync_thread=None

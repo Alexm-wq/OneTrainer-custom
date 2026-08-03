@@ -12,6 +12,7 @@ from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.encryption_util import configure_data_encryption
 from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
 
@@ -25,9 +26,20 @@ class BaseTrainer(
 
     tensorboard_subprocess: subprocess.Popen
 
-    def __init__(self, config: TrainConfig, callbacks: TrainCallbacks, commands: TrainCommands):
+    def __init__(
+            self,
+            config: TrainConfig,
+            callbacks: TrainCallbacks,
+            commands: TrainCommands,
+            *,
+            require_encryption_key: bool = True,
+    ):
         super().__init__()
         self.config = config
+        configure_data_encryption(
+            self.config,
+            require_key=require_encryption_key,
+        )
         self.callbacks = callbacks
         self.commands = commands
         self.train_device = torch.device(self.config.train_device)

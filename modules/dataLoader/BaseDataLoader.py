@@ -5,6 +5,7 @@ from modules.dataLoader.mixin.DataLoaderMgdsMixin import DataLoaderMgdsMixin
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.encryption_util import configure_data_encryption
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.MGDS import MGDS, TrainDataLoader
@@ -29,6 +30,7 @@ class BaseDataLoader(
     ):
         super().__init__()
 
+        configure_data_encryption(config)
         self.train_device = train_device
         self.temp_device = temp_device
 

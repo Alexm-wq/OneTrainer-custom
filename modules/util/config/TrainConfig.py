@@ -11,6 +11,7 @@ from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.SecretsConfig import SecretsConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
+from modules.util.enum.CacheEncryptionScope import CacheEncryptionScope
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
 from modules.util.enum.EMAMode import EMAMode
@@ -449,6 +450,10 @@ class TrainConfig(BaseConfig):
     image_caching: bool
     text_caching: bool
     clear_cache_before_training: bool
+    use_cache_only: bool
+    dataset_encryption_enabled: bool
+    cache_encryption_enabled: bool
+    cache_encryption_scope: CacheEncryptionScope
 
     # training settings
     learning_rate_scheduler: LearningRateScheduler
@@ -1127,6 +1132,10 @@ class TrainConfig(BaseConfig):
         data.append(("image_caching", True, bool, False))
         data.append(("text_caching", True, bool, False))
         data.append(("clear_cache_before_training", True, bool, False))
+        data.append(("use_cache_only", False, bool, False))
+        data.append(("dataset_encryption_enabled", False, bool, False))
+        data.append(("cache_encryption_enabled", False, bool, False))
+        data.append(("cache_encryption_scope", CacheEncryptionScope.ENCRYPTED_SOURCES, CacheEncryptionScope, False))
 
         # training settings
         data.append(("learning_rate_scheduler", LearningRateScheduler.CONSTANT, LearningRateScheduler, False))

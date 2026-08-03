@@ -120,8 +120,9 @@ class DeriveDPORejectedPath(
             self._cache_modes.append('dpo')
             dpo_count += 1
 
-            if resolve_aspect_ratio("", image_path) != resolve_aspect_ratio("", rejected_path):
-                aspect_mismatches.append(f"{image_path} vs {rejected_path}")
+            # Do not reopen chosen/rejected source images during dataset
+            # reconstruction or backup resume. Pair geometry is handled by the
+            # training pipeline and can be inspected explicitly through Check Pairs.
 
         if missing:
             raise RuntimeError(

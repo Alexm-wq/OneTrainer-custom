@@ -41,6 +41,7 @@ class TopBarController:
             ("QwenImage", ModelType.QWEN),
             ("Anima", ModelType.ANIMA),
             ("Krea 2", ModelType.KREA_2),
+            ("PRX Pixel", ModelType.PRX_PIXEL),
             ("Z-Image", ModelType.Z_IMAGE),
             ("Ernie Image", ModelType.ERNIE),
             ("Ideogram 4", ModelType.IDEOGRAM_4),
@@ -104,7 +105,11 @@ class TopBarController:
             return None
 
     def save_secrets(self, path) -> str:
-        write_json_atomic(path, self.train_config.secrets.to_dict())
+        secrets = self.train_config.secrets.to_dict()
+        # Dataset keys are session-only. Saving them beside the configuration
+        # would defeat the purpose of encrypting data before uploading it.
+        secrets["dataset_encryption_key"] = ""
+        write_json_atomic(path, secrets)
         return path
 
     def open_wiki(self):

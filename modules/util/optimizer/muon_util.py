@@ -57,6 +57,10 @@ def build_muon_adam_key_fn(
                     'text_fusion.layerwise_blocks',
                     'text_fusion.refiner_blocks',
                 ]
+            case ModelType.PRX_PIXEL:
+                default_patterns = [
+                    'blocks',
+                ]
             case _: # Unmatched cases
                 raise NotImplementedError(f"Default hidden layer patterns are not defined for model type: {model.model_type}")
         filters = [ModuleFilter(p, use_regex=False) for p in default_patterns]

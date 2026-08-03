@@ -102,7 +102,12 @@ class GenericTrainer(BaseTrainer):
         if multi.is_master():
             self.__save_config_to_workspace()
 
-            if self.config.clear_cache_before_training and (self.config.image_caching or self.config.text_caching):
+            if self.config.use_cache_only and self.config.clear_cache_before_training:
+                print(
+                    "[OT-CACHE-ONLY] Ignoring 'Clear cache before training'; "
+                    "cache-only mode never deletes or rebuilds cache files."
+                )
+            elif self.config.clear_cache_before_training and (self.config.image_caching or self.config.text_caching):
                 self.__clear_cache()
 
         if self.config.train_dtype.enable_tf():
@@ -1339,9 +1344,10 @@ class GenericTrainer(BaseTrainer):
 
         if self.config.only_cache:
             if multi.is_master():
-                self.callbacks.on_update_status("Caching")
-                for _epoch in tqdm(range(train_progress.epoch, self.config.epochs, 1), desc="epoch"):
-                    self.data_loader.get_data_set().start_next_epoch()
+                self.callbacks.on_update_status("Caching all variations")
+                # Cache modules now warm every configured variation on their
+                # first start. Replaying every epoch would only rebuild ordering.
+                self.data_loader.get_data_set().start_next_epoch()
             return
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None

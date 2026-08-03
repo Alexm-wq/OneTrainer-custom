@@ -496,6 +496,15 @@ def enable_checkpointing_for_krea2_transformer(
         (model.transformer_blocks,           ["hidden_states"]),
     ])
 
+def enable_checkpointing_for_prx_transformer(
+        model: nn.Module,
+        config: TrainConfig,
+        part: TrainModelPartConfig,
+) -> LayerOffloadConductor | None:
+    return enable_checkpointing(model, config, part, config.compile, [
+        (model.blocks, ["hidden_states", "encoder_hidden_states"]),
+    ])
+
 def enable_checkpointing_for_qwen3vl_encoder_layers(
         model: nn.Module,
         config: TrainConfig,

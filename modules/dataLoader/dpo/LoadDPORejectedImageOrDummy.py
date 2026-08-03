@@ -4,6 +4,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageOps
 
+from mgds.crypto import open_source_binary
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
@@ -62,17 +63,18 @@ class LoadDPORejectedImageOrDummy(
 
     def _load_image(self, path: str) -> torch.Tensor:
         path = str(Path(path))
-        with Image.open(path) as img:
-            img = ImageOps.exif_transpose(img)
-            if self.channels == 1:
-                img = img.convert("L")
-                arr = np.asarray(img, dtype=np.float32)[None, :, :]
-            elif self.channels == 4:
-                img = img.convert("RGBA")
-                arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)
-            else:
-                img = img.convert("RGB")
-                arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)
+        with open_source_binary(path) as source:
+            with Image.open(source) as img:
+                img = ImageOps.exif_transpose(img)
+                if self.channels == 1:
+                    img = img.convert("L")
+                    arr = np.asarray(img, dtype=np.float32)[None, :, :]
+                elif self.channels == 4:
+                    img = img.convert("RGBA")
+                    arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)
+                else:
+                    img = img.convert("RGB")
+                    arr = np.asarray(img, dtype=np.float32).transpose(2, 0, 1)
 
         arr = arr / 255.0
         arr = arr * (self.range_max - self.range_min) + self.range_min

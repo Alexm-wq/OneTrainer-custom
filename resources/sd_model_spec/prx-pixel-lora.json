@@ -1,0 +1,11 @@
+{
+  "modelspec.sai_model_spec": "1.0.0",
+  "modelspec.architecture": "prx-pixel/lora",
+  "modelspec.implementation": "diffusers",
+  "modelspec.title": "PRX Pixel LoRA",
+  "modelspec.description": "LoRA adapter for Photoroom PRX Pixel",
+  "modelspec.author": "",
+  "modelspec.license": "Apache-2.0",
+  "modelspec.resolution": "1024",
+  "modelspec.prediction_type": "x0"
+}

@@ -1,3 +1,4 @@
+import base64
 import pickle
 import shlex
 import threading
@@ -153,6 +154,17 @@ class LinuxCloud(BaseCloud):
 
         if self.config.secrets.huggingface_token != "":
             cmd+=f" && export HF_TOKEN={self.config.secrets.huggingface_token}"
+        if (
+                self.config.dataset_encryption_enabled
+                or self.config.cache_encryption_enabled
+        ):
+            encoded_key = base64.b64encode(
+                self.config.secrets.dataset_encryption_key.encode("utf-8")
+            ).decode("ascii")
+            cmd += (
+                " && export OT_DATASET_ENCRYPTION_KEY_B64="
+                f"{shlex.quote(encoded_key)}"
+            )
         if config.huggingface_cache_dir != "":
             cmd+=f" && export HF_HOME={config.huggingface_cache_dir}"
 
