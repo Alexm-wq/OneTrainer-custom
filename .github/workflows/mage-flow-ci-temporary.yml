@@ -97,20 +97,20 @@ jobs:
           assert callable(load_from_repo) and callable(generate_images)
           print('Microsoft Mage runtime on OneTrainer torch', torch.__version__, ': PASS')
           PY
-      - name: Import and verify Mage OneTrainer registrations
+      - name: Bootstrap OneTrainer and verify Mage registrations
         env:
           PYTHONPATH: /tmp/Mage-runtime
         run: |
           pixi run -e cpu python - <<'PY'
-          # Existing custom-branch encryption_util imports an mgds.crypto module
-          # that is absent from the repository's pinned MGDS commit. Stub only
-          # that unrelated pre-existing symbol so it cannot mask Mage imports.
           import sys, types
           crypto = types.ModuleType('mgds.crypto')
           crypto.configure_encryption_key = lambda *args, **kwargs: None
           sys.modules['mgds.crypto'] = crypto
 
-          from modules.util import factory
+          # Use OneTrainer's actual bootstrap order. Direct-importing an
+          # individual setup first creates an artificial optimizer_util/create
+          # circular import that normal OneTrainer startup does not use.
+          from modules.util import create, factory
           from modules.util.enum.ModelType import ModelType
           from modules.util.enum.TrainingMethod import TrainingMethod
           from modules.modelLoader.BaseModelLoader import BaseModelLoader
@@ -118,15 +118,6 @@ jobs:
           from modules.dataLoader.BaseDataLoader import BaseDataLoader
           from modules.modelSampler.BaseModelSampler import BaseModelSampler
           from modules.modelSaver.BaseModelSaver import BaseModelSaver
-
-          import modules.modelLoader.MageFlowLoRAModelLoader
-          import modules.modelLoader.MageFlowFineTuneModelLoader
-          import modules.modelSetup.MageFlowLoRASetup
-          import modules.modelSetup.MageFlowFineTuneSetup
-          import modules.dataLoader.MageFlowBaseDataLoader
-          import modules.modelSampler.MageFlowSampler
-          import modules.modelSaver.MageFlowLoRAModelSaver
-          import modules.modelSaver.MageFlowFineTuneModelSaver
 
           assert ModelType.MAGE_FLOW.is_mage_flow()
           assert ModelType.MAGE_FLOW.is_flow_matching()
@@ -139,7 +130,7 @@ jobs:
           assert factory.get(BaseModelSampler, ModelType.MAGE_FLOW)
           assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.LORA)
           assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE)
-          print('Mage OneTrainer registrations: PASS')
+          print('Mage OneTrainer registrations via normal bootstrap: PASS')
           PY
       - name: Run Mage model helper tests
         env:
