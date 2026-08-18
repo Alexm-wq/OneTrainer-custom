@@ -179,6 +179,7 @@ flash-attn-4 = { version = "==4.0.0b23", extras = ["cu13"] }
 
 [tool.pixi.feature.cuda13.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
+prerelease-mode = "allow"
 
 [tool.pixi.feature.cuda12]
 platforms = ["linux-cuda12", "win-cuda12"]
