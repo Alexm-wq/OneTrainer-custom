@@ -101,7 +101,6 @@ cuda13 = [
 cuda12 = ["onetrainer[cuda13]"]
 
 rocm = [
-  # pytorch
   "torch==2.12.0",
   "torchvision==0.27.0",
   "onnxruntime==1.23.2",
@@ -172,6 +171,12 @@ ui = { cmd = "python scripts/train_ui.py", cwd = "." }
 
 [tool.pixi.feature.cuda13]
 platforms = ["linux-cuda13", "win-cuda13"]
+
+# FlashAttention 4 is the native Mage-Flow attention backend on CUDA 13/Blackwell.
+# Keep it Pixi-feature-specific so the cuda12 package-extra alias does not pull
+# CUDA 13 CuTeDSL dependencies into the cuda12 environment.
+[tool.pixi.feature.cuda13.pypi-dependencies]
+flash-attn-4 = { version = "==4.0.0b23", extras = ["cu13"], marker = "sys_platform == 'linux'" }
 
 [tool.pixi.feature.cuda13.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
