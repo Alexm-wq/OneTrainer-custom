@@ -1,5 +1,5 @@
 {
-    "base_model_name": "microsoft/Mage-Flow-Base",
+    "base_model_name": "SceneWorks/Mage-Flow-Base",
     "model_type": "MAGE_FLOW",
     "training_method": "LORA",
     "output_model_format": "DIFFUSERS_LORA",
