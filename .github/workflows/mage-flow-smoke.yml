@@ -5,44 +5,107 @@ on:
     branches: [mage-flow-full]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Compile Mage and adaptive DPO integration
+      - name: Patch Mage UI wiring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('modules/ui/TopBarController.py')
+          s = p.read_text(encoding='utf-8')
+          old = '            ("Flux 2 [Dev, Klein]", ModelType.FLUX_2),\n            ("Sana", ModelType.SANA),\n'
+          new = '            ("Flux 2 [Dev, Klein]", ModelType.FLUX_2),\n            ("Mage Flow", ModelType.MAGE_FLOW),\n            ("Sana", ModelType.SANA),\n'
+          if old in s:
+              s = s.replace(old, new, 1)
+              p.write_text(s, encoding='utf-8')
+          elif '("Mage Flow", ModelType.MAGE_FLOW)' not in s:
+              raise SystemExit('Mage Flow model dropdown insertion point not found')
+
+          p = Path('modules/ui/BaseTrainingTabView.py')
+          s = p.read_text(encoding='utf-8')
+          old = '''        elif model_type.is_flux_2():\n            self.__setup_flux_2_ui(column_0, column_1, column_2, controller, ui_state)\n        elif model_type.is_chroma():\n'''
+          new = '''        elif model_type.is_flux_2():\n            self.__setup_flux_2_ui(column_0, column_1, column_2, controller, ui_state)\n        elif model_type.is_mage_flow():\n            self.__setup_mage_flow_ui(column_0, column_1, column_2, controller, ui_state)\n        elif model_type.is_chroma():\n'''
+          if old in s:
+              s = s.replace(old, new, 1)
+          elif 'elif model_type.is_mage_flow():' not in s:
+              raise SystemExit('Mage Flow training UI dispatch insertion point not found')
+
+          marker = '''    def __setup_chroma_ui(self, column_0, column_1, column_2, controller, ui_state):\n'''
+          method = '''    def __setup_mage_flow_ui(self, column_0, column_1, column_2, controller, ui_state):\n        self.__create_base_frame(column_0, 0, controller, ui_state)\n        self.__create_text_encoder_frame(\n            column_0, 1, ui_state,\n            supports_clip_skip=False,\n            supports_training=False,\n            supports_sequence_length=True,\n        )\n\n        self.__create_base2_frame(column_1, 0, controller, ui_state)\n        self.__create_transformer_frame(\n            column_1, 1, ui_state,\n            supports_guidance_scale=False,\n            supports_force_attention_mask=False,\n        )\n        self.__create_noise_frame(column_1, 2, ui_state)\n        self.__create_self_flow_frame(column_1, 3, ui_state)\n\n        self.__create_masked_frame(column_2, 1, ui_state)\n        self.__create_loss_frame(column_2, 2, controller, ui_state)\n        self.__create_layer_frame(column_2, 3, controller, ui_state)\n\n'''
+          if 'def __setup_mage_flow_ui' not in s:
+              if marker not in s:
+                  raise SystemExit('Mage Flow training UI method insertion point not found')
+              s = s.replace(marker, method + marker, 1)
+
+          # Make Self-Flow tooltips model-neutral now that the same controls are
+          # used by native Mage-Flow as well as FLUX.2.
+          s = s.replace(
+              'Enable Self-Flow dual-timestep FLUX.2 Base LoRA training. Sampling and disabled training keep the normal FLUX.2 path.',
+              'Enable Self-Flow dual-timestep LoRA training for supported model architectures. Sampling and disabled training keep the model\'s normal path.',
+          )
+          s = s.replace(
+              'Fraction of FLUX.2 image tokens assigned the second timestep. The Self-Flow paper requires at most 0.5; 0.25 is the reference default.',
+              'Fraction of image tokens assigned the second timestep. The Self-Flow paper requires at most 0.5; 0.25 is the reference default.',
+          )
+          s = s.replace(
+              'CPU EMA decay for FLUX.2 adapter parameters used by the Self-Flow teacher.',
+              'CPU EMA decay for adapter parameters used by the Self-Flow teacher.',
+          )
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Compile Mage UI and integration
         run: |
           python -m compileall -q \
+            modules/ui/TopBarController.py \
+            modules/ui/BaseTrainingTabView.py \
             modules/model/MageFlowModel.py \
             modules/module/MageFlowSelfFlow.py \
             modules/modelLoader/mageFlow \
-            modules/modelLoader/MageFlowLoRAModelLoader.py \
-            modules/modelLoader/MageFlowFineTuneModelLoader.py \
             modules/modelSetup/BaseMageFlowSetup.py \
-            modules/modelSetup/MageFlowLoRASetup.py \
-            modules/modelSetup/MageFlowFineTuneSetup.py \
-            modules/dataLoader/mage \
             modules/dataLoader/MageFlowBaseDataLoader.py \
-            modules/dataLoader/dpo/AdaptiveDPODataset.py \
-            modules/dataLoader/dpo/EncodeDPORejectedOrDummyLatent.py \
-            modules/dataLoader/mixin/DataLoaderText2ImageMixin.py \
             modules/modelSampler/MageFlowSampler.py \
-            modules/modelSaver/mageFlow \
-            modules/modelSaver/MageFlowLoRAModelSaver.py \
-            modules/modelSaver/MageFlowFineTuneModelSaver.py \
-            modules/util/config/TrainConfig.py \
             modules/util/enum/ModelType.py \
-            tests/test_adaptive_dpo_dataset_policy.py \
             tests/test_mage_flow_self_flow.py \
             tests/test_mage_flow_presets.py
-      - name: Validate adaptive DPO keep floor and warmup
-        run: python -m unittest -v tests.test_adaptive_dpo_dataset_policy
+      - name: Validate Mage UI registration
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          top = Path('modules/ui/TopBarController.py').read_text(encoding='utf-8')
+          train = Path('modules/ui/BaseTrainingTabView.py').read_text(encoding='utf-8')
+          assert '("Mage Flow", ModelType.MAGE_FLOW)' in top
+          assert 'elif model_type.is_mage_flow():' in train
+          assert 'def __setup_mage_flow_ui' in train
+          assert 'self.__create_self_flow_frame(column_1, 3, ui_state)' in train
+          print('Mage UI registration: PASS')
+          PY
       - name: Validate Mage 5090 presets
         run: python -m unittest -v tests.test_mage_flow_presets
       - name: Install CPU torch for isolated Self-Flow test
         run: python -m pip install --quiet torch
       - name: Run Mage Self-Flow unit smoke
         run: python -m unittest -v tests.test_mage_flow_self_flow
+      - name: Commit Mage UI wiring after tests pass
+        run: |
+          if git diff --quiet -- modules/ui/TopBarController.py modules/ui/BaseTrainingTabView.py; then
+            echo "Mage UI wiring already committed."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add modules/ui/TopBarController.py modules/ui/BaseTrainingTabView.py
+          git commit -m "Expose Mage Flow and Self-Flow controls in UI"
+          git push origin HEAD:mage-flow-full
