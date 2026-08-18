@@ -32,15 +32,23 @@ class ModelType(Enum):
     MAGE_FLOW = 'MAGE_FLOW'
 
     SANA = 'SANA'
+
     HUNYUAN_VIDEO = 'HUNYUAN_VIDEO'
+
     HI_DREAM_FULL = 'HI_DREAM_FULL'
+
     CHROMA_1 = 'CHROMA_1'
+
     QWEN = 'QWEN'
+
     ANIMA = 'ANIMA'
     KREA_2 = 'KREA_2'
     PRX_PIXEL = 'PRX_PIXEL'
+
     Z_IMAGE = 'Z_IMAGE'
+
     ERNIE = 'ERNIE'
+
     IDEOGRAM_4 = 'IDEOGRAM_4'
 
     def __str__(self):
@@ -130,6 +138,8 @@ class ModelType(Enum):
         return self == ModelType.IDEOGRAM_4
 
     def supports_negative_prompt(self) -> bool:
+        # asymmetric dual-network CFG models drive the negative branch from a frozen unconditional network (or an
+        # empty prompt), not a user-supplied negative prompt
         return not self.is_ideogram()
 
     def has_mask_input(self) -> bool:
@@ -185,7 +195,7 @@ class ModelType(Enum):
             or self.is_ideogram()
 
     def is_video_model(self) -> bool:
-        return self.is_hunyuan_video()
+        return self.is_hunyuan_video() #incase we add more video models in the future
 
     def model_parts(self) -> tuple[str, ...]:
         return _MODEL_PARTS[self]
@@ -211,9 +221,11 @@ class ModelType(Enum):
         raise ValueError(f"No supported training methods defined for model type {self}")
 
     def denoising_model_part(self) -> str:
+        # the denoising model component (unet / transformer / prior), always listed first in model_parts().
         return _MODEL_PARTS[self][0]
 
     def text_encoder_parts(self) -> tuple[str, ...]:
+        # the text encoder components, named "text_encoder"/"text_encoder_2"/... by convention (see below).
         return tuple(part for part in _MODEL_PARTS[self] if part.startswith("text_encoder"))
 
     def supported_lora_formats(self) -> list[ModelFormat]:
@@ -277,7 +289,10 @@ class ModelType(Enum):
         else:
             raise ValueError(f"Unsupported training method: {training_method}")
 
-
+# The components each model type has, keyed by TrainConfig field names, as the single source of truth.
+# The diffusion model (unet / transformer / prior) is always listed first; the first text encoder is
+# "text_encoder" (matching the config field), even for multi-encoder models that refer to it as
+# "text_encoder_1" elsewhere in the code.
 _MODEL_PARTS: dict[ModelType, tuple[str, ...]] = {
     ModelType.STABLE_DIFFUSION_15: ("unet", "text_encoder", "vae"),
     ModelType.STABLE_DIFFUSION_15_INPAINTING: ("unet", "text_encoder", "vae"),
@@ -291,6 +306,7 @@ _MODEL_PARTS: dict[ModelType, tuple[str, ...]] = {
     ModelType.STABLE_DIFFUSION_35: ("transformer", "text_encoder", "text_encoder_2", "text_encoder_3", "vae"),
     ModelType.STABLE_DIFFUSION_XL_10_BASE: ("unet", "text_encoder", "text_encoder_2", "vae"),
     ModelType.STABLE_DIFFUSION_XL_10_BASE_INPAINTING: ("unet", "text_encoder", "text_encoder_2", "vae"),
+    # Only Würstchen v2's decoder has its own text encoder; Stable Cascade's decoder does not.
     ModelType.WUERSTCHEN_2: ("prior", "text_encoder", "effnet_encoder", "decoder", "decoder_text_encoder", "decoder_vqgan"),
     ModelType.STABLE_CASCADE_1: ("prior", "text_encoder", "effnet_encoder", "decoder", "decoder_vqgan"),
     ModelType.PIXART_ALPHA: ("transformer", "text_encoder", "vae"),
