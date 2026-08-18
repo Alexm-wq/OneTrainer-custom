@@ -62,6 +62,8 @@ jobs:
           encryption = Path('modules/util/encryption_util.py').read_text(encoding='utf-8')
           ui = Path('modules/ui/TrainUIController.py').read_text(encoding='utf-8')
           mage = Path('modules/modelLoader/mageFlow/MageFlowModelLoader.py').read_text(encoding='utf-8')
+          mage_cache = Path('modules/dataLoader/mage/EncodeMageText.py').read_text(encoding='utf-8')
+          mage_loader = Path('modules/dataLoader/MageFlowBaseDataLoader.py').read_text(encoding='utf-8')
 
           assert 'class MissingEncryptionKeyError(RuntimeError)' in encryption
           assert 'configure_data_encryption(self.train_config)' in ui
@@ -85,7 +87,15 @@ jobs:
           assert 'if major == 12:' in mage
           assert 'return "sdpa", "sdpa"' in mage
           assert 'quantized_weight_layers=' in mage
-          print('Encryption recovery, Mage quantization, and SM120 attention guard: PASS')
+          assert 'weight_dtypes.text_encoder.is_quantized() and te_quantized == 0' in mage
+          assert 'model.mage_attention_backend = mage_attn_backend' in mage
+
+          assert '_MAGE_TEXT_ATTENTION_LOCK = threading.Lock()' in mage_cache
+          assert 'set_attn_backend("sdpa")' in mage_cache
+          assert 'set_attn_backend(self.restore_attention_backend)' in mage_cache
+          assert 'restore_attention_backend=getattr(' in mage_loader
+
+          print('Encryption recovery, Mage quantization, and text-cache attention guards: PASS')
           PY
       - name: Validate adaptive DPO keep floor and warmup
         run: python -m unittest -v tests.test_adaptive_dpo_dataset_policy
