@@ -139,7 +139,9 @@ class MageFlowModel(BaseModel):
 
     @staticmethod
     def image_shapes(batch_size: int, height: int, width: int):
-        return [[(1, int(height), int(width))] for _ in range(batch_size)]
+        # Official Mage packed convention: one outer pack containing one
+        # (frames, height, width) tuple for every sample in that pack.
+        return [[(1, int(height), int(width)) for _ in range(batch_size)]]
 
     @staticmethod
     def _cu_seqlens(lengths: list[int], device: torch.device) -> Tensor:
