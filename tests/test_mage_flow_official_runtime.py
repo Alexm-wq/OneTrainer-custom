@@ -77,6 +77,16 @@ class MageOfficialRuntimeTests(unittest.TestCase):
         ours = self._ours(tokenwise).predicted
         torch.testing.assert_close(ours, official, rtol=2e-5, atol=2e-6)
 
+    def test_mixed_tokenwise_timesteps_actually_change_output(self):
+        homogeneous = torch.cat([
+            self.timesteps[0].repeat(self.image_tokens_per_sample),
+            self.timesteps[1].repeat(self.image_tokens_per_sample),
+        ]).reshape(1, -1)
+        mixed = torch.tensor([[0.2, 0.8, 0.2, 0.8, 0.7, 0.1, 0.7, 0.1]])
+        base = self._ours(homogeneous).predicted
+        changed = self._ours(mixed).predicted
+        self.assertGreater((changed - base).abs().max().item(), 1e-5)
+
     def test_real_mage_tokenwise_checkpoint_backward(self):
         tokenwise = torch.tensor([[0.2, 0.8, 0.2, 0.8, 0.7, 0.1, 0.7, 0.1]])
         result = self._ours(tokenwise, checkpoint=True)
