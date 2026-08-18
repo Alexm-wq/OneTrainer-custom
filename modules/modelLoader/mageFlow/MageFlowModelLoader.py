@@ -19,9 +19,13 @@ class MageFlowModelLoader:
             return load_from_repo
         except ImportError as exc:
             raise RuntimeError(
-                "Mage-Flow support requires Microsoft's official mage_flow package. "
-                "Install it in the active OneTrainer environment with: "
-                "python -m pip install --no-deps 'git+https://github.com/microsoft/Mage.git'"
+                "Mage-Flow support requires Microsoft's official mage_flow package/source. "
+                "Microsoft keeps the package metadata in the repository's mage_flow/ subdirectory. "
+                "Either add a clone of https://github.com/microsoft/Mage to PYTHONPATH, or install that "
+                "subdirectory without replacing OneTrainer's pinned torch stack, e.g. "
+                "python -m pip install --no-deps "
+                "'git+https://github.com/microsoft/Mage.git#subdirectory=mage_flow'. "
+                "Mage also requires the lightweight runtime packages einops>=0.8 and loguru>=0.7."
             ) from exc
 
     def load(
@@ -58,13 +62,13 @@ class MageFlowModelLoader:
 
         model.model_type = model_type
         model.base_model_name = model_names.base_model
-        model.official_model = official
         model.tokenizer = official.txt_enc.tokenizer
         model.noise_scheduler = official.scheduler
         model.text_encoder_wrapper = official.txt_enc
         model.text_encoder = official.txt_enc.hf_module
         model.vae = official.vae
         model.transformer = official.transformer
+        model.official_model = official
 
         transformer_dtype = weight_dtypes.transformer.torch_dtype()
         vae_dtype = weight_dtypes.vae.torch_dtype()
