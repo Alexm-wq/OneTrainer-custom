@@ -5,56 +5,14 @@ on:
     branches: [mage-flow-full]
   workflow_dispatch:
 
-permissions:
-  contents: write
-
 jobs:
   smoke:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: mage-flow-full
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-      - name: Apply adaptive DPO policy hardening
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          p = Path("modules/dataLoader/dpo/AdaptiveDPODataset.py")
-          s = p.read_text(encoding="utf-8")
-          old = '''        self.ema_decay = min(max(float(ema_decay), 0.0), 0.999999)\n        # TEMP: no multi-observation warmup.\n        # A pair becomes adaptive immediately after its first valid loss observation.\n        self.min_observations = 1\n        self.min_keep_probability = min(max(float(min_keep_probability), 0.0), 1.0)\n'''
-          new = '''        self.ema_decay = min(max(float(ema_decay), 0.0), 0.999999)\n        # Require three successful observations before a pair can surrender its\n        # own slot. Old/hand-edited configs may request less, but the runtime\n        # warm-up floor is deliberately hard so one noisy early loss cannot\n        # immediately reshape the dataset.\n        self.min_observations = max(int(min_observations), 3)\n        # Every pair keeps at least 25% of its original sampling opportunities,\n        # regardless of how easy its EMA becomes or what an old config says.\n        # Higher user-specified maintenance probabilities remain supported.\n        self.min_keep_probability = min(max(float(min_keep_probability), 0.25), 1.0)\n'''
-          if old not in s:
-              if new not in s:
-                  raise SystemExit("AdaptiveDPODataset policy block not found")
-          else:
-              s = s.replace(old, new, 1)
-              p.write_text(s, encoding="utf-8")
-
-          p = Path("modules/util/config/TrainConfig.py")
-          s = p.read_text(encoding="utf-8")
-          old = '        data.append(("rlhf_dpo_adaptive_dataset_min_keep_probability", 0.1, float, False))\n'
-          new = '        data.append(("rlhf_dpo_adaptive_dataset_min_keep_probability", 0.25, float, False))\n'
-          if old in s:
-              s = s.replace(old, new, 1)
-              p.write_text(s, encoding="utf-8")
-          elif new not in s:
-              raise SystemExit("TrainConfig adaptive keep default not found")
-
-          p = Path("modules/dataLoader/mixin/DataLoaderText2ImageMixin.py")
-          s = p.read_text(encoding="utf-8")
-          old = '''                    "rlhf_dpo_adaptive_dataset_min_keep_probability",\n                    0.1,\n'''
-          new = '''                    "rlhf_dpo_adaptive_dataset_min_keep_probability",\n                    0.25,\n'''
-          if old in s:
-              s = s.replace(old, new, 1)
-              p.write_text(s, encoding="utf-8")
-          elif new not in s:
-              raise SystemExit("DataLoader adaptive keep fallback not found")
-          PY
       - name: Compile Mage and adaptive DPO integration
         run: |
           python -m compileall -q \
@@ -88,14 +46,3 @@ jobs:
         run: python -m pip install --quiet torch
       - name: Run Mage Self-Flow unit smoke
         run: python -m unittest -v tests.test_mage_flow_self_flow
-      - name: Commit adaptive DPO hardening after tests pass
-        run: |
-          if git diff --quiet -- modules/dataLoader/dpo/AdaptiveDPODataset.py modules/dataLoader/mixin/DataLoaderText2ImageMixin.py modules/util/config/TrainConfig.py; then
-            echo "Adaptive DPO policy already committed."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add modules/dataLoader/dpo/AdaptiveDPODataset.py modules/dataLoader/mixin/DataLoaderText2ImageMixin.py modules/util/config/TrainConfig.py
-          git commit -m "Harden adaptive DPO keep floor and warmup"
-          git push origin HEAD:mage-flow-full
