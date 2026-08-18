@@ -15,8 +15,8 @@ class MageFlowModelLoader:
     @staticmethod
     def _require_mage():
         try:
-            from mage_flow.pipeline import load_from_repo
-            return load_from_repo
+            import mage_flow.pipeline as mage_pipeline
+            return mage_pipeline
         except ImportError as exc:
             raise RuntimeError(
                 "Mage-Flow is part of OneTrainer's cuda13 Pixi environment. "
@@ -53,17 +53,28 @@ class MageFlowModelLoader:
         if not model_names.base_model:
             raise ValueError("Mage-Flow requires a base model directory or Hugging Face repository id")
 
-        load_from_repo = self._require_mage()
+        mage_pipeline = self._require_mage()
         mage_attn_backend, hf_attn_impl = self._resolve_attention_backend()
 
-        # Upstream Mage constructs ModelConfig without an attn_type override, so
-        # it defaults to flash2. Force the Qwen3-VL constructor independently,
-        # then switch Mage's shared packed attention shim after construction.
+        # Upstream load_from_repo() constructs ModelConfig without attn_type,
+        # which otherwise selects its default "flash2" before the text encoder
+        # is created. Force the backend at the actual ModelConfig construction
+        # point so BOTH Mage's packed-varlen attention and Qwen3-VL are created
+        # with FA4. Keep the HF env override as a belt-and-suspenders override
+        # for the Qwen constructor, then restore all upstream globals afterward.
+        original_model_config = mage_pipeline.ModelConfig
         previous_hf_attn_impl = os.environ.get("VF_HF_ATTN_IMPL")
+
+        def model_config_with_attention(*args, **kwargs):
+            kwargs["attn_type"] = mage_attn_backend
+            return original_model_config(*args, **kwargs)
+
+        mage_pipeline.ModelConfig = model_config_with_attention
         os.environ["VF_HF_ATTN_IMPL"] = hf_attn_impl
         try:
-            official = load_from_repo(model_names.base_model, device="cpu")
+            official = mage_pipeline.load_from_repo(model_names.base_model, device="cpu")
         finally:
+            mage_pipeline.ModelConfig = original_model_config
             if previous_hf_attn_impl is None:
                 os.environ.pop("VF_HF_ATTN_IMPL", None)
             else:
