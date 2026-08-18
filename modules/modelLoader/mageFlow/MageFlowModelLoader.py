@@ -19,13 +19,9 @@ class MageFlowModelLoader:
             return load_from_repo
         except ImportError as exc:
             raise RuntimeError(
-                "Mage-Flow support requires Microsoft's official mage_flow package/source. "
-                "Microsoft keeps the package metadata in the repository's mage_flow/ subdirectory. "
-                "Either add a clone of https://github.com/microsoft/Mage to PYTHONPATH, or install that "
-                "subdirectory without replacing OneTrainer's pinned torch stack, e.g. "
-                "python -m pip install --no-deps "
-                "'git+https://github.com/microsoft/Mage.git#subdirectory=mage_flow'. "
-                "Mage also requires the lightweight runtime packages einops>=0.8 and loguru>=0.7."
+                "Mage-Flow support is installed by OneTrainer's dedicated mage-cuda13 Pixi environment. "
+                "From the OneTrainer repository run: pixi run -e mage-cuda13 mage-setup. "
+                "Then launch OneTrainer with: pixi run -e mage-cuda13 ui."
             ) from exc
 
     def load(
