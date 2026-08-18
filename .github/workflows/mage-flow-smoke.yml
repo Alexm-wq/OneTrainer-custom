@@ -1,0 +1,39 @@
+name: Mage-Flow smoke
+
+on:
+  pull_request:
+    branches: [mage-flow-ci-base]
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Compile Mage integration
+        run: |
+          python -m compileall -q \
+            modules/model/MageFlowModel.py \
+            modules/module/MageFlowSelfFlow.py \
+            modules/modelLoader/mageFlow \
+            modules/modelLoader/MageFlowLoRAModelLoader.py \
+            modules/modelLoader/MageFlowFineTuneModelLoader.py \
+            modules/modelSetup/BaseMageFlowSetup.py \
+            modules/modelSetup/MageFlowLoRASetup.py \
+            modules/modelSetup/MageFlowFineTuneSetup.py \
+            modules/dataLoader/mage \
+            modules/dataLoader/MageFlowBaseDataLoader.py \
+            modules/dataLoader/dpo/EncodeDPORejectedOrDummyLatent.py \
+            modules/modelSampler/MageFlowSampler.py \
+            modules/modelSaver/mageFlow \
+            modules/modelSaver/MageFlowLoRAModelSaver.py \
+            modules/modelSaver/MageFlowFineTuneModelSaver.py \
+            modules/util/enum/ModelType.py \
+            tests/test_mage_flow_self_flow.py
+      - name: Install CPU torch for isolated Self-Flow test
+        run: python -m pip install --quiet torch
+      - name: Run Mage Self-Flow unit smoke
+        run: python -m unittest -v tests.test_mage_flow_self_flow
