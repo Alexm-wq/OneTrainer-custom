@@ -105,12 +105,12 @@ jobs:
           print('OneTrainer CPU environment:', sys.version.split()[0], torch.__version__)
           PY
 
-      - name: Install current Microsoft Mage without dependency mutation
-        run: |
-          git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
-          pixi run -e cpu python -m pip install --no-deps /tmp/Mage-runtime
+      - name: Checkout current Microsoft Mage without dependency mutation
+        run: git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
 
       - name: Import Mage runtime on OneTrainer torch 2.12
+        env:
+          PYTHONPATH: /tmp/Mage-runtime
         run: |
           pixi run -e cpu python - <<'PY'
           import inspect
@@ -127,6 +127,8 @@ jobs:
           PY
 
       - name: Import and verify OneTrainer Mage registrations
+        env:
+          PYTHONPATH: /tmp/Mage-runtime
         run: |
           pixi run -e cpu python - <<'PY'
           from modules.util import factory
