@@ -520,7 +520,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 min_keep_probability=float(getattr(
                     config,
                     "rlhf_dpo_adaptive_dataset_min_keep_probability",
-                    0.1,
+                    0.25,
                 )),
                 replacement_power=float(getattr(
                     config,

@@ -68,10 +68,15 @@ class AdaptiveDPODataset(
                 self.names.append(required_name)
 
         self.ema_decay = min(max(float(ema_decay), 0.0), 0.999999)
-        # TEMP: no multi-observation warmup.
-        # A pair becomes adaptive immediately after its first valid loss observation.
-        self.min_observations = 1
-        self.min_keep_probability = min(max(float(min_keep_probability), 0.0), 1.0)
+        # Require three successful observations before a pair can surrender its
+        # own slot. Old/hand-edited configs may request less, but the runtime
+        # warm-up floor is deliberately hard so one noisy early loss cannot
+        # immediately reshape the dataset.
+        self.min_observations = max(int(min_observations), 3)
+        # Every pair keeps at least 25% of its original sampling opportunities,
+        # regardless of how easy its EMA becomes or what an old config says.
+        # Higher user-specified maintenance probabilities remain supported.
+        self.min_keep_probability = min(max(float(min_keep_probability), 0.25), 1.0)
         self.replacement_power = max(float(replacement_power), 0.01)
         self.default_objective = DPOObjective(default_objective)
 

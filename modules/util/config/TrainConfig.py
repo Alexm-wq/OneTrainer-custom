@@ -1495,7 +1495,7 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_adaptive_dataset", False, bool, False))
         data.append(("rlhf_dpo_adaptive_dataset_ema", 0.8, float, False))
         data.append(("rlhf_dpo_adaptive_dataset_min_observations", 3, int, False))
-        data.append(("rlhf_dpo_adaptive_dataset_min_keep_probability", 0.1, float, False))
+        data.append(("rlhf_dpo_adaptive_dataset_min_keep_probability", 0.25, float, False))
         data.append(("rlhf_dpo_adaptive_dataset_replacement_power", 2.0, float, False))
 
         # Only severe outliers are written to dpo_bad_pairs.csv. The change
