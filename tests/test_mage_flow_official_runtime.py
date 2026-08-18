@@ -5,6 +5,7 @@ import torch
 from mage_flow.models.mage_flow import MageFlow, MageFlowParams
 from mage_flow.models.modules._attn_backend import set_attn_backend
 
+from modules.model.MageFlowModel import MageFlowModel
 from modules.module.MageFlowSelfFlow import mage_flow_forward
 
 
@@ -32,9 +33,7 @@ class MageOfficialRuntimeTests(unittest.TestCase):
         self.txt = torch.randn(1, 6, 8)
         self.img_cu = torch.tensor([0, 4, 8], dtype=torch.int32)
         self.txt_cu = torch.tensor([0, 3, 6], dtype=torch.int32)
-        # Mage's packed convention is one outer pack containing one F/H/W tuple
-        # for each sample in that pack.
-        self.img_shapes = [[(1, 2, 2), (1, 2, 2)]]
+        self.img_shapes = MageFlowModel.image_shapes(self.batch, 2, 2)
         self.timesteps = torch.tensor([0.2, 0.7])
 
     def _official(self):
