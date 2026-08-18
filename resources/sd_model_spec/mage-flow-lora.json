@@ -1,0 +1,6 @@
+{
+    "modelspec.sai_model_spec": "1.0.0",
+    "modelspec.architecture": "Mage-Flow/lora",
+    "modelspec.implementation": "https://github.com/microsoft/Mage",
+    "modelspec.title": "Mage Flow LoRA"
+}
