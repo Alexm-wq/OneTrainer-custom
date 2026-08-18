@@ -10,6 +10,10 @@ from mgds.crypto import configure_encryption_key
 KEY_ENVIRONMENT_VARIABLE = "OT_DATASET_ENCRYPTION_KEY_B64"
 
 
+class MissingEncryptionKeyError(RuntimeError):
+    """Recoverable configuration error raised before encrypted data is opened."""
+
+
 def _key_from_environment() -> str:
     encoded = os.environ.get(KEY_ENVIRONMENT_VARIABLE, "")
     if encoded == "":
@@ -34,9 +38,9 @@ def configure_data_encryption(
         config.secrets.dataset_encryption_key = key
 
     if enabled and key == "" and require_key:
-        raise RuntimeError(
+        raise MissingEncryptionKeyError(
             "Dataset/cache encryption is enabled, but no encryption key was entered. "
-            "Enter it in the Data tab or set OT_DATASET_ENCRYPTION_KEY_B64."
+            "Enter it in the Data tab or set OT_DATASET_ENCRYPTION_KEY_B64, then start training again."
         )
 
     configure_encryption_key(key if enabled and key != "" else None)
