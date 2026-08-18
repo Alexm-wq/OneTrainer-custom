@@ -19,6 +19,7 @@ from modules.util import create
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.encryption_util import MissingEncryptionKeyError, configure_data_encryption
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
 from modules.util.ui.validation import flush_and_validate_all
@@ -215,14 +216,21 @@ class TrainUIController:
 
     def __training_thread_function(self):
         error_caught = False
+        error_status = None
+        trainer = None
 
         self.training_callbacks = TrainCallbacks(
             on_update_train_progress=self.on_update_train_progress,
             on_update_status=self.on_update_status,
         )
 
-        trainer = create.create_trainer(self.train_config, self.training_callbacks, self.training_commands, reattach=self.view.get_cloud_reattach())
         try:
+            trainer = create.create_trainer(
+                self.train_config,
+                self.training_callbacks,
+                self.training_commands,
+                reattach=self.view.get_cloud_reattach(),
+            )
             trainer.start()
             if self.train_config.cloud.enabled:
                 self.view.sync_cloud_secrets()
@@ -231,32 +239,46 @@ class TrainUIController:
             self.start_total_steps = None
             self.start_time = time.monotonic()
             trainer.train()
+        except MissingEncryptionKeyError as exc:
+            if self.train_config.cloud.enabled:
+                self.view.sync_cloud_secrets()
+            error_caught = True
+            error_status = f"Error: {exc}"
+            print(f"[OT-ENCRYPTION] {exc}")
         except Exception:
             if self.train_config.cloud.enabled:
                 self.view.sync_cloud_secrets()
             error_caught = True
+            error_status = "Error: check the console for details"
             traceback.print_exc()
+        finally:
+            if trainer is not None:
+                try:
+                    trainer.end()
+                except Exception:
+                    error_caught = True
+                    if error_status is None:
+                        error_status = "Error while stopping training: check the console for details"
+                    traceback.print_exc()
 
-        trainer.end()
+            # Always release the UI run state, even if trainer construction,
+            # startup, dataloader creation, or teardown failed.
+            self.training_thread = None
+            self.training_commands = None
+            self.training_callbacks = None
+            torch.clear_autocast_cache()
+            torch_gc()
 
-        # clear gpu memory
-        del trainer
+            if error_caught:
+                self.on_update_status(error_status or "Error: check the console for details")
+            else:
+                self.on_update_status("Stopped")
 
-        self.training_thread = None
-        self.training_commands = None
-        torch.clear_autocast_cache()
-        torch_gc()
+            # queue UI update on Tk main thread; on_training_stopped applies shared styles, avoid potential race/crash
+            self.view.schedule_on_main_thread(lambda: self.view.on_training_stopped(error_caught))
 
-        if error_caught:
-            self.on_update_status("Error: check the console for details")
-        else:
-            self.on_update_status("Stopped")
-
-        # queue UI update on Tk main thread; on_training_stopped applies shared styles, avoid potential race/crash
-        self.view.schedule_on_main_thread(lambda: self.view.on_training_stopped(error_caught))
-
-        if self.train_config.tensorboard_always_on and not self.always_on_tensorboard_subprocess:
-            self.view.schedule_on_main_thread(self._start_always_on_tensorboard)
+            if self.train_config.tensorboard_always_on and not self.always_on_tensorboard_subprocess:
+                self.view.schedule_on_main_thread(self._start_always_on_tensorboard)
 
     def start_training(self):
         if self.training_thread is None:
@@ -265,6 +287,18 @@ class TrainUIController:
             errors = flush_and_validate_all()
             if errors:
                 self.view.show_validation_errors(errors)
+                return
+
+            # Encryption is a startup requirement, not a fatal training error.
+            # Check it while the UI is still idle so a missing key never enters
+            # the worker thread or leaves the Start button in a running state.
+            try:
+                configure_data_encryption(self.train_config)
+            except MissingEncryptionKeyError as exc:
+                message = str(exc)
+                print(f"[OT-ENCRYPTION] {message}")
+                self.on_update_status(f"Error: {message}")
+                self.view.show_validation_errors([message])
                 return
 
             self.view.on_training_started()
