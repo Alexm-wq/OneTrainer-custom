@@ -21,6 +21,10 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
         super().__init__(train_device=train_device, temp_device=temp_device, debug_mode=debug_mode)
 
     @staticmethod
+    def _image_shapes(batch_size: int, height: int, width: int):
+        return MageFlowModel.image_shapes(batch_size, height, width)
+
+    @staticmethod
     def _validate_self_flow(model: MageFlowModel, config: TrainConfig):
         if config.self_flow_structural_enabled and not config.self_flow_enabled:
             raise ValueError("Structural Self-Flow requires Self-Flow")
