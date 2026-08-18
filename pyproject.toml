@@ -65,7 +65,7 @@ dependencies = [
 
     # cloud
     "runpod==1.7.10",
-    "fabric==3.2.2",
+    "fabric==2.7.10",
 
     # debug
     "psutil==7.0.0",
@@ -173,10 +173,9 @@ ui = { cmd = "python scripts/train_ui.py", cwd = "." }
 platforms = ["linux-cuda13", "win-cuda13"]
 
 # FlashAttention 4 is the native Mage-Flow attention backend on CUDA 13/Blackwell.
-# Keep it Pixi-feature-specific so the cuda12 package-extra alias does not pull
-# CUDA 13 CuTeDSL dependencies into the cuda12 environment.
-[tool.pixi.feature.cuda13.pypi-dependencies]
-flash-attn-4 = { version = "==4.0.0b23", extras = ["cu13"], marker = "sys_platform == 'linux'" }
+# Scope it to Linux so Windows CUDA environments retain the SDPA fallback.
+[tool.pixi.feature.cuda13.target.linux-64.pypi-dependencies]
+flash-attn-4 = { version = "==4.0.0b23", extras = ["cu13"] }
 
 [tool.pixi.feature.cuda13.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
