@@ -24,6 +24,22 @@ class MageFlowModelLoader:
                 "Then launch OneTrainer with: pixi run -e cuda13 ui."
             ) from exc
 
+    @staticmethod
+    def _resolve_attention_backend() -> tuple[str, str]:
+        """Select Mage's native FA4 backend when available, otherwise SDPA.
+
+        Mage upstream defaults to FlashAttention2. On CUDA 13/Blackwell our
+        environment installs the CuTeDSL FlashAttention4 package instead. The
+        first value controls Mage's shared packed-varlen attention shim; the
+        second is the Hugging Face Qwen3-VL attention implementation used while
+        constructing the frozen text encoder.
+        """
+        try:
+            from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+            return "flash4", "flash_attention_4"
+        except ImportError:
+            return "sdpa", "sdpa"
+
     def load(
             self,
             model: MageFlowModel,
@@ -38,7 +54,27 @@ class MageFlowModelLoader:
             raise ValueError("Mage-Flow requires a base model directory or Hugging Face repository id")
 
         load_from_repo = self._require_mage()
-        official = load_from_repo(model_names.base_model, device="cpu")
+        mage_attn_backend, hf_attn_impl = self._resolve_attention_backend()
+
+        # Upstream Mage constructs ModelConfig without an attn_type override, so
+        # it defaults to flash2. Force the Qwen3-VL constructor independently,
+        # then switch Mage's shared packed attention shim after construction.
+        previous_hf_attn_impl = os.environ.get("VF_HF_ATTN_IMPL")
+        os.environ["VF_HF_ATTN_IMPL"] = hf_attn_impl
+        try:
+            official = load_from_repo(model_names.base_model, device="cpu")
+        finally:
+            if previous_hf_attn_impl is None:
+                os.environ.pop("VF_HF_ATTN_IMPL", None)
+            else:
+                os.environ["VF_HF_ATTN_IMPL"] = previous_hf_attn_impl
+
+        from mage_flow.models.modules._attn_backend import set_attn_backend
+        set_attn_backend(mage_attn_backend)
+        print(
+            f"[Mage-Flow] attention backend={mage_attn_backend} "
+            f"qwen_attn_implementation={hf_attn_impl}"
+        )
 
         if model_names.transformer_model:
             from safetensors.torch import load_file
