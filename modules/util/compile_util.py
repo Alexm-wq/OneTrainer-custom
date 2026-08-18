@@ -67,7 +67,9 @@ def init_compile():
     # which threads don't inherit. init_compile() must therefore be called in every thread that can
     # trigger a compilation - including the autograd worker threads, which recompute checkpointed
     # modules during the backward pass.
-    torch._dynamo.config.cache_size_limit = 8192
+    # Allow many legitimate compiled variants from variable training inputs.
+    torch._dynamo.config.recompile_limit = 8192
+    torch._dynamo.config.accumulated_recompile_limit = 65536
 
 
 torch.utils._sympy.functions.Mod.eval = Mod_patched_eval

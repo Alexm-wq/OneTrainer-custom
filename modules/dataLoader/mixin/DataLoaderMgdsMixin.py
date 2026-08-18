@@ -23,14 +23,38 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
     ):
         concepts = config.concepts
         if concepts is None:
-            with open(config.concept_file_name, 'r') as f:
-                concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+            try:
+                with open(config.concept_file_name, 'r') as f:
+                    concepts = [
+                        ConceptConfig.default_values().from_dict(c)
+                        for c in json.load(f)
+                    ]
+            except (OSError, json.JSONDecodeError, TypeError):
+                if not config.use_cache_only:
+                    raise
+                # Self-describing cache manifests supply the runtime concept
+                # defaults. MGDS itself does not need an upstream concept row
+                # when cache-only modules have no inputs.
+                concepts = []
 
         # choose all validation concepts, or none of them, depending on is_validation
-        concepts = [concept for concept in concepts if (ConceptType(concept.type) == ConceptType.VALIDATION) == is_validation]
+        concepts = [
+            concept
+            for concept in concepts
+            if (
+                ConceptType(
+                    concept.get("type", ConceptType.STANDARD)
+                    if isinstance(concept, dict)
+                    else concept.type
+                ) == ConceptType.VALIDATION
+            ) == is_validation
+        ]
 
         # convert before passing to MGDS
-        concepts = [c.to_dict() for c in concepts]
+        concepts = [
+            c if isinstance(c, dict) else c.to_dict()
+            for c in concepts
+        ]
 
         settings = {
             "target_resolution": config.resolution,

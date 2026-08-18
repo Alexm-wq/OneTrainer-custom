@@ -1,6 +1,7 @@
 import copy
 import inspect
 from collections.abc import Callable
+from contextlib import nullcontext
 
 from modules.model.Flux2Model import Flux2Model
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
@@ -36,6 +37,18 @@ class Flux2Sampler(BaseModelSampler):
         self.model = model
         self.model_type = model_type
         self.pipeline = model.create_pipeline()
+
+    def _self_flow_sampling_context(self, use_ema: bool):
+        if self.model.self_flow_ema is None:
+            if not use_ema:
+                return nullcontext()
+            raise RuntimeError(
+                "Self-Flow EMA sampling was requested, but no Self-Flow EMA state is loaded."
+            )
+        return self.model.self_flow_ema.sampling_parameters(
+            use_teacher=use_ema,
+            adapter_modules=self.model.self_flow_adapter_modules(),
+        )
 
     @torch.no_grad()
     def __sample_base(
@@ -171,19 +184,22 @@ class Flux2Sampler(BaseModelSampler):
             on_sample: Callable[[ModelSamplerOutput], None] = lambda _: None,
             on_update_progress: Callable[[int, int], None] = lambda _, __: None,
     ):
-        sampler_output = self.__sample_base(
-            prompt=sample_config.prompt,
-            negative_prompt=sample_config.negative_prompt,
-            height=self.quantize_resolution(sample_config.height, 64),
-            width=self.quantize_resolution(sample_config.width, 64),
-            seed=sample_config.seed,
-            random_seed=sample_config.random_seed,
-            diffusion_steps=sample_config.diffusion_steps,
-            cfg_scale=sample_config.cfg_scale,
-            noise_scheduler=sample_config.noise_scheduler,
-            text_encoder_sequence_length=sample_config.text_encoder_1_sequence_length,
-            on_update_progress=on_update_progress,
-        )
+        with self._self_flow_sampling_context(
+            bool(getattr(sample_config, "self_flow_ema", False))
+        ):
+            sampler_output = self.__sample_base(
+                prompt=sample_config.prompt,
+                negative_prompt=sample_config.negative_prompt,
+                height=self.quantize_resolution(sample_config.height, 64),
+                width=self.quantize_resolution(sample_config.width, 64),
+                seed=sample_config.seed,
+                random_seed=sample_config.random_seed,
+                diffusion_steps=sample_config.diffusion_steps,
+                cfg_scale=sample_config.cfg_scale,
+                noise_scheduler=sample_config.noise_scheduler,
+                text_encoder_sequence_length=sample_config.text_encoder_1_sequence_length,
+                on_update_progress=on_update_progress,
+            )
 
         self.save_sampler_output(
             sampler_output, destination,

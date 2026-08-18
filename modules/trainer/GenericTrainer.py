@@ -11,6 +11,7 @@ from pathlib import Path
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.dpo.AdaptiveDPODataset import AdaptiveDPODataset
 from modules.model.BaseModel import BaseModel
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
@@ -25,7 +26,11 @@ from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
+from modules.util.enum.ConceptDPOObjective import ConceptDPOObjective
+from modules.util.enum.ConceptDPOReferenceMode import ConceptDPOReferenceMode
 from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
@@ -91,14 +96,78 @@ class GenericTrainer(BaseTrainer):
         self.one_step_trained = False
         self.grad_hook_handles = []
         self._dpo_reference_snapshot_path = None
+        self._dpo_concept_reference_snapshot_path = None
         self._dpo_reference_initialized = False
+        self._resume_restore_dpo_reference = False
+        self._resume_restore_dpo_concept_references = False
         self._resume_integrity_payload = None
         self._resume_saved_gradient_accumulation_steps = None
         self._gradient_accumulation_dirty = False
         self._dpo_metric_sums: dict[str, float] = {}
-        self._dpo_metric_weight = 0.0
+        self._dpo_metric_weights: dict[str, float] = {}
+        # DPO gradients are accumulated in host RAM when the optimizer exposes
+        # a momentum-bypass step.  This avoids a second GPU momentum buffer.
+        self._dpo_bypass_cpu_grads: dict[Parameter, Tensor] = {}
+        self._dpo_bypass_update_weight = 0.0
+        self._adaptive_dpo_dataset_module: AdaptiveDPODataset | None = None
+        # Pair-loss observations are staged for the current gradient-
+        # accumulation window and committed only after its optimizer step.
+        self._adaptive_dpo_pending: list[tuple[str, float, str]] = []
+
+    def __find_adaptive_dpo_dataset_module(self) -> AdaptiveDPODataset | None:
+        if not bool(getattr(self.config, "rlhf_dpo_adaptive_dataset", False)):
+            return None
+        try:
+            modules = self.data_loader.get_data_set().loading_pipeline.modules
+        except Exception:
+            return None
+        for module in modules:
+            if isinstance(module, AdaptiveDPODataset):
+                return module
+        return None
+
+    def __stage_adaptive_dpo_observations(self):
+        module = self._adaptive_dpo_dataset_module
+        if module is None:
+            return
+        observations = self.model_setup.get_last_dpo_pair_losses()
+        if observations:
+            self._adaptive_dpo_pending.extend(observations)
+
+    def __commit_adaptive_dpo_observations(self):
+        module = self._adaptive_dpo_dataset_module
+        if module is not None and self._adaptive_dpo_pending:
+            module.observe(self._adaptive_dpo_pending)
+        self._adaptive_dpo_pending.clear()
+
+    def __discard_adaptive_dpo_observations(self):
+        self._adaptive_dpo_pending.clear()
+
+    def __load_adaptive_dpo_dataset_state(self, backup_path: str):
+        module = self._adaptive_dpo_dataset_module
+        if module is None:
+            return
+        module.load_state(os.path.join(
+            backup_path,
+            "onetrainer_dpo_adaptive_dataset.json",
+        ))
+
+    def __save_adaptive_dpo_dataset_state(self, backup_path: str):
+        module = self._adaptive_dpo_dataset_module
+        if module is None:
+            return
+        if self._adaptive_dpo_pending:
+            raise RuntimeError(
+                "Refusing to save Adaptive DPO Dataset state with uncommitted "
+                "gradient-accumulation observations."
+            )
+        module.save_state(os.path.join(
+            backup_path,
+            "onetrainer_dpo_adaptive_dataset.json",
+        ))
 
     def start(self):
+        self.config.validate_dpo_settings()
         if multi.is_master():
             self.__save_config_to_workspace()
 
@@ -170,10 +239,16 @@ class GenericTrainer(BaseTrainer):
         torch_gc()
 
         if last_backup_path:
-            self._dpo_reference_snapshot_path = os.path.join(
-                last_backup_path,
-                "onetrainer_dpo_reference.pt",
-            )
+            if self._resume_restore_dpo_reference:
+                self._dpo_reference_snapshot_path = os.path.join(
+                    last_backup_path,
+                    "onetrainer_dpo_reference.pt",
+                )
+            if self._resume_restore_dpo_concept_references:
+                self._dpo_concept_reference_snapshot_path = os.path.join(
+                    last_backup_path,
+                    "onetrainer_dpo_concept_references.pt",
+                )
             self.model_setup.load_dpo_curriculum_state(
                 os.path.join(
                     last_backup_path,
@@ -190,6 +265,23 @@ class GenericTrainer(BaseTrainer):
         self.data_loader = self.create_data_loader(
             self.model, self.model_setup, self.model.train_progress
         )
+        self._adaptive_dpo_dataset_module = (
+            self.__find_adaptive_dpo_dataset_module()
+        )
+        if (
+            bool(getattr(self.config, "rlhf_dpo_adaptive_dataset", False))
+            and self._adaptive_dpo_dataset_module is None
+        ):
+            raise RuntimeError(
+                "Adaptive DPO Dataset is enabled, but its dataloader module "
+                "was not created. Restart OneTrainer after installing the "
+                "complete patch."
+            )
+        if last_backup_path:
+            # Legacy backups predate this file. Missing state intentionally
+            # starts cold rather than blocking resume.
+            self.__load_adaptive_dpo_dataset_state(last_backup_path)
+
         self.model_saver = self.create_model_saver()
 
         self.model_sampler = self.create_model_sampler(self.model)
@@ -202,6 +294,149 @@ class GenericTrainer(BaseTrainer):
             self.validation_data_loader = self.create_data_loader(
                 self.model, self.model_setup, self.model.train_progress, is_validation=True
             )
+
+    def __concepts_use_reference_mode(
+            self,
+            target_mode: ConceptDPOReferenceMode,
+    ) -> bool:
+        concepts = self.config.concepts
+        if concepts is None:
+            try:
+                with open(
+                        self.config.concept_file_name,
+                        "r",
+                        encoding="utf-8",
+                ) as handle:
+                    concepts = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                concepts = []
+
+        for concept in concepts or []:
+            if isinstance(concept, dict):
+                enabled = concept.get("enabled", True)
+                raw = concept.get(
+                    "dpo_reference_mode",
+                    ConceptDPOReferenceMode.DEFAULT,
+                )
+            else:
+                enabled = getattr(concept, "enabled", True)
+                raw = getattr(
+                    concept,
+                    "dpo_reference_mode",
+                    ConceptDPOReferenceMode.DEFAULT,
+                )
+
+            if not enabled:
+                continue
+            if isinstance(raw, ConceptDPOReferenceMode):
+                mode = raw
+            else:
+                try:
+                    mode = ConceptDPOReferenceMode(
+                        str(raw or "DEFAULT").strip().upper()
+                    )
+                except ValueError:
+                    continue
+            if mode == target_mode:
+                return True
+
+        return False
+
+    def __requires_gpu_existing_adapter_dpo_reference(self) -> bool:
+        return (
+            self.__global_requires_gpu_existing_adapter_dpo_reference()
+            or self.__concepts_use_reference_mode(
+                ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT
+            )
+        )
+
+    def __requires_cpu_existing_adapter_dpo_reference(self) -> bool:
+        return (
+            self.__global_requires_cpu_existing_adapter_dpo_reference()
+            or self.__concepts_use_reference_mode(
+                ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU
+            )
+        )
+
+    def __global_requires_gpu_existing_adapter_dpo_reference(self) -> bool:
+        return (
+            DPORefMode(self.config.effective_dpo_ref_mode())
+            == DPORefMode.EXISTING_ADAPTER
+        )
+
+    def __global_requires_cpu_existing_adapter_dpo_reference(self) -> bool:
+        return (
+            DPORefMode(self.config.effective_dpo_ref_mode())
+            == DPORefMode.EXISTING_ADAPTER_CPU
+        )
+
+    def __global_requires_ema_adapter_dpo_reference(self) -> bool:
+        return (
+            DPORefMode(self.config.effective_dpo_ref_mode())
+            == DPORefMode.EMA_ADAPTER
+        )
+
+    def __concept_reference_keys(
+            self,
+            target_mode: ConceptDPOReferenceMode,
+    ) -> list[str]:
+        concepts = self.config.concepts
+        if concepts is None:
+            try:
+                with open(
+                        self.config.concept_file_name,
+                        "r",
+                        encoding="utf-8",
+                ) as handle:
+                    concepts = json.load(handle)
+            except (OSError, json.JSONDecodeError):
+                concepts = []
+
+        keys: list[str] = []
+        for concept in concepts or []:
+            if isinstance(concept, dict):
+                enabled = concept.get("enabled", True)
+                seed = concept.get("seed")
+                raw = concept.get(
+                    "dpo_reference_mode",
+                    ConceptDPOReferenceMode.DEFAULT,
+                )
+            else:
+                enabled = getattr(concept, "enabled", True)
+                seed = getattr(concept, "seed", None)
+                raw = getattr(
+                    concept,
+                    "dpo_reference_mode",
+                    ConceptDPOReferenceMode.DEFAULT,
+                )
+            if not enabled:
+                continue
+            try:
+                mode = (
+                    raw
+                    if isinstance(raw, ConceptDPOReferenceMode)
+                    else ConceptDPOReferenceMode(
+                        str(raw or "DEFAULT").strip().upper()
+                    )
+                )
+            except ValueError:
+                continue
+            if mode != target_mode:
+                continue
+            if seed is None:
+                raise RuntimeError(
+                    "A concept using Current Adapter Snapshot has no stable "
+                    "seed. Re-save the concept before training."
+                )
+            keys.append(str(seed))
+        return list(dict.fromkeys(keys))
+
+    def __requires_existing_adapter_dpo_reference(self) -> bool:
+        return (
+            self.__requires_gpu_existing_adapter_dpo_reference()
+            or self.__requires_cpu_existing_adapter_dpo_reference()
+            or self.__global_requires_ema_adapter_dpo_reference()
+        )
 
     def __validate_resume_backup_files(self, backup_path: str):
         optimizer_path = os.path.join(
@@ -221,6 +456,7 @@ class GenericTrainer(BaseTrainer):
             "args.json",
         )
         saved_ga = None
+        saved_args = {}
         if os.path.isfile(args_path):
             try:
                 with open(args_path, "r", encoding="utf-8") as handle:
@@ -280,20 +516,111 @@ class GenericTrainer(BaseTrainer):
                 "the loaded global step will be checked against its saved GA."
             )
 
-        ref_mode = str(self.config.effective_dpo_ref_mode())
-        if (
+        current_global_reference_required = (
             self.config.rlhf_enabled
-            and ref_mode == "EXISTING_ADAPTER"
-        ):
+            and (
+                self.__global_requires_gpu_existing_adapter_dpo_reference()
+                or self.__global_requires_cpu_existing_adapter_dpo_reference()
+                or self.__global_requires_ema_adapter_dpo_reference()
+            )
+        )
+        saved_global_reference_mode = ""
+        if self._resume_integrity_payload is not None:
+            saved_global_reference_mode = str(
+                self._resume_integrity_payload.get("dpo_ref_mode", "")
+            )
+        elif saved_args:
+            saved_global_reference_mode = str(
+                saved_args.get("rlhf_dpo_ref_mode", "")
+            )
+        saved_global_reference_required = saved_global_reference_mode in {
+                str(DPORefMode.EXISTING_ADAPTER),
+                str(DPORefMode.EXISTING_ADAPTER_CPU),
+                str(DPORefMode.EMA_ADAPTER),
+        }
+
+        # Fixed GPU/CPU snapshots are interchangeable storage variants. An EMA
+        # snapshot is a different mathematical state and must only be restored
+        # into another EMA phase. Selecting Linear-DPO on a legacy checkpoint
+        # therefore starts a new EMA from the resumed policy instead of trying
+        # to manufacture missing history.
+        current_mode = DPORefMode(self.config.effective_dpo_ref_mode())
+        reference_kind_matches = (
+            saved_global_reference_mode == str(DPORefMode.EMA_ADAPTER)
+            if current_mode == DPORefMode.EMA_ADAPTER
+            else saved_global_reference_mode in {
+                str(DPORefMode.EXISTING_ADAPTER),
+                str(DPORefMode.EXISTING_ADAPTER_CPU),
+            }
+        )
+
+        self._resume_restore_dpo_reference = (
+            current_global_reference_required
+            and saved_global_reference_required
+            and reference_kind_matches
+        )
+
+        if self._resume_restore_dpo_reference:
             reference_path = os.path.join(
                 backup_path,
                 "onetrainer_dpo_reference.pt",
             )
             if not os.path.isfile(reference_path):
                 raise RuntimeError(
-                    "[OT-RESUME] DPO backup is missing its fixed reference: "
+                    "[OT-RESUME] DPO backup is missing its saved reference: "
                     f"{reference_path}"
                 )
+        elif current_global_reference_required:
+            if self.__global_requires_ema_adapter_dpo_reference():
+                print(
+                    "[OT-RLHF] starting a new Linear-DPO phase from the "
+                    "adapter loaded by this legacy/non-Linear backup; a new "
+                    "EMA reference will be initialized"
+                )
+            else:
+                print(
+                    "[OT-RLHF] starting a new adapter-reference phase from "
+                    "the adapter loaded by this backup"
+                )
+
+        current_concept_reference_keys = set(
+            self.__concept_reference_keys(
+                ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT
+            )
+            + self.__concept_reference_keys(
+                ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU
+            )
+        )
+        saved_concept_reference_keys = set()
+        if self._resume_integrity_payload is not None:
+            raw_saved_keys = self._resume_integrity_payload.get(
+                "dpo_concept_reference_keys",
+                [],
+            )
+            if isinstance(raw_saved_keys, (list, tuple)):
+                saved_concept_reference_keys = {
+                    str(key) for key in raw_saved_keys
+                }
+
+        self._resume_restore_dpo_concept_references = bool(
+            current_concept_reference_keys
+            & saved_concept_reference_keys
+        )
+        if self._resume_restore_dpo_concept_references:
+            concept_reference_path = os.path.join(
+                backup_path,
+                "onetrainer_dpo_concept_references.pt",
+            )
+            if not os.path.isfile(concept_reference_path):
+                raise RuntimeError(
+                    "[OT-RESUME] backup declares per-concept DPO references "
+                    f"but is missing: {concept_reference_path}"
+                )
+        elif current_concept_reference_keys:
+            print(
+                "[OT-RLHF] starting new per-concept adapter-reference phase(s) "
+                "from the adapter loaded by this backup"
+            )
 
         if (
             self.config.rlhf_enabled
@@ -341,7 +668,7 @@ class GenericTrainer(BaseTrainer):
             train_progress: TrainProgress,
     ):
         payload = {
-            "version": 1,
+            "version": 2,
             "global_step": int(train_progress.global_step),
             "gradient_accumulation_steps": int(
                 self.config.gradient_accumulation_steps
@@ -349,6 +676,13 @@ class GenericTrainer(BaseTrainer):
             "optimizer_boundary": True,
             "rlhf_enabled": bool(self.config.rlhf_enabled),
             "dpo_ref_mode": str(self.config.effective_dpo_ref_mode()),
+            "dpo_requires_existing_adapter_reference": (
+                self.__requires_existing_adapter_dpo_reference()
+            ),
+            "dpo_concept_reference_keys": sorted(
+                self.model_setup._dpo_concept_ref_params.keys()
+                | self.model_setup._dpo_concept_ref_params_cpu.keys()
+            ),
         }
         path = os.path.join(
             backup_path,
@@ -664,8 +998,15 @@ class GenericTrainer(BaseTrainer):
                 ),
                 self.config,
             )
+            self.__save_adaptive_dpo_dataset_state(backup_path)
             self.model_setup.save_dpo_reference(
                 os.path.join(backup_path, "onetrainer_dpo_reference.pt")
+            )
+            self.model_setup.save_dpo_concept_references(
+                os.path.join(
+                    backup_path,
+                    "onetrainer_dpo_concept_references.pt",
+                )
             )
             self.__write_resume_integrity(
                 backup_path,
@@ -776,7 +1117,30 @@ class GenericTrainer(BaseTrainer):
             "update_step", self.config.gradient_accumulation_steps, TimeUnit.STEP, train_progress, start_at_zero=False
         )
 
-    def __apply_fused_back_pass(self, scaler):
+    def __apply_fused_back_pass(
+            self,
+            scaler,
+            dpo_momentum_bypass: bool = False,
+            sequential_rlhf_backward: bool = False,
+    ):
+        if dpo_momentum_bypass or sequential_rlhf_backward:
+            if (
+                self.config.optimizer.fused_back_pass
+                or self.config.fused_gradient_reduce
+            ):
+                if dpo_momentum_bypass:
+                    print(
+                        "[OT-DPO] Momentum bypass disables fused back-pass and "
+                        "fused gradient reduction so DPO gradients can be isolated."
+                    )
+                else:
+                    print(
+                        "[OT-RLHF] Sequential chosen Self-Flow disables fused "
+                        "back-pass/reduction so supervised and DPO gradients "
+                        "can be accumulated before one optimizer step."
+                    )
+            return
+
         fused_optimizer_step = self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass
         fused_reduce = self.config.multi_gpu and self.config.fused_gradient_reduce
         if fused_optimizer_step:
@@ -828,13 +1192,32 @@ class GenericTrainer(BaseTrainer):
     def __dpo_tensorboard_metric_names(self) -> set[str]:
         return {
             "objective_loss",
+            "sigmoid_objective_loss",
+            "sigmoid_chosen_reward",
+            "sigmoid_rejected_reward",
+            "sigmoid_reward_margin",
+            "linear_objective_loss",
+            "linear_utility",
+            "linear_policy_error_gap",
+            "linear_direct_accuracy",
+            "linear_effective_pair_weight",
+            "balanced_reject_loss",
+            "balanced_chosen_budget",
+            "balanced_reject_target",
+            "balanced_reject_violation",
+            "balanced_target_satisfied",
             "chosen_reward",
             "rejected_reward",
             "reward_margin",
             "accuracy",
             "hard_pair_curriculum_weight",
+            "hard_pair_competence_ema",
             "hard_pair_margin_ema",
             "hard_pair_observations",
+            "adaptive_pair_difficulty",
+            "localized_active_fraction",
+            "localized_mask_fraction",
+            "localized_mean_weight",
             "margin_penalty_loss",
             "wrong_order_penalty_loss",
             "margin_target_violation",
@@ -845,6 +1228,10 @@ class GenericTrainer(BaseTrainer):
             "chosen_anchor_push_loss",
             "chosen_anchor_floor_loss",
             "chosen_anchor_aux_loss",
+            "policy_auxiliary_loss",
+            "chosen_supervised_weight",
+            "chosen_supervised_loss",
+            "total_loss",
         }
 
     def __accumulate_dpo_metrics(
@@ -865,22 +1252,28 @@ class GenericTrainer(BaseTrainer):
                     self._dpo_metric_sums.get(name, 0.0)
                     + float(value) * weight
                 )
-        self._dpo_metric_weight += weight
+                self._dpo_metric_weights[name] = (
+                    self._dpo_metric_weights.get(name, 0.0)
+                    + weight
+                )
 
     def __flush_dpo_tensorboard_metrics(self, global_step: int):
-        if self._dpo_metric_weight <= 0:
+        if not self._dpo_metric_sums:
             return
 
         if hasattr(self, "tensorboard"):
             for name, total in self._dpo_metric_sums.items():
+                weight = self._dpo_metric_weights.get(name, 0.0)
+                if weight <= 0:
+                    continue
                 self.tensorboard.add_scalar(
                     f"dpo/{name}",
-                    total / self._dpo_metric_weight,
+                    total / weight,
                     global_step,
                 )
 
         self._dpo_metric_sums.clear()
-        self._dpo_metric_weight = 0.0
+        self._dpo_metric_weights.clear()
 
     def __batch_len(self, batch: dict) -> int:
         preferred_keys = (
@@ -982,6 +1375,173 @@ class GenericTrainer(BaseTrainer):
             return raw
         return ConceptType(raw)
 
+    def __effective_dpo_objective_at(
+            self,
+            batch: dict,
+            index: int,
+    ) -> DPOObjective:
+        raw = batch.get("dpo_objective", ConceptDPOObjective.DEFAULT)
+        if isinstance(raw, torch.Tensor):
+            if raw.numel() == 0:
+                raw = ConceptDPOObjective.DEFAULT
+            elif raw.ndim == 0:
+                raw = raw.detach().cpu().item()
+            else:
+                raw = raw.detach().cpu().flatten()[index].item()
+        elif isinstance(raw, (list, tuple)):
+            raw = raw[index]
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+
+        if isinstance(raw, ConceptDPOObjective):
+            override = raw
+        elif isinstance(raw, DPOObjective):
+            # Accept an explicit full objective value in hand-edited configs,
+            # while the UI intentionally exposes only DEFAULT and SIGMOID.
+            if raw == DPOObjective.SIGMOID:
+                override = ConceptDPOObjective.SIGMOID
+            else:
+                raise ValueError(
+                    "Per-concept DPO objective currently supports only "
+                    f"DEFAULT or SIGMOID, got {raw}."
+                )
+        else:
+            value = str(raw or "DEFAULT").strip().upper()
+            try:
+                override = ConceptDPOObjective(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "Per-concept DPO objective currently supports only "
+                    f"DEFAULT or SIGMOID, got {raw!r}."
+                ) from exc
+
+        if override == ConceptDPOObjective.DEFAULT:
+            return DPOObjective(self.config.rlhf_dpo_objective)
+        return DPOObjective.SIGMOID
+
+    def __dpo_streamed_at(self, batch: dict, index: int) -> bool:
+        raw = batch.get("dpo_streamed", False)
+        if isinstance(raw, torch.Tensor):
+            if raw.numel() == 0:
+                return False
+            if raw.ndim == 0:
+                raw = raw.detach().cpu().item()
+            else:
+                raw = raw.detach().cpu().flatten()[index].item()
+        elif isinstance(raw, (list, tuple)):
+            raw = raw[index]
+        return self.__as_bool(raw)
+
+    def __effective_dpo_reference_mode_at(
+            self,
+            batch: dict,
+            index: int,
+    ) -> DPORefMode:
+        raw = batch.get(
+            "dpo_reference_mode",
+            ConceptDPOReferenceMode.DEFAULT,
+        )
+        if isinstance(raw, torch.Tensor):
+            if raw.numel() == 0:
+                raw = ConceptDPOReferenceMode.DEFAULT
+            elif raw.ndim == 0:
+                raw = raw.detach().cpu().item()
+            else:
+                raw = raw.detach().cpu().flatten()[index].item()
+        elif isinstance(raw, (list, tuple)):
+            raw = raw[index]
+
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="ignore")
+
+        if isinstance(raw, ConceptDPOReferenceMode):
+            override = raw
+        elif isinstance(raw, DPORefMode):
+            return raw
+        else:
+            value = str(raw or "DEFAULT").strip().upper()
+            try:
+                override = ConceptDPOReferenceMode(value)
+            except ValueError as exc:
+                raise ValueError(
+                    "Per-concept DPO reference supports DEFAULT, BASE_MODEL, "
+                    "CURRENT_ADAPTER_SNAPSHOT, or "
+                    "CURRENT_ADAPTER_SNAPSHOT_CPU, got "
+                    f"{raw!r}."
+                ) from exc
+
+        if override == ConceptDPOReferenceMode.DEFAULT:
+            return DPORefMode(self.config.effective_dpo_ref_mode())
+        if override == ConceptDPOReferenceMode.BASE_MODEL:
+            return DPORefMode.NEW_ADAPTER
+        if override == ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU:
+            return DPORefMode.EXISTING_ADAPTER_CPU
+        return DPORefMode.EXISTING_ADAPTER
+
+    def __dpo_reference_key_at(
+            self,
+            batch: dict,
+            index: int,
+    ) -> str | None:
+        """Return a key only for an explicit per-concept snapshot override."""
+        raw_mode = batch.get(
+            "dpo_reference_mode",
+            ConceptDPOReferenceMode.DEFAULT,
+        )
+        if isinstance(raw_mode, torch.Tensor):
+            if raw_mode.numel() == 0:
+                raw_mode = ConceptDPOReferenceMode.DEFAULT
+            elif raw_mode.ndim == 0:
+                raw_mode = raw_mode.detach().cpu().item()
+            else:
+                raw_mode = raw_mode.detach().cpu().flatten()[index].item()
+        elif isinstance(raw_mode, (list, tuple)):
+            raw_mode = raw_mode[index]
+        if isinstance(raw_mode, bytes):
+            raw_mode = raw_mode.decode("utf-8", errors="ignore")
+
+        if isinstance(raw_mode, ConceptDPOReferenceMode):
+            override = raw_mode
+        elif isinstance(raw_mode, DPORefMode):
+            # Full DPORefMode values are global-style overrides and have no
+            # concept-owned snapshot identity.
+            return None
+        else:
+            override = ConceptDPOReferenceMode(
+                str(raw_mode or "DEFAULT").strip().upper()
+            )
+        if override not in {
+            ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT,
+            ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU,
+        }:
+            return None
+
+        if "dpo_reference_key" not in batch:
+            raise RuntimeError(
+                "A concept requests Current Adapter Snapshot but the data "
+                "loader did not emit dpo_reference_key. Restart OneTrainer "
+                "after installing the complete patch."
+            )
+        raw_key = batch["dpo_reference_key"]
+        if isinstance(raw_key, torch.Tensor):
+            if raw_key.numel() == 0:
+                raw_key = None
+            elif raw_key.ndim == 0:
+                raw_key = raw_key.detach().cpu().item()
+            else:
+                raw_key = raw_key.detach().cpu().flatten()[index].item()
+        elif isinstance(raw_key, (list, tuple)):
+            raw_key = raw_key[index]
+        if isinstance(raw_key, bytes):
+            raw_key = raw_key.decode("utf-8", errors="ignore")
+        if raw_key is None or str(raw_key).strip() == "":
+            raise RuntimeError(
+                "A concept requests Current Adapter Snapshot but has no "
+                "stable concept seed/reference key."
+            )
+        return str(raw_key)
+
     @staticmethod
     def __assert_dpo_resolution_homogeneous(batch: dict):
         chosen = batch.get("latent_image")
@@ -1027,58 +1587,474 @@ class GenericTrainer(BaseTrainer):
             self,
             batch: dict,
             train_progress: TrainProgress,
-    ) -> Tensor:
+            *,
+            accumulation_steps: int = 1,
+            normal_backward: Callable[[Tensor], None] | None = None,
+            dpo_backward: Callable[[Tensor], None] | None = None,
+    ) -> tuple[Tensor | None, Tensor | None, float, bool]:
+        """Return weighted normal/DPO components, optionally backpropagated.
+
+        Flux2 may run both ordinary samples and DPO policy samples through
+        Self-Flow. Self-Flow's EMA-teacher parameter swaps mean independent
+        live graphs must not straddle a later normal/DPO/reference forward.
+        Sequential mode therefore finishes a graph before the next such forward
+        when normal and DPO data are mixed, or when multiple DPO dispatch groups
+        are present. Gradients still accumulate before the same optimizer step,
+        and existing count/total_items weighting is unchanged.
+        """
         if not self.config.rlhf_enabled:
-            return self.__calculate_standard_only_training_loss(batch, train_progress)
+            return (
+                self.__calculate_standard_only_training_loss(
+                    batch, train_progress
+                ),
+                None,
+                0.0,
+                False,
+            )
 
         dpo_indices = self.__rlhf_dpo_indices(batch)
         if not dpo_indices:
-            return self.__calculate_standard_only_training_loss(batch, train_progress)
+            return (
+                self.__calculate_standard_only_training_loss(
+                    batch, train_progress
+                ),
+                None,
+                0.0,
+                False,
+            )
 
         normal_indices = self.__normal_indices(batch)
-
         total_items = len(dpo_indices) + len(normal_indices)
-        loss_sum = None
+        normal_loss_sum: Tensor | None = None
+        dpo_loss_sum: Tensor | None = None
 
-        def add_loss(loss: Tensor, count: int):
-            nonlocal loss_sum
-            if count <= 0:
-                return
-            weighted = loss * (count / max(total_items, 1))
-            loss_sum = weighted if loss_sum is None else loss_sum + weighted
+        def weighted(loss: Tensor, count: int) -> Tensor:
+            return loss * (count / max(total_items, 1))
 
+        dispatch_groups: dict[
+            tuple[DPOObjective, DPORefMode, str | None, bool],
+            list[int],
+        ] = {}
+        for index in dpo_indices:
+            objective = self.__effective_dpo_objective_at(batch, index)
+            if objective == DPOObjective.LINEAR:
+                reference_mode = DPORefMode.EMA_ADAPTER
+                reference_key = None
+            else:
+                reference_mode = self.__effective_dpo_reference_mode_at(
+                    batch,
+                    index,
+                )
+                # A per-concept Sigmoid override under a global Linear-DPO
+                # config must not silently inherit Linear's moving reference.
+                # Keep the existing objective on its base-model reference
+                # unless the concept explicitly selected a fixed snapshot.
+                if reference_mode == DPORefMode.EMA_ADAPTER:
+                    reference_mode = DPORefMode.NEW_ADAPTER
+                reference_key = self.__dpo_reference_key_at(batch, index)
+            streamed = self.__dpo_streamed_at(batch, index)
+            dispatch_groups.setdefault(
+                (objective, reference_mode, reference_key, streamed),
+                [],
+            ).append(index)
+
+        accumulation_steps = max(int(accumulation_steps), 1)
+
+        # Keep these reasons separate:
+        # 1) Some model families may require a standalone chosen-supervised
+        #    DPO forward.
+        # 2) Self-Flow parameter swaps require live graphs to be sequentialized
+        #    across normal-vs-DPO boundaries and across multiple DPO dispatch
+        #    groups. A single DPO group can still backward normally after this
+        #    function returns.
+        externalize_chosen_supervised = bool(
+            normal_backward is not None
+            and dpo_backward is not None
+            and self.model_setup.rlhf_chosen_supervised_requires_separate_forward(
+                self.config
+            )
+            and any(
+                self.model_setup.rlhf_chosen_supervised_weight(
+                    self.config,
+                    dispatch_objective,
+                ) > 0.0
+                for dispatch_objective, _, _, _ in dispatch_groups
+            )
+        )
+        model_requires_graph_sequencing = (
+            self.model_setup.rlhf_mixed_normal_dpo_requires_sequential_backward(
+                self.config
+            )
+        )
+        sequential_backward = bool(
+            normal_backward is not None
+            and dpo_backward is not None
+            and (
+                externalize_chosen_supervised
+                or (
+                    model_requires_graph_sequencing
+                    and (
+                        bool(normal_indices)
+                        or len(dispatch_groups) > 1
+                    )
+                )
+            )
+        )
+
+        def finish_normal_component(component: Tensor) -> Tensor:
+            if not sequential_backward:
+                return component
+            assert normal_backward is not None
+            normal_backward(component / accumulation_steps)
+            self.model_setup.after_backward(
+                self.model,
+                self.config,
+                train_progress,
+            )
+            return component.detach()
+
+        def finish_dpo_component(component: Tensor) -> Tensor:
+            if not sequential_backward:
+                return component
+            assert dpo_backward is not None
+            dpo_backward(component / accumulation_steps)
+            self.model_setup.after_backward(
+                self.model,
+                self.config,
+                train_progress,
+            )
+            return component.detach()
+
+        # In sequential mode even an ordinary positive subbatch must complete
+        # its backward before any later EMA/reference parameter swap. This also
+        # keeps peak VRAM at one training graph instead of retaining the normal
+        # graph across all DPO groups.
         if normal_indices:
             normal_batch = self.__subbatch(batch, normal_indices)
-            normal_loss = self.__calculate_standard_only_training_loss(normal_batch, train_progress)
-            add_loss(normal_loss, len(normal_indices))
+            normal_loss = self.__calculate_standard_only_training_loss(
+                normal_batch, train_progress
+            )
+            normal_component = weighted(normal_loss, len(normal_indices))
+            normal_loss_sum = finish_normal_component(normal_component)
             if hasattr(self, "tensorboard"):
                 self.tensorboard.add_scalar(
                     "rlhf/normal_loss",
                     float(normal_loss.detach().item()),
                     train_progress.global_step,
                 )
+            del normal_loss, normal_component
 
-        if dpo_indices:
-            dpo_batch = self.__subbatch(batch, dpo_indices)
+        # Dispatch groups are batched, never processed pair-by-pair. With full
+        # Self-Flow DPO, sequential mode also prevents one dispatch group's live
+        # policy graph from surviving across the next reference/EMA swap.
+        for (
+            objective,
+            reference_mode,
+            reference_key,
+            streamed,
+        ), objective_indices in dispatch_groups.items():
+            dpo_batch = self.__subbatch(batch, objective_indices)
             self.__assert_dpo_resolution_homogeneous(dpo_batch)
+
+            external_supervised_value = None
+            if externalize_chosen_supervised:
+                supervised_weight = (
+                    self.model_setup.rlhf_chosen_supervised_weight(
+                        self.config,
+                        objective,
+                    )
+                )
+                if supervised_weight > 0.0:
+                    supervised_loss = (
+                        self.model_setup.calculate_rlhf_chosen_supervised_loss(
+                            self.model,
+                            dpo_batch,
+                            self.config,
+                            train_progress,
+                        )
+                    )
+                    external_supervised_value = float(
+                        supervised_loss.detach().item()
+                    )
+                    supervised_component = weighted(
+                        supervised_weight * supervised_loss,
+                        len(objective_indices),
+                    )
+                    supervised_component = finish_normal_component(
+                        supervised_component
+                    )
+                    normal_loss_sum = (
+                        supervised_component
+                        if normal_loss_sum is None
+                        else normal_loss_sum + supervised_component
+                    )
+                    del supervised_loss, supervised_component
+
+            # With an external chosen supervised value, calculate_dpo_loss()
+            # reports the full objective but constructs only the pure DPO-side
+            # graph. This graph is immediately differentiated before the next
+            # objective/reference group can swap any live adapter parameters.
             dpo_loss = self.model_setup.calculate_dpo_loss(
                 self.model,
                 dpo_batch,
                 self.config,
                 train_progress,
+                objective=objective,
+                reference_mode=reference_mode,
+                reference_key=reference_key,
+                streamed=streamed,
+                external_chosen_supervised_loss_value=(
+                    external_supervised_value
+                ),
             )
-            add_loss(dpo_loss, len(dpo_indices))
+            component = weighted(dpo_loss, len(objective_indices))
+            component = finish_dpo_component(component)
+            dpo_loss_sum = (
+                component
+                if dpo_loss_sum is None
+                else dpo_loss_sum + component
+            )
 
+            self.__stage_adaptive_dpo_observations()
             dpo_metrics = self.model_setup.get_last_dpo_metrics()
             self.__accumulate_dpo_metrics(
                 dpo_metrics,
-                len(dpo_indices),
+                len(objective_indices),
             )
 
-        if loss_sum is None:
-            return self.__calculate_standard_only_training_loss(batch, train_progress)
+        if normal_loss_sum is None and dpo_loss_sum is None:
+            return (
+                self.__calculate_standard_only_training_loss(
+                    batch, train_progress
+                ),
+                None,
+                0.0,
+                False,
+            )
 
-        return loss_sum
+        dpo_item_fraction = len(dpo_indices) / max(total_items, 1)
+        return (
+            normal_loss_sum,
+            dpo_loss_sum,
+            dpo_item_fraction,
+            sequential_backward,
+        )
+
+    def __dpo_momentum_bypass_enabled(self) -> bool:
+        if not self.config.rlhf_enabled or self.model is None:
+            return False
+
+        # UI/config is the authoritative control. getattr(..., True) keeps
+        # legacy configs/backups compatible with the historical behavior where
+        # DPO momentum bypass was enabled by default.
+        enabled = bool(
+            getattr(
+                self.config,
+                "rlhf_dpo_momentum_bypass",
+                True,
+            )
+        )
+
+        # Preserve OT_DPO_BYPASS_MOMENTUM=0 as an emergency command-line
+        # disable, but do NOT let an environment value of 1 override a user
+        # disabling the checkbox in the UI.
+        env_value = os.environ.get("OT_DPO_BYPASS_MOMENTUM")
+        if (
+            env_value is not None
+            and env_value.strip().lower() in {"0", "false", "no", "off"}
+        ):
+            enabled = False
+
+        optimizer = self.model.optimizer
+        has_momentum = any(
+            float(group.get("momentum", 0.0)) != 0.0
+            for group in optimizer.param_groups
+        )
+
+        return (
+            enabled
+            and has_momentum
+            and bool(
+                getattr(
+                    optimizer,
+                    "supports_dpo_momentum_bypass",
+                    False,
+                )
+            )
+        )
+
+    def __clear_dpo_bypass_gradients(self):
+        self._dpo_bypass_cpu_grads.clear()
+        self._dpo_bypass_update_weight = 0.0
+
+    def __backward_dpo_without_momentum(self, loss: Tensor):
+        """Capture DPO leaf gradients in CPU FP32 and suppress .grad writes.
+
+        A temporary leaf hook receives each incoming DPO gradient, adds it to
+        the host-side accumulation buffer, then zeros that same transient GPU
+        tensor before autograd accumulates it into ``parameter.grad``.  Existing
+        normal gradients therefore remain untouched and no second GPU gradient
+        or momentum state persists between microbatches.
+        """
+        had_normal_grad = {
+            parameter: parameter.grad is not None
+            for parameter in self.parameters
+            if parameter.requires_grad
+        }
+        handles: list[RemovableHandle] = []
+
+        def make_hook(parameter: Parameter):
+            def capture(grad: Tensor | None):
+                # A parameter may not participate in this particular DPO
+                # backward pass. Some autograd/checkpointing paths report that
+                # through the hook as None.
+                if grad is None:
+                    return None
+
+                cpu_grad = grad.detach().to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )
+                existing = self._dpo_bypass_cpu_grads.get(parameter)
+                if existing is None:
+                    self._dpo_bypass_cpu_grads[parameter] = cpu_grad
+                else:
+                    existing.add_(cpu_grad)
+                # Reuse the transient tensor rather than allocating zeros_like.
+                grad.zero_()
+                return grad
+            return capture
+
+        try:
+            for parameter in self.parameters:
+                if parameter.requires_grad:
+                    handles.append(parameter.register_hook(make_hook(parameter)))
+            loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # DPO-only parameters may have received an allocated all-zero .grad.
+        # Remove those while retaining normal gradients that existed beforehand.
+        for parameter, previously_present in had_normal_grad.items():
+            if not previously_present:
+                parameter.grad = None
+
+    @staticmethod
+    def __dpo_cpu_clip_scale(
+            gradients: dict[Parameter, Tensor],
+            max_norm: float | None,
+    ) -> float:
+        total_sq = 0.0
+        for grad in gradients.values():
+            if not bool(torch.isfinite(grad).all().item()):
+                raise RuntimeError(
+                    "DPO momentum-bypass gradient became NaN or Inf."
+                )
+            grad_norm = torch.linalg.vector_norm(
+                grad,
+                ord=2,
+                dtype=torch.float64,
+            )
+            total_sq += float(grad_norm.item()) ** 2
+
+        if max_norm is None:
+            return 1.0
+
+        total_norm = math.sqrt(total_sq)
+        if not math.isfinite(total_norm):
+            raise RuntimeError(
+                "DPO momentum-bypass gradient norm became NaN or Inf."
+            )
+        return min(1.0, float(max_norm) / (total_norm + 1e-6))
+
+    @torch.no_grad()
+    def __apply_dpo_momentum_bypass(
+            self,
+            normal_grad_parameters: set[Parameter],
+    ):
+        if not self._dpo_bypass_cpu_grads:
+            return
+
+        update_scale = float(self._dpo_bypass_update_weight)
+        if not math.isfinite(update_scale) or update_scale <= 0.0:
+            raise RuntimeError(
+                f"Invalid DPO momentum-bypass update scale: {update_scale!r}"
+            )
+
+        optimizer = self.model.optimizer
+        if not hasattr(optimizer, "step_parameter_without_momentum"):
+            raise RuntimeError(
+                "The active optimizer does not implement the DPO momentum "
+                "bypass step."
+            )
+
+        # Multi-GPU gradients must be averaged before clipping.  Stream one
+        # parameter at a time, then return the reduced gradient to host RAM.
+        if multi.is_enabled():
+            for group in optimizer.param_groups:
+                for parameter in group["params"]:
+                    cpu_grad = self._dpo_bypass_cpu_grads.get(parameter)
+                    if cpu_grad is None:
+                        continue
+                    parameter.grad = cpu_grad.to(
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    )
+                    multi.reduce_grads_mean(
+                        [parameter],
+                        self.config.gradient_reduce_precision,
+                    )
+                    self._dpo_bypass_cpu_grads[parameter] = (
+                        parameter.grad.detach().to(
+                            device="cpu",
+                            dtype=torch.float32,
+                        )
+                    )
+                    parameter.grad = None
+
+        clip_scale = self.__dpo_cpu_clip_scale(
+            self._dpo_bypass_cpu_grads,
+            self.config.clip_grad_norm,
+        )
+
+        updated = 0
+        try:
+            for group in optimizer.param_groups:
+                for i, parameter in enumerate(group["params"]):
+                    cpu_grad = self._dpo_bypass_cpu_grads.get(parameter)
+                    if cpu_grad is None:
+                        continue
+                    grad = cpu_grad.to(
+                        device=parameter.device,
+                        dtype=parameter.dtype,
+                    )
+                    if clip_scale < 1.0:
+                        grad.mul_(clip_scale)
+
+                    had_normal_grad = parameter in normal_grad_parameters
+                    optimizer.step_parameter_without_momentum(
+                        parameter,
+                        grad,
+                        group,
+                        i,
+                        # Apply decay exactly once.  The normal step already
+                        # handled it for parameters with normal gradients.
+                        apply_weight_decay=not had_normal_grad,
+                        increment_state_step=not had_normal_grad,
+                        update_scale=update_scale,
+                    )
+                    updated += 1
+                    del grad
+        finally:
+            for parameter in self.parameters:
+                parameter.grad = None
+            self.__clear_dpo_bypass_gradients()
+
+        if updated == 0:
+            raise RuntimeError(
+                "DPO loss produced no gradients for momentum bypass."
+            )
 
 
     def __before_eval(self):
@@ -1204,6 +2180,10 @@ class GenericTrainer(BaseTrainer):
             "dpo_pair_key",
             "dpo_is_paired",
             "dpo_cache_mode",
+            "dpo_objective",
+            "dpo_reference_mode",
+            "dpo_reference_key",
+            "dpo_streamed",
             "crop_resolution",
             "scale_resolution",
             "loss_weight",
@@ -1352,7 +2332,47 @@ class GenericTrainer(BaseTrainer):
 
         scaler = create_grad_scaler() if enable_grad_scaling(self.config.train_dtype, self.parameters) else None
 
-        self.__apply_fused_back_pass(scaler)
+        dpo_momentum_bypass = self.__dpo_momentum_bypass_enabled()
+        sequential_rlhf_backward_possible = bool(
+            self.config.rlhf_enabled
+            and (
+                self.model_setup.rlhf_chosen_supervised_requires_separate_forward(
+                    self.config
+                )
+                or self.model_setup.rlhf_mixed_normal_dpo_requires_sequential_backward(
+                    self.config
+                )
+            )
+        )
+        if dpo_momentum_bypass and scaler is not None:
+            raise RuntimeError(
+                "DPO momentum bypass currently requires BF16 or FP32 training; "
+                "FP16 GradScaler isolation is not implemented safely."
+            )
+        fused_optimizer_step = (
+            not dpo_momentum_bypass
+            and not sequential_rlhf_backward_possible
+            and self.config.optimizer.optimizer.supports_fused_back_pass()
+            and self.config.optimizer.fused_back_pass
+        )
+        fused_reduce = (
+            not dpo_momentum_bypass
+            and not sequential_rlhf_backward_possible
+            and self.config.multi_gpu
+            and self.config.fused_gradient_reduce
+        )
+        if dpo_momentum_bypass:
+            print(
+                "[OT-DPO] DPO momentum bypass enabled: normal gradients use "
+                "optimizer momentum; DPO gradients are accumulated in CPU "
+                "FP32 and streamed through momentum-free SinkSGD updates."
+            )
+
+        self.__apply_fused_back_pass(
+            scaler,
+            dpo_momentum_bypass,
+            sequential_rlhf_backward_possible,
+        )
 
         # False if the model gradients are all None, True otherwise
         # This is used to schedule sampling only when the gradients don't take up any space
@@ -1384,9 +2404,28 @@ class GenericTrainer(BaseTrainer):
                     self.model,
                     self.config,
                     self._dpo_reference_snapshot_path,
+                    force_existing_adapter=(
+                        self.__global_requires_gpu_existing_adapter_dpo_reference()
+                    ),
+                    force_cpu_existing_adapter=(
+                        self.__global_requires_cpu_existing_adapter_dpo_reference()
+                    ),
+                )
+                self.model_setup.initialize_dpo_concept_references(
+                    self.model,
+                    gpu_reference_keys=self.__concept_reference_keys(
+                        ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT
+                    ),
+                    cpu_reference_keys=self.__concept_reference_keys(
+                        ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU
+                    ),
+                    snapshot_path=(
+                        self._dpo_concept_reference_snapshot_path
+                    ),
                 )
                 self._dpo_reference_initialized = True
                 self._dpo_reference_snapshot_path = None
+                self._dpo_concept_reference_snapshot_path = None
 
             if self.config.debug_mode:
                 multi.warn_parameter_divergence(self.parameters, train_device)
@@ -1479,31 +2518,108 @@ class GenericTrainer(BaseTrainer):
                     # This intentionally does not touch calculate_dpo_loss, native Krea DPO
                     # logp, chosen-reward anchor/floor logic, or any RL loss code.
                     self.__ot_write_batch_breadcrumb(batch, train_progress)
+                    accumulation_steps = self.config.gradient_accumulation_steps
+
+                    def backward_normal_component(component: Tensor):
+                        if scaler:
+                            scaler.scale(component).backward()
+                        else:
+                            component.backward()
+
+                    def backward_dpo_component(component: Tensor):
+                        if dpo_momentum_bypass:
+                            self.__backward_dpo_without_momentum(component)
+                        elif scaler:
+                            scaler.scale(component).backward()
+                        else:
+                            component.backward()
+
                     try:
-                        loss = self.__calculate_mixed_rlhf_training_loss(batch, train_progress)
+                        (
+                            normal_loss,
+                            dpo_loss,
+                            dpo_item_fraction,
+                            sequential_backward_done,
+                        ) = self.__calculate_mixed_rlhf_training_loss(
+                            batch,
+                            train_progress,
+                            accumulation_steps=accumulation_steps,
+                            normal_backward=backward_normal_component,
+                            dpo_backward=backward_dpo_component,
+                        )
                     except Exception as e:
                         self.__ot_write_crash_dump(e, batch, train_progress)
                         raise
 
-                    loss = loss / self.config.gradient_accumulation_steps
+                    normal_loss = (
+                        normal_loss / accumulation_steps
+                        if normal_loss is not None
+                        else None
+                    )
+                    dpo_loss = (
+                        dpo_loss / accumulation_steps
+                        if dpo_loss is not None
+                        else None
+                    )
+                    if normal_loss is None and dpo_loss is None:
+                        raise RuntimeError("Training batch produced no loss.")
+
                     self._gradient_accumulation_dirty = True
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                    if dpo_momentum_bypass and dpo_loss is not None:
+                        self._dpo_bypass_update_weight += (
+                            float(dpo_item_fraction) / accumulation_steps
+                        )
+
+                    if not sequential_backward_done:
+                        if dpo_momentum_bypass and dpo_loss is not None:
+                            if normal_loss is not None:
+                                normal_loss.backward()
+                            self.__backward_dpo_without_momentum(dpo_loss)
+                        else:
+                            loss = (
+                                dpo_loss
+                                if normal_loss is None
+                                else normal_loss
+                                if dpo_loss is None
+                                else normal_loss + dpo_loss
+                            )
+                            if scaler:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
+
+                        self.model_setup.after_backward(
+                            self.model,
+                            self.config,
+                            train_progress,
+                        )
 
                     has_gradient = True
-                    detached_loss = loss.detach()
+                    detached_loss = sum(
+                        component.detach()
+                        for component in (normal_loss, dpo_loss)
+                        if component is not None
+                    )
                     multi.reduce_tensor_mean(detached_loss)
                     accumulated_loss += detached_loss
 
                     if self.__is_update_step(train_progress):
-                        if self.config.fused_gradient_reduce:
+                        if fused_reduce:
                             multi.finish_async(self.config.gradient_reduce_precision)
                         else:
                             multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
 
-                        if scaler and self.config.optimizer.optimizer.supports_fused_back_pass() and self.config.optimizer.fused_back_pass:
+                        normal_grad_parameters = {
+                            parameter
+                            for parameter in self.parameters
+                            if parameter.grad is not None
+                        }
+
+                        optimizer_step_succeeded = True
+                        scaler_scale_before = (
+                            float(scaler.get_scale()) if scaler else None
+                        )
+                        if scaler and fused_optimizer_step:
                             scaler.step_after_unscale_parameter_(self.model.optimizer)
                             scaler.update()
                         elif scaler:
@@ -1516,10 +2632,38 @@ class GenericTrainer(BaseTrainer):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             self.model.optimizer.step()
+                        if scaler:
+                            # GradScaler lowers its scale when it skips an
+                            # overflowing optimizer step. Moving references
+                            # must not advance when the policy did not.
+                            optimizer_step_succeeded = (
+                                float(scaler.get_scale())
+                                >= scaler_scale_before
+                            )
 
-                        lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
+                        # Clear normal gradients before streaming one DPO gradient
+                        # tensor at a time back to the GPU.
                         self.model.optimizer.zero_grad(set_to_none=True)
+                        dpo_bypass_updated = False
+                        if dpo_momentum_bypass:
+                            # This update is intentionally independent of the
+                            # GradScaler-controlled normal optimizer step. If
+                            # the normal step overflows but the separately
+                            # accumulated DPO gradients are applied, the policy
+                            # still changed and its Linear-DPO EMA must follow.
+                            dpo_bypass_updated = bool(
+                                self._dpo_bypass_cpu_grads
+                            )
+                            self.__apply_dpo_momentum_bypass(
+                                normal_grad_parameters
+                            )
+                        optimizer_step_succeeded = (
+                            optimizer_step_succeeded or dpo_bypass_updated
+                        )
+
+                        lr_scheduler.step()
                         self.model_setup.commit_dpo_curriculum_state()
+                        self.__commit_adaptive_dpo_observations()
                         has_gradient = False
                         self._gradient_accumulation_dirty = False
                         self.__flush_dpo_tensorboard_metrics(
@@ -1547,7 +2691,16 @@ class GenericTrainer(BaseTrainer):
                             self.tensorboard.add_scalar("smooth_loss/train_step", ema_loss, train_progress.global_step)
 
                         accumulated_loss = 0.0
-                        self.model_setup.after_optimizer_step(self.model, self.config, train_progress)
+                        if optimizer_step_succeeded:
+                            self.model_setup.after_optimizer_step(
+                                self.model,
+                                self.config,
+                                train_progress,
+                            )
+                            self.model_setup.update_dpo_ema_reference(
+                                self.model,
+                                self.config,
+                            )
 
                         if self.model.ema:
                             assert multi.is_master()
@@ -1587,10 +2740,12 @@ class GenericTrainer(BaseTrainer):
 
         if self._gradient_accumulation_dirty:
             self.model.optimizer.zero_grad(set_to_none=True)
+            self.__clear_dpo_bypass_gradients()
             self._gradient_accumulation_dirty = False
             self._dpo_metric_sums.clear()
-            self._dpo_metric_weight = 0.0
+            self._dpo_metric_weights.clear()
             self.model_setup.discard_dpo_curriculum_pending()
+            self.__discard_adaptive_dpo_observations()
             print(
                 "[OT-TRAIN] discarded an incomplete final gradient-"
                 "accumulation window; no resumable backup was written for it."

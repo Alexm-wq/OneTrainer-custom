@@ -110,15 +110,17 @@ class EncodeDPORejectedOrDummyLatent(
         return latent.squeeze(dim=0).detach()
 
     def get_item(self, variation: int, index: int, requested_name: str = None) -> dict:
-        latent_image = self._get_previous_item(variation, self.latent_image_in_name, index)
         is_paired = self._as_bool(self._get_previous_item(variation, self.is_paired_in_name, index))
 
-        if not is_paired:
-            dummy = latent_image if self.dummy_mode == "copy" else torch.zeros_like(latent_image)
-            return {self.latent_out_name: dummy}
+        if is_paired:
+            # Do not request latent_image here. During an in-place cache
+            # upgrade that would unnecessarily VAE-encode the already cached
+            # chosen image before encoding the rejected image.
+            image_rejected = self._get_previous_item(variation, self.image_in_name, index)
+            if image_rejected is None:
+                raise RuntimeError("DPO row has no image_rejected tensor")
+            return {self.latent_out_name: self._encode_rejected(image_rejected)}
 
-        image_rejected = self._get_previous_item(variation, self.image_in_name, index)
-        if image_rejected is None:
-            raise RuntimeError("DPO row has no image_rejected tensor")
-
-        return {self.latent_out_name: self._encode_rejected(image_rejected)}
+        latent_image = self._get_previous_item(variation, self.latent_image_in_name, index)
+        dummy = latent_image if self.dummy_mode == "copy" else torch.zeros_like(latent_image)
+        return {self.latent_out_name: dummy}

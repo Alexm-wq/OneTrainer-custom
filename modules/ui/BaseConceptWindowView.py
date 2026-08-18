@@ -3,6 +3,8 @@ import math
 
 from modules.util import path_util
 from modules.util.enum.BalancingStrategy import BalancingStrategy
+from modules.util.enum.ConceptDPOObjective import ConceptDPOObjective
+from modules.util.enum.ConceptDPOReferenceMode import ConceptDPOReferenceMode
 from modules.util.enum.ConceptType import ConceptType
 
 
@@ -116,6 +118,138 @@ class BaseConceptWindowView:
             ui_state,
             "dpo_rejected_pattern",
         )
+
+        self.components.label(
+            frame,
+            12,
+            0,
+            "DPO Objective",
+            tooltip=(
+                "Default inherits the objective selected in the RLHF tab. "
+                "DPO / Sigmoid overrides that objective for paired samples "
+                "from this concept only."
+            ),
+        )
+        self.components.options_kv(
+            frame,
+            12,
+            1,
+            [
+                ("Default (RLHF Tab)", ConceptDPOObjective.DEFAULT),
+                ("DPO / Sigmoid", ConceptDPOObjective.SIGMOID),
+            ],
+            ui_state,
+            "dpo_objective",
+        )
+
+        self.components.label(
+            frame,
+            13,
+            0,
+            "DPO Reference",
+            tooltip=(
+                "Default inherits the RLHF-tab reference. Base Model disables "
+                "the adapter only for this concept's reference forward. "
+                "Current Adapter Snapshot freezes the adapter loaded at "
+                "training start and uses it only for this concept."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.options_kv(
+            frame,
+            13,
+            1,
+            [
+                ("Default (RLHF Tab)", ConceptDPOReferenceMode.DEFAULT),
+                ("Base Model", ConceptDPOReferenceMode.BASE_MODEL),
+                (
+                    "Current Adapter Snapshot",
+                    ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT,
+                ),
+                (
+                    "Current Adapter Snapshot (CPU Offload)",
+                    ConceptDPOReferenceMode.CURRENT_ADAPTER_SNAPSHOT_CPU,
+                ),
+            ],
+            ui_state,
+            "dpo_reference_mode",
+        )
+
+        self.components.label(
+            frame,
+            14,
+            0,
+            "Streamed DPO (Low VRAM)",
+            tooltip=(
+                "Runs chosen and rejected reference forwards sequentially and "
+                "recomputes one policy branch at a time during backward. This greatly "
+                "reduces DPO activation memory for high-resolution concepts, "
+                "at the cost of extra recomputation during backward. It only "
+                "affects paired DPO samples from this concept."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 14, 1, ui_state, "dpo_streamed")
+
+        self.components.label(
+            frame,
+            15,
+            0,
+            "Localized / Masked DPO",
+            tooltip=(
+                "Use <chosen-stem>-masklabel.png to give the selected region "
+                "more weight in this concept's DPO score. The surrounding "
+                "image keeps weight 1, and this composes with every DPO "
+                "objective, curriculum, supervised mix, and Self-Flow."
+            ),
+            wide_tooltip=True,
+        )
+
+        self.components.label(
+            frame,
+            16,
+            0,
+            "DPO Mask Weight",
+            tooltip=(
+                "Direct element-loss multiplier inside white mask pixels. "
+                "Must be at least 1. Soft/gray pixels interpolate between "
+                "the surrounding weight 1 and this value."
+            ),
+            wide_tooltip=True,
+        )
+        dpo_mask_weight_widget = self.components.entry(
+            frame,
+            16,
+            1,
+            ui_state,
+            "dpo_mask_weight",
+        )
+
+        def set_dpo_mask_weight_enabled(value=None):
+            raw = (
+                value
+                if value is not None
+                else controller.concept.dpo_masked
+            )
+            enabled = (
+                raw.strip().lower() in {"1", "true", "yes", "on"}
+                if isinstance(raw, str)
+                else bool(raw)
+            )
+            self.components.set_widget_enabled(
+                dpo_mask_weight_widget,
+                enabled,
+            )
+
+        self.components.switch(
+            frame,
+            15,
+            1,
+            ui_state,
+            "dpo_masked",
+            command=set_dpo_mask_weight_enabled,
+        )
+        set_dpo_mask_weight_enabled()
 
     def build_image_augmentation_tab(self, frame, controller, image_ui_state):
         # header

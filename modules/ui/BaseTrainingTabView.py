@@ -159,6 +159,7 @@ class BaseTrainingTabView(ABC):
         self.__create_base2_frame(column_1, 0, controller, ui_state)
         self.__create_transformer_frame(column_1, 1, ui_state, supports_guidance_scale=True, supports_force_attention_mask=False)
         self.__create_noise_frame(column_1, 2, ui_state, supports_dynamic_timestep_shifting=True)
+        self.__create_self_flow_frame(column_1, 3, ui_state)
 
         self.__create_masked_frame(column_2, 1, ui_state)
         self.__create_loss_frame(column_2, 2, controller, ui_state)
@@ -804,6 +805,109 @@ class BaseTrainingTabView(ABC):
                               tooltip="Conditional Embedding Perturbation. Inject a slight noise into the TEs outputs to enhance the quality, diversity, and fidelity of the generated images. Gamma controls perturbation noise magnitude, paper's default is 1.")
         self.components.entry(frame, row, 1, ui_state, "cep_gamma", required=True)
         row += 1
+
+    def __create_self_flow_frame(self, master, row, ui_state):
+        frame = self.components.section_frame(master, row)
+
+        self.components.label(
+            frame, 0, 0, "Self-Flow",
+            tooltip="Enable Self-Flow dual-timestep FLUX.2 Base LoRA training. Sampling and disabled training keep the normal FLUX.2 path.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 0, 1, ui_state, "self_flow_enabled")
+
+        self.components.label(
+            frame, 1, 0, "Token Mask Ratio",
+            tooltip="Fraction of FLUX.2 image tokens assigned the second timestep. The Self-Flow paper requires at most 0.5; 0.25 is the reference default.",
+            wide_tooltip=True,
+        )
+        self.components.entry(
+            frame, 1, 1, ui_state, "self_flow_mask_ratio", required=True,
+            extra_validate=check_range(lower=0, upper=0.5, message="Self-Flow mask ratio must be between 0 and 0.5"),
+        )
+
+        self.components.label(
+            frame, 2, 0, "Representation Weight",
+            tooltip="Weight of the cosine student/EMA-teacher representation objective.",
+        )
+        self.components.entry(
+            frame, 2, 1, ui_state, "self_flow_rep_weight", required=True,
+            extra_validate=check_range(lower=0, upper=1000000, message="Self-Flow representation weight must be non-negative"),
+        )
+
+        self.components.label(
+            frame, 3, 0, "Structural Alignment",
+            tooltip=(
+                "Also align pairwise spatial relationships between sampled student and EMA-teacher image tokens. "
+                "Adds no transformer forward pass."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 3, 1, ui_state, "self_flow_structural_enabled")
+
+        self.components.label(
+            frame, 4, 0, "Structural Weight",
+            tooltip=(
+                "Weight of the sampled off-diagonal token-relation MSE. "
+                "Start conservatively; 0.25 is the default."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.entry(
+            frame, 4, 1, ui_state, "self_flow_structural_weight", required=True,
+            extra_validate=check_range(
+                lower=0,
+                upper=1000000,
+                message="Structural Self-Flow weight must be non-negative",
+            ),
+        )
+
+        self.components.label(
+            frame, 5, 0, "Structural Tokens",
+            tooltip=(
+                "Number of globally distributed image tokens used for relation matching. "
+                "256 keeps the quadratic Gram matrix small at 2K."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.entry(
+            frame, 5, 1, ui_state, "self_flow_structural_tokens", required=True,
+            extra_validate=check_range(
+                lower=2,
+                upper=2048,
+                message="Structural Self-Flow token count must be between 2 and 2048",
+            ),
+        )
+
+        self.components.label(
+            frame, 6, 0, "Teacher EMA Decay",
+            tooltip="CPU EMA decay for FLUX.2 adapter parameters used by the Self-Flow teacher.",
+        )
+        self.components.entry(
+            frame, 6, 1, ui_state, "self_flow_ema_decay", required=True,
+            extra_validate=check_range(lower=0, upper=0.999999, message="Self-Flow EMA decay must be in [0, 1)"),
+        )
+
+        self.components.label(
+            frame, 7, 0, "Student Layer",
+            tooltip="Single-stream layer used for the student feature. -1 selects an automatic depth-aware default.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 7, 1, ui_state, "self_flow_student_layer", required=True)
+
+        self.components.label(
+            frame, 8, 0, "Teacher Layer",
+            tooltip="Deeper single-stream EMA-teacher layer. -1 selects an automatic depth-aware default.",
+            wide_tooltip=True,
+        )
+        self.components.entry(frame, 8, 1, ui_state, "self_flow_teacher_layer", required=True)
+
+        self.components.label(
+            frame, 9, 0, "Offload Teacher Target",
+            tooltip="Keep the teacher feature on CPU while the student runs. Slower, but useful for high-resolution VRAM pressure.",
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 9, 1, ui_state, "self_flow_teacher_target_offload")
 
     def __create_masked_frame(self, master, row, ui_state):
         frame = self.components.section_frame(master, row)

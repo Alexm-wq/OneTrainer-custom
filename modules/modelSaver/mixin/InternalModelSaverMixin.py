@@ -30,6 +30,19 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
             os.makedirs(os.path.join(destination, "ema"), exist_ok=True)
             torch.save(model.ema.state_dict(), os.path.join(destination, "ema", "ema.pt"))
 
+        # Self-Flow's projector and CPU adapter EMA are training-only. They are
+        # stored in internal backups and deliberately excluded from normal
+        # LoRA exports so sampling remains compatible with ordinary adapters.
+        get_self_flow_state_dict = getattr(model, "get_self_flow_state_dict", None)
+        if callable(get_self_flow_state_dict):
+            self_flow_state_dict = get_self_flow_state_dict()
+            if self_flow_state_dict is not None:
+                os.makedirs(os.path.join(destination, "self_flow"), exist_ok=True)
+                torch.save(
+                    self_flow_state_dict,
+                    os.path.join(destination, "self_flow", "self_flow.pt"),
+                )
+
         # meta
         with open(os.path.join(destination, "meta.json"), "w") as meta_file:
             json.dump({

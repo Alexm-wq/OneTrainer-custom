@@ -39,6 +39,24 @@ class DeriveDPORejectedPath(
         self._pair_keys: list[str] = []
         self._cache_modes: list[str] = []
 
+    @staticmethod
+    def _build_pair_key(
+            chosen_path: str,
+            rejected_path: str,
+    ) -> str:
+        def normalize(path: str) -> str:
+            return os.path.normcase(
+                os.path.realpath(
+                    os.path.abspath(os.path.expanduser(str(path)))
+                )
+            )
+
+        return (
+            "dpo-pair-path-v1\n"
+            f"chosen={normalize(chosen_path)}\n"
+            f"rejected={normalize(rejected_path)}"
+        )
+
     def length(self) -> int:
         return self._get_previous_length(self.path_in_name)
 
@@ -110,13 +128,15 @@ class DeriveDPORejectedPath(
                 missing.append(str(e))
                 self._rejected_paths.append(image_path)
                 self._is_paired.append(False)
-                self._pair_keys.append(stem)
+                self._pair_keys.append('')
                 self._cache_modes.append('missing')
                 continue
 
             self._rejected_paths.append(rejected_path)
             self._is_paired.append(True)
-            self._pair_keys.append(stem)
+            self._pair_keys.append(
+                self._build_pair_key(image_path, rejected_path)
+            )
             self._cache_modes.append('dpo')
             dpo_count += 1
 

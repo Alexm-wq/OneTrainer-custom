@@ -47,6 +47,18 @@ class BaseSampleFrameView:
             self.components.label(bottom_frame, 2, 2, "random seed:")
             self.components.switch(bottom_frame, 2, 3, ui_state, "random_seed")
 
+            # Manual FLUX.2 Self-Flow student/EMA selection
+            if controller.supports_self_flow_ema_sampling():
+                self.components.label(bottom_frame, 3, 2, "Self-Flow EMA:")
+                self.components.switch(
+                    bottom_frame,
+                    3,
+                    3,
+                    ui_state,
+                    "self_flow_ema",
+                    text="use EMA teacher",
+                )
+
             # cfg scale
             self.components.label(bottom_frame, 3, 0, "cfg scale:")
             self.components.entry(bottom_frame, 3, 1, ui_state, "cfg_scale")

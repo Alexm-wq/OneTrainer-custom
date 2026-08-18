@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import uuid
 from copy import deepcopy
@@ -518,6 +519,18 @@ class TrainConfig(BaseConfig):
     timestep_shift: float
     dynamic_timestep_shifting: bool
 
+    # FLUX.2 Self-Flow (LoRA training only)
+    self_flow_enabled: bool
+    self_flow_mask_ratio: float
+    self_flow_rep_weight: float
+    self_flow_structural_enabled: bool
+    self_flow_structural_weight: float
+    self_flow_structural_tokens: int
+    self_flow_ema_decay: float
+    self_flow_student_layer: int
+    self_flow_teacher_layer: int
+    self_flow_teacher_target_offload: bool
+
     # unet
     unet: TrainModelPartConfig
 
@@ -648,7 +661,10 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_objective: DPOObjective
     rlhf_dpo_ipo_tau: float
     rlhf_dpo_ref_mode: DPORefMode
+    rlhf_dpo_linear_eta: float
+    rlhf_dpo_linear_ema_decay: float
     rlhf_dpo_adaptive_beta: bool
+    rlhf_dpo_momentum_bypass: bool
     rlhf_dpo_validation: bool
     rlhf_dpo_validation_percentage: float
     rlhf_dpo_patience_enabled: bool
@@ -664,8 +680,10 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_chosen_reward_floor_multiplier: float
     rlhf_dpo_chosen_reward_sharpness: float
 
-    # Anchored Reject: independently protect the chosen side and suppress the
-    # rejected side. There is deliberately no explicit margin objective.
+    # Anchored Reject trains the chosen side with one full ordinary supervised
+    # loss and suppresses the rejected side with an absolute anchor. These two
+    # legacy chosen-anchor fields remain serialized for backup compatibility,
+    # but are no longer used by the objective.
     rlhf_dpo_anchored_chosen_target: float
     rlhf_dpo_anchored_rejected_target: float
     rlhf_dpo_anchored_chosen_weight: float
@@ -675,13 +693,28 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_anchored_margin_weight: float
     rlhf_dpo_anchored_wrong_order_weight: float
 
-    # Optional competence-gated curriculum for Anchored Reject. Close or
-    # incorrectly ranked pairs receive a small gradient until their detached
-    # per-pair EMA margin shows that the model can distinguish them.
+    # Balanced Reject trains chosen with one full ordinary supervised loss.
+    # Its preference gradient is rejected-only; detached chosen improvement
+    # defines the rejected suppression budget.
+    rlhf_dpo_balanced_reject_ratio: float
+    rlhf_dpo_balanced_reject_weight: float
+    rlhf_dpo_balanced_huber_delta: float
+
+    # Optional objective-agnostic competence curriculum. Close or incorrectly
+    # ranked pairs receive a small gradient until their detached per-pair EMA
+    # margin shows that the model can distinguish them.
     rlhf_dpo_hard_pair_curriculum: bool
     rlhf_dpo_hard_pair_curriculum_ema: float
     rlhf_dpo_hard_pair_curriculum_min_weight: float
     rlhf_dpo_hard_pair_curriculum_full_margin: float
+
+    # Adaptive DPO dataset: solved pairs can be probabilistically replaced by
+    # harder pairs before their expensive cache/image payload is loaded.
+    rlhf_dpo_adaptive_dataset: bool
+    rlhf_dpo_adaptive_dataset_ema: float
+    rlhf_dpo_adaptive_dataset_min_observations: int
+    rlhf_dpo_adaptive_dataset_min_keep_probability: float
+    rlhf_dpo_adaptive_dataset_replacement_power: float
 
     # Separate CSV diagnostics for catastrophic/outlier pairs. These are never
     # sent to TensorBoard.
@@ -693,7 +726,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=11,
+            config_version=12,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -706,6 +739,7 @@ class TrainConfig(BaseConfig):
                 8: self.__migration_8,
                 9: self.__migration_9,
                 10: self.__migration_10,
+                11: self.__migration_11,
             }
         )
 
@@ -942,6 +976,13 @@ class TrainConfig(BaseConfig):
             elif training_method != "EMBEDDING":
                 migrated_data["output_model_format"] = "LEGACY_SAFETENSORS"
 
+        return migrated_data
+
+    def __migration_11(self, data: dict) -> dict:
+        """Add opt-in Linear-DPO settings without changing old objectives."""
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_dpo_linear_eta", 0.01)
+        migrated_data.setdefault("rlhf_dpo_linear_ema_decay", 0.995)
         return migrated_data
 
     def model_part_configs(self) -> list[TrainModelPartConfig]:
@@ -1191,6 +1232,19 @@ class TrainConfig(BaseConfig):
         data.append(("dynamic_timestep_shifting", False, bool, False))
         data.append(("cep_gamma", 0.0, float, False))
 
+        # FLUX.2 Self-Flow. Layer -1 selects normalized defaults from the
+        # loaded model depth (roughly one-third / five-sixths).
+        data.append(("self_flow_enabled", False, bool, False))
+        data.append(("self_flow_mask_ratio", 0.25, float, False))
+        data.append(("self_flow_rep_weight", 1.0, float, False))
+        data.append(("self_flow_structural_enabled", False, bool, False))
+        data.append(("self_flow_structural_weight", 0.25, float, False))
+        data.append(("self_flow_structural_tokens", 256, int, False))
+        data.append(("self_flow_ema_decay", 0.9999, float, False))
+        data.append(("self_flow_student_layer", -1, int, False))
+        data.append(("self_flow_teacher_layer", -1, int, False))
+        data.append(("self_flow_teacher_target_offload", False, bool, False))
+
 
         # unet
         unet = TrainModelPartConfig.default_values()
@@ -1378,7 +1432,19 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
+        # Linear-DPO (Li et al., 2026) clips its detached linear utility to
+        # [eta, 1-eta] and compares the policy with a separately updated EMA
+        # reference. These paper defaults are deliberately opt-in through the
+        # objective selector, so legacy configs deserialize unchanged.
+        data.append(("rlhf_dpo_linear_eta", 0.01, float, False))
+        data.append(("rlhf_dpo_linear_ema_decay", 0.995, float, False))
         data.append(("rlhf_dpo_adaptive_beta", False, bool, False))
+
+        # Keep DPO gradients out of persistent optimizer momentum. This is
+        # enabled by default to preserve the behavior of existing builds that
+        # used OT_DPO_BYPASS_MOMENTUM=1 by default. Legacy configs/backups that
+        # do not contain this field therefore continue with no-momentum DPO.
+        data.append(("rlhf_dpo_momentum_bypass", True, bool, False))
         data.append(("rlhf_dpo_validation", False, bool, False))
         data.append(("rlhf_dpo_validation_percentage", 0.0, float, False))
         data.append(("rlhf_dpo_patience_enabled", False, bool, False))
@@ -1394,25 +1460,43 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_chosen_reward_floor_multiplier", 4.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_sharpness", 20.0, float, False))
 
-        # Anchored Reject defaults. A zero chosen target prevents chosen-side
-        # degradation relative to the reference. A slightly negative rejected
-        # target asks the policy to make the rejected sample worse than the
-        # reference without continuously widening a pairwise margin.
+        # Anchored Reject uses one full ordinary chosen-image loss. Retain the
+        # old chosen target/weight fields so existing configs and backups still
+        # deserialize; the objective deliberately ignores them. A slightly
+        # negative rejected target asks the policy to suppress the reject.
         data.append(("rlhf_dpo_anchored_chosen_target", 0.0, float, False))
         data.append(("rlhf_dpo_anchored_rejected_target", -0.05, float, False))
-        data.append(("rlhf_dpo_anchored_chosen_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_anchored_chosen_weight", 0.0, float, False))
         data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))
         data.append(("rlhf_dpo_anchored_huber_delta", 0.1, float, False))
         data.append(("rlhf_dpo_anchored_margin_target", 0.05, float, False))
         data.append(("rlhf_dpo_anchored_margin_weight", 0.5, float, False))
         data.append(("rlhf_dpo_anchored_wrong_order_weight", 0.5, float, False))
 
-        # Disabled by default. At margin <= 0 the pair uses Minimum Weight;
-        # Smoothstep ramps it to full strength at Full Margin.
+        # Balanced Reject uses full chosen supervision (weight 1.0). A positive
+        # detached chosen reward budgets an equal-and-opposite reject target by
+        # default. If chosen reward is <= 0, the reject target returns to 0.
+        data.append(("rlhf_dpo_balanced_reject_ratio", 1.0, float, False))
+        data.append(("rlhf_dpo_balanced_reject_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_balanced_huber_delta", 0.1, float, False))
+
+        # Disabled by default and compatible with every DPO objective. At
+        # margin <= 0 the pair uses Minimum Weight; Smoothstep ramps it to full
+        # strength at Full Margin.
         data.append(("rlhf_dpo_hard_pair_curriculum", False, bool, False))
         data.append(("rlhf_dpo_hard_pair_curriculum_ema", 0.9, float, False))
         data.append(("rlhf_dpo_hard_pair_curriculum_min_weight", 0.1, float, False))
         data.append(("rlhf_dpo_hard_pair_curriculum_full_margin", 0.05, float, False))
+
+        # Adaptive dataset is deliberately opt-in. Missing fields in legacy
+        # configs/backups therefore deserialize to False/defaults without a
+        # migration or resume failure. Only the checkbox is exposed in the UI;
+        # the remaining values are advanced JSON-tunable defaults.
+        data.append(("rlhf_dpo_adaptive_dataset", False, bool, False))
+        data.append(("rlhf_dpo_adaptive_dataset_ema", 0.8, float, False))
+        data.append(("rlhf_dpo_adaptive_dataset_min_observations", 3, int, False))
+        data.append(("rlhf_dpo_adaptive_dataset_min_keep_probability", 0.1, float, False))
+        data.append(("rlhf_dpo_adaptive_dataset_replacement_power", 2.0, float, False))
 
         # Only severe outliers are written to dpo_bad_pairs.csv. The change
         # threshold compares a pair with its previous occurrence in this run.
@@ -1423,4 +1507,66 @@ class TrainConfig(BaseConfig):
         return TrainConfig(data)
 
     def effective_dpo_ref_mode(self):
+        if DPOObjective(self.rlhf_dpo_objective) == DPOObjective.LINEAR:
+            return DPORefMode.EMA_ADAPTER
         return getattr(self, "rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER)
+
+    def validate_dpo_settings(self):
+        """Reject combinations whose controls are disabled in the UI.
+
+        This keeps hand-edited JSON and command-line launches mathematically
+        equivalent to the visible Linear-DPO configuration instead of silently
+        accepting options that the objective cannot use faithfully.
+        """
+        if not self.rlhf_enabled:
+            return
+
+        objective = DPOObjective(self.rlhf_dpo_objective)
+        if objective != DPOObjective.LINEAR:
+            if DPORefMode(self.rlhf_dpo_ref_mode) == DPORefMode.EMA_ADAPTER:
+                raise ValueError(
+                    "EMA Adapter reference is reserved for Linear-DPO."
+                )
+            if objective == DPOObjective.BALANCED_REJECT:
+                if float(self.rlhf_dpo_balanced_reject_ratio) < 0.0:
+                    raise ValueError("Balanced Reject ratio must be >= 0.")
+                if float(self.rlhf_dpo_balanced_reject_weight) < 0.0:
+                    raise ValueError("Balanced Reject weight must be >= 0.")
+                if float(self.rlhf_dpo_balanced_huber_delta) <= 0.0:
+                    raise ValueError("Balanced Reject Huber delta must be > 0.")
+            return
+
+        beta = float(self.rlhf_dpo_beta)
+        eta = float(self.rlhf_dpo_linear_eta)
+        ema_decay = float(self.rlhf_dpo_linear_ema_decay)
+        if beta <= 0.0:
+            raise ValueError("Linear-DPO beta must be greater than zero.")
+        if not 0.0 <= eta <= 0.5:
+            raise ValueError("Linear-DPO eta must be in [0, 0.5].")
+        if not 0.0 <= ema_decay < 1.0:
+            raise ValueError("Linear-DPO EMA decay must be in [0, 1).")
+        if bool(self.rlhf_dpo_adaptive_dataset):
+            adaptive_scale = float(
+                self.rlhf_dpo_hard_pair_curriculum_full_margin
+            )
+            if not math.isfinite(adaptive_scale) or adaptive_scale <= 0.0:
+                raise ValueError(
+                    "Linear-DPO Adaptive Dataset requires Full Competence to "
+                    "be finite and greater than zero."
+                )
+
+        incompatible = []
+        if float(self.rlhf_dpo_label_smoothing) != 0.0:
+            incompatible.append("Label Smoothing")
+        if bool(self.rlhf_dpo_adaptive_beta):
+            incompatible.append("Adaptive Beta")
+        if bool(self.rlhf_dpo_beta_gradient_decouple):
+            incompatible.append("Beta Gradient Decouple")
+        if bool(self.rlhf_dpo_chosen_reward_anchor):
+            incompatible.append("Chosen Reward Anchor")
+        if incompatible:
+            raise ValueError(
+                "Linear-DPO is incompatible with: "
+                + ", ".join(incompatible)
+                + ". Disable these options or select another objective."
+            )

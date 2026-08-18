@@ -167,6 +167,7 @@ class SampleConfig(BaseConfig):
     length: float
     seed: int
     random_seed: bool
+    self_flow_ema: bool
     diffusion_steps: int
     cfg_scale: float
     noise_scheduler: NoiseScheduler
@@ -211,6 +212,7 @@ class SampleConfig(BaseConfig):
         data.append(("length", 10.0, float, False))
         data.append(("seed", 42, int, False))
         data.append(("random_seed", False, bool, False))
+        data.append(("self_flow_ema", False, bool, False))
         data.append(("diffusion_steps", defaults["diffusion_steps"], int, False))
         data.append(("cfg_scale", defaults["cfg_scale"], float, False))
         data.append(("noise_scheduler", defaults["noise_scheduler"], NoiseScheduler, False))

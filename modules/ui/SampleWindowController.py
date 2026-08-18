@@ -52,6 +52,13 @@ class SampleWindowController:
     def get_model_type(self):
         return self.current_train_config.model_type
 
+    def supports_self_flow_ema_sampling(self) -> bool:
+        return bool(
+            getattr(self.current_train_config, "self_flow_enabled", False)
+            and self.current_train_config.model_type.is_flux_2()
+            and self.current_train_config.training_method == TrainingMethod.LORA
+        )
+
     def load_model(self) -> BaseModel:
         model_loader = create.create_model_loader(
             model_type=self.initial_train_config.model_type,

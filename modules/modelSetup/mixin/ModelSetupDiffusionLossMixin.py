@@ -32,6 +32,13 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         loss = diff + torch.nn.functional.softplus(-2.0*diff) - torch.log(torch.full(size=diff.size(), fill_value=2.0, dtype=torch.float32, device=diff.device))
         return loss
 
+    @staticmethod
+    def __apply_element_loss_weight(loss: Tensor, data: dict) -> Tensor:
+        element_loss_weight = data.get('element_loss_weight')
+        if element_loss_weight is None:
+            return loss
+        return loss * element_loss_weight.to(device=loss.device, dtype=loss.dtype)
+
     def __masked_losses(
             self,
             batch: dict,
@@ -45,16 +52,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # MSE/L2 Loss
         if config.mse_strength != 0:
             losses += masked_losses_with_prior(
-                losses=F.mse_loss(
+                losses=self.__apply_element_loss_weight(F.mse_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
                     reduction='none'
-                ),
-                prior_losses=F.mse_loss(
+                ), data),
+                prior_losses=self.__apply_element_loss_weight(F.mse_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['prior_target'].to(dtype=torch.float32),
                     reduction='none'
-                ) if 'prior_target' in data else None,
+                ), data) if 'prior_target' in data else None,
                 mask=batch['latent_mask'].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -64,16 +71,16 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # MAE/L1 Loss
         if config.mae_strength != 0:
             losses += masked_losses_with_prior(
-                losses=F.l1_loss(
+                losses=self.__apply_element_loss_weight(F.l1_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
                     reduction='none'
-                ),
-                prior_losses=F.l1_loss(
+                ), data),
+                prior_losses=self.__apply_element_loss_weight(F.l1_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['prior_target'].to(dtype=torch.float32),
                     reduction='none'
-                ) if 'prior_target' in data else None,
+                ), data) if 'prior_target' in data else None,
                 mask=batch['latent_mask'].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -83,14 +90,14 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # log-cosh Loss
         if config.log_cosh_strength != 0:
             losses += masked_losses_with_prior(
-                losses=self.__log_cosh_loss(
+                losses=self.__apply_element_loss_weight(self.__log_cosh_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32)
-                ),
-                prior_losses=self.__log_cosh_loss(
+                ), data),
+                prior_losses=self.__apply_element_loss_weight(self.__log_cosh_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['prior_target'].to(dtype=torch.float32)
-                ) if 'prior_target' in data else None,
+                ), data) if 'prior_target' in data else None,
                 mask=batch['latent_mask'].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -100,18 +107,18 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
         # Huber Loss
         if config.huber_strength != 0:
             losses += masked_losses_with_prior(
-                losses=F.huber_loss(
+                losses=self.__apply_element_loss_weight(F.huber_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32),
                     reduction='none',
                     delta=config.huber_delta,
-                ),
-                prior_losses=F.huber_loss(
+                ), data),
+                prior_losses=self.__apply_element_loss_weight(F.huber_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['prior_target'].to(dtype=torch.float32),
                     reduction='none',
                     delta=config.huber_delta,
-                ) if 'prior_target' in data else None,
+                ), data) if 'prior_target' in data else None,
                 mask=batch['latent_mask'].to(dtype=torch.float32),
                 unmasked_weight=config.unmasked_weight,
                 normalize_masked_area_loss=config.normalize_masked_area_loss,
@@ -148,35 +155,35 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
 
         # MSE/L2 Loss
         if config.mse_strength != 0:
-            losses += F.mse_loss(
+            losses += self.__apply_element_loss_weight(F.mse_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none'
-            ).mean(mean_dim) * config.mse_strength
+            ), data).mean(mean_dim) * config.mse_strength
 
         # MAE/L1 Loss
         if config.mae_strength != 0:
-            losses += F.l1_loss(
+            losses += self.__apply_element_loss_weight(F.l1_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none'
-            ).mean(mean_dim) * config.mae_strength
+            ), data).mean(mean_dim) * config.mae_strength
 
         # log-cosh Loss
         if config.log_cosh_strength != 0:
-            losses += self.__log_cosh_loss(
+            losses += self.__apply_element_loss_weight(self.__log_cosh_loss(
                     data['predicted'].to(dtype=torch.float32),
                     data['target'].to(dtype=torch.float32)
-                ).mean(mean_dim) * config.log_cosh_strength
+                ), data).mean(mean_dim) * config.log_cosh_strength
 
         # Huber Loss
         if config.huber_strength != 0:
-            losses += F.huber_loss(
+            losses += self.__apply_element_loss_weight(F.huber_loss(
                 data['predicted'].to(dtype=torch.float32),
                 data['target'].to(dtype=torch.float32),
                 reduction='none',
                 delta=config.huber_delta,
-            ).mean(mean_dim) * config.huber_strength
+            ), data).mean(mean_dim) * config.huber_strength
 
         # VB loss
         if config.vb_loss_strength != 0 and 'predicted_var_values' in data:
@@ -336,7 +343,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                 case LossWeight.CONSTANT:
                     pass
                 case LossWeight.SIGMA:
-                    losses *= self.__sigma_loss_weight(data['timestep'], losses.device)
+                    # Self-Flow supplies per-token sigma weights before spatial
+                    # reduction through element_loss_weight. The legacy [B]
+                    # path retains its established post-reduction weighting.
+                    if 'element_loss_weight' not in data:
+                        losses *= self.__sigma_loss_weight(data['timestep'], losses.device)
                 case _:
                     raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models")
 

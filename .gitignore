@@ -61,3 +61,24 @@ dpo_pair_log.csv.*
 *.before_*
 *.patch
 install_anchored_reject_curriculum.py
+
+# Local OneTrainer patch/backups
+.onetrainer_patch_backups/
+ot_dataset_dpo_objective_backups/
+ot_dpo_cache_upgrader_backups/
+ot_mgds_backups/
+
+# One-off backup copies
+*.before-*
+*.bak
+
+# Runtime DPO state/logs
+.adaptive_dpo_dataset_last_backup
+adaptive_dpo_decisions.csv
+dpo_bad_pairs.csv
+
+# Local model/checkpoint files
+/model.safetensors
+
+# Temporary patch scripts
+/patch_dpo_full_self_flow_experiment.py

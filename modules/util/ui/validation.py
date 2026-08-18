@@ -105,12 +105,14 @@ def validate_path(
         return None
 
     if io_type == PathIOType.INPUT:
-        if not os.path.exists(os.path.abspath(trimmed)):
-            return "Input path does not exist"
+        absolute_path = os.path.abspath(trimmed)
+        if not os.path.exists(absolute_path):
+            return f"Input path does not exist: {absolute_path}"
 
     if io_type in (PathIOType.OUTPUT, PathIOType.MODEL):
-        if not os.path.isdir(os.path.dirname(os.path.abspath(trimmed))):
-            return "Parent folder does not exist"
+        parent_path = os.path.dirname(os.path.abspath(trimmed))
+        if not os.path.isdir(parent_path):
+            return f"Parent folder does not exist: {parent_path}"
 
     if io_type == PathIOType.MODEL and output_format is not None:
         if output_format == "DIFFUSERS":

@@ -3,6 +3,8 @@ from typing import Any
 
 from modules.util.config.BaseConfig import BaseConfig
 from modules.util.enum.BalancingStrategy import BalancingStrategy
+from modules.util.enum.ConceptDPOObjective import ConceptDPOObjective
+from modules.util.enum.ConceptDPOReferenceMode import ConceptDPOReferenceMode
 from modules.util.enum.ConceptType import ConceptType
 
 
@@ -143,6 +145,11 @@ class ConceptConfig(BaseConfig):
 
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
+    dpo_objective: ConceptDPOObjective
+    dpo_reference_mode: ConceptDPOReferenceMode
+    dpo_streamed: bool
+    dpo_masked: bool
+    dpo_mask_weight: float
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
@@ -201,4 +208,22 @@ class ConceptConfig(BaseConfig):
 
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
+        data.append((
+            "dpo_objective",
+            ConceptDPOObjective.DEFAULT,
+            ConceptDPOObjective,
+            False,
+        ))
+        data.append((
+            "dpo_reference_mode",
+            ConceptDPOReferenceMode.DEFAULT,
+            ConceptDPOReferenceMode,
+            False,
+        ))
+        data.append(("dpo_streamed", False, bool, False))
+        # Localized DPO reuses the existing <chosen-stem>-masklabel.png file.
+        # The multiplier is applied directly to the elementwise loss inside
+        # the selected region; 1.0 therefore means no localization effect.
+        data.append(("dpo_masked", False, bool, False))
+        data.append(("dpo_mask_weight", 10.0, float, False))
         return ConceptConfig(data)

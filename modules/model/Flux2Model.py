@@ -4,6 +4,7 @@ from random import Random
 
 from modules.model.BaseModel import BaseModel
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.module.Flux2SelfFlow import Flux2SelfFlowEMA, Flux2SelfFlowProjector
 from modules.util.convert_util import chunk_swap
 from modules.util.enum.ModelType import ModelType
 from modules.util.LayerOffloadConductor import LayerOffloadConductor
@@ -48,6 +49,11 @@ class Flux2Model(BaseModel):
 
     transformer_lora: LoRAModuleWrapper | None
     lora_state_dict: dict | None
+    self_flow_projector: Flux2SelfFlowProjector | None
+    self_flow_ema: Flux2SelfFlowEMA | None
+    self_flow_state_dict: dict | None
+    self_flow_student_layer: int | None
+    self_flow_teacher_layer: int | None
 
     def __init__(
             self,
@@ -70,6 +76,11 @@ class Flux2Model(BaseModel):
 
         self.transformer_lora = None
         self.lora_state_dict = None
+        self.self_flow_projector = None
+        self.self_flow_ema = None
+        self.self_flow_state_dict = None
+        self.self_flow_student_layer = None
+        self.self_flow_teacher_layer = None
 
     def adapters(self) -> list[LoRAModuleWrapper]:
         return [a for a in [
@@ -144,6 +155,8 @@ class Flux2Model(BaseModel):
 
         if self.transformer_lora is not None:
             self.transformer_lora.to(device)
+        if self.self_flow_projector is not None:
+            self.self_flow_projector.to(device=device)
 
     def to(self, device: torch.device):
         self.vae_to(device)
@@ -155,6 +168,22 @@ class Flux2Model(BaseModel):
         if self.text_encoder is not None:
             self.text_encoder.eval()
         self.transformer.eval()
+        if self.self_flow_projector is not None:
+            self.self_flow_projector.eval()
+
+    def self_flow_adapter_modules(self) -> list[torch.nn.Module]:
+        if self.transformer_lora is None:
+            return []
+        return list(self.transformer_lora.lora_modules.values())
+
+    def get_self_flow_state_dict(self) -> dict | None:
+        if self.self_flow_projector is None or self.self_flow_ema is None:
+            return None
+        return {
+            "version": 1,
+            "projector": self.self_flow_projector.state_dict(),
+            "ema": self.self_flow_ema.state_dict(),
+        }
 
     def create_pipeline(self) -> DiffusionPipeline:
         klass = Flux2Pipeline if self.is_dev() else Flux2KleinPipeline

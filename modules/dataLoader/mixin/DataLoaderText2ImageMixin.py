@@ -58,22 +58,72 @@ from mgds.pipelineModules.VariationSorting import VariationSorting
 import torch
 
 from diffusers import AutoencoderKL
+from modules.dataLoader.dpo.AdaptiveDPODataset import AdaptiveDPODataset
 from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
 from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
 from modules.dataLoader.dpo.LoadDPORejectedImageOrDummy import LoadDPORejectedImageOrDummy
 from modules.dataLoader.dpo.EncodeDPORejectedOrDummyLatent import EncodeDPORejectedOrDummyLatent
+from modules.dataLoader.dpo.LoadDPOLocalizedMask import LoadDPOLocalizedMask
+from modules.dataLoader.dpo.PrepareDPOLocalizedMask import PrepareDPOLocalizedMask
 
 
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     @staticmethod
+    def _localized_dpo_enabled(config: TrainConfig) -> bool:
+        if not bool(getattr(config, "rlhf_enabled", False)):
+            return False
+
+        concepts = getattr(config, "concepts", None)
+        if concepts is None:
+            try:
+                with open(
+                        config.concept_file_name,
+                        "r",
+                        encoding="utf-8",
+                ) as handle:
+                    concepts = [
+                        ConceptConfig.default_values().from_dict(item)
+                        for item in json.load(handle)
+                    ]
+            except (OSError, json.JSONDecodeError, TypeError):
+                concepts = []
+
+        for concept in concepts:
+            concept_dict = (
+                concept.to_dict()
+                if hasattr(concept, "to_dict")
+                else concept
+            )
+            if not bool(concept_dict.get("enabled", True)):
+                continue
+            if not bool(concept_dict.get("dpo_masked", False)):
+                continue
+            if (
+                concept_dict.get("dpo_chosen_pattern", "")
+                or concept_dict.get("dpo_rejected_pattern", "")
+            ):
+                return True
+        return False
+
+    @staticmethod
     def _cache_only_concepts(config: TrainConfig) -> list[dict]:
         concepts = config.concepts
         if concepts is None:
-            with open(config.concept_file_name, "r", encoding="utf-8") as handle:
-                concepts = [
-                    ConceptConfig.default_values().from_dict(item)
-                    for item in json.load(handle)
-                ]
+            try:
+                with open(
+                        config.concept_file_name,
+                        "r",
+                        encoding="utf-8",
+                ) as handle:
+                    concepts = [
+                        ConceptConfig.default_values().from_dict(item)
+                        for item in json.load(handle)
+                    ]
+            except (OSError, json.JSONDecodeError, TypeError):
+                # Cache-only can run from self-describing manifests with no
+                # concept file at all. Missing concepts merely disable live
+                # per-concept overrides; they never invalidate the cache.
+                concepts = []
         concept_dicts = [
             concept.to_dict() if hasattr(concept, "to_dict") else concept
             for concept in concepts
@@ -157,11 +207,26 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 image_out_name='image_rejected', range_min=0, range_max=1,
                 dtype=train_dtype.torch_dtype(),
             ))
+            if self._localized_dpo_enabled(config):
+                modules.append(LoadDPOLocalizedMask(
+                    path_in_name="image_path",
+                    image_in_name="image",
+                    is_paired_in_name="dpo_is_paired",
+                    concept_in_name="concept",
+                    mask_out_name="dpo_mask_image",
+                    mask_path_out_name="dpo_mask_path",
+                    dtype=train_dtype.torch_dtype(),
+                ))
 
         if vae_frame_dim:
             modules.append(image_to_video)
             if config.rlhf_enabled:
                 modules.append(ImageToVideo(in_name='image_rejected', out_name='image_rejected'))
+                if self._localized_dpo_enabled(config):
+                    modules.append(ImageToVideo(
+                        in_name="dpo_mask_image",
+                        out_name="dpo_mask_image",
+                    ))
 
         modules.extend([load_sample_prompts, load_concept_prompts, filename_prompt, select_prompt_input, select_random_text])
 
@@ -183,6 +248,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         inputs = ['image']
         if config.rlhf_enabled and 'image_rejected' not in inputs:
             inputs.append('image_rejected')
+        if self._localized_dpo_enabled(config):
+            inputs.append("dpo_mask_image")
 
         lowest_resolution = min([int(x.strip()) for x in re.split(r'\D', config.resolution) if x.strip() != ''])
         circular_mask_shrink = RandomCircularMaskShrink(mask_name='mask', shrink_probability=1.0, shrink_factor_min=0.2, shrink_factor_max=1.0, enabled_in_name='concept.image.enable_random_circular_mask_shrink')
@@ -239,6 +306,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         inputs = ['image']
         if config.rlhf_enabled and 'image_rejected' not in inputs:
             inputs.append('image_rejected')
+        if self._localized_dpo_enabled(config):
+            inputs.append("dpo_mask_image")
 
         if config.masked_training or config.model_type.has_mask_input():
             inputs.append('mask')
@@ -263,6 +332,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 inputs.append('image_rejected')
             if 'image_rejected' not in image_inputs:
                 image_inputs.append('image_rejected')
+            if self._localized_dpo_enabled(config):
+                inputs.append("dpo_mask_image")
 
         if config.masked_training or config.model_type.has_mask_input():
             inputs.append('mask')
@@ -336,10 +407,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 'dpo_cache_mode',
                 'image_path_rejected',
                 'crop_resolution',
-                'scale_resolution',
                 'concept.image.resolution_override',
                 'concept.image.enable_resolution_override',
             ]
+            if self._localized_dpo_enabled(config):
+                output_names = output_names + [
+                    "dpo_mask",
+                    "dpo_mask_path",
+                ]
 
         if before_cache_image_fun is None:
             def prepare_vae():
@@ -359,6 +434,35 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ('concept.loss_weight', 'loss_weight'),
             ('concept.type', 'concept_type'),
         ]
+        if config.rlhf_enabled:
+            output_names.append((
+                'concept.dpo_objective',
+                'dpo_objective',
+            ))
+            output_names.append((
+                'concept.dpo_reference_mode',
+                'dpo_reference_mode',
+            ))
+            output_names.append((
+                'concept.dpo_streamed',
+                'dpo_streamed',
+            ))
+            output_names.append((
+                'concept.dpo_masked',
+                'dpo_masked',
+            ))
+            output_names.append((
+                'concept.dpo_mask_weight',
+                'dpo_mask_weight',
+            ))
+            # The concept seed is stable across saves and does not depend on
+            # the source path.  It therefore identifies the frozen adapter
+            # snapshot belonging to this concept without putting that live
+            # selector into either the image or text cache.
+            output_names.append((
+                'concept.seed',
+                'dpo_reference_key',
+            ))
 
         if config.validation:
             output_names.append(('concept.name', 'concept_name'))
@@ -388,6 +492,44 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         if config.model_type.has_mask_input():
             modules.append(mask_remove)
 
+        if (
+            config.rlhf_enabled
+            and bool(getattr(config, "rlhf_dpo_adaptive_dataset", False))
+        ):
+            # This random-access remap sits after cache/variation construction
+            # but before aspect sorting. Epoch start indexes only cheap metadata.
+            # The keep/replace draw itself happens live when the candidate is
+            # actually requested for training, before its expensive payload is
+            # fetched; replacement stays inside the same resolution bucket.
+            adaptive_names = list(dict.fromkeys(
+                name.split(".", 1)[0]
+                for name in sort_names
+            ))
+            modules.append(AdaptiveDPODataset(
+                names=adaptive_names,
+                ema_decay=float(getattr(
+                    config,
+                    "rlhf_dpo_adaptive_dataset_ema",
+                    0.8,
+                )),
+                min_observations=int(getattr(
+                    config,
+                    "rlhf_dpo_adaptive_dataset_min_observations",
+                    3,
+                )),
+                min_keep_probability=float(getattr(
+                    config,
+                    "rlhf_dpo_adaptive_dataset_min_keep_probability",
+                    0.1,
+                )),
+                replacement_power=float(getattr(
+                    config,
+                    "rlhf_dpo_adaptive_dataset_replacement_power",
+                    2.0,
+                )),
+                default_objective=str(config.rlhf_dpo_objective),
+            ))
+
         modules.append(batch_sorting)
         if world_size > 1:
             modules.append(distributed_sampler)
@@ -411,10 +553,6 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         image_cache_dir = os.path.join(config.cache_dir, "image")
         text_cache_dir = os.path.join(config.cache_dir, "text")
 
-        if config.rlhf_enabled:
-            image_cache_dir = os.path.join(config.cache_dir, "image-rlhf-mixed-working")
-            text_cache_dir = os.path.join(config.cache_dir, "text-rlhf-mixed-working")
-
         if before_cache_image_fun is None:
             def prepare_vae():
                 model.to(self.temp_device)
@@ -435,12 +573,22 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 'dpo_cache_mode',
                 'image_path_rejected',
                 'crop_resolution',
-                'scale_resolution',
             ]:
                 if _dpo_name not in image_aggregate_names:
                     image_aggregate_names = image_aggregate_names + [_dpo_name]
                 if _dpo_name not in sort_names:
                     sort_names = sort_names + [_dpo_name]
+
+            if self._localized_dpo_enabled(config):
+                if "dpo_mask" not in image_split_names:
+                    image_split_names = image_split_names + ["dpo_mask"]
+                if "dpo_mask_path" not in image_aggregate_names:
+                    image_aggregate_names = image_aggregate_names + [
+                        "dpo_mask_path"
+                    ]
+                for _localized_name in ("dpo_mask", "dpo_mask_path"):
+                    if _localized_name not in sort_names:
+                        sort_names = sort_names + [_localized_name]
 
         cache_only_concepts = (
             self._cache_only_concepts(config)
@@ -460,6 +608,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         image_encryption_source_names = ['image_path']
         if config.rlhf_enabled:
             image_encryption_source_names.append('image_path_rejected')
+            if self._localized_dpo_enabled(config):
+                image_encryption_source_names.append('dpo_mask_path')
         if config.masked_training:
             image_encryption_source_names.append('mask_path')
         if config.custom_conditioning_image:
@@ -468,6 +618,33 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         encrypt_all_cache_files = (
             config.cache_encryption_scope == CacheEncryptionScope.ALL
         )
+        # In cache-only mode both cache modules negotiate one on-disk layout.
+        # This shared object makes the image cache authoritative and prevents
+        # the text cache from independently reinterpreting concept balancing.
+        cache_only_layout = {} if config.use_cache_only else None
+
+        image_variation_groups = [
+            'concept.path',
+            'concept.seed',
+            'concept.include_subdirectories',
+            'concept.image',
+            'concept.dpo_chosen_pattern',
+            'concept.dpo_rejected_pattern',
+        ]
+        text_variation_groups = [
+            'concept.path',
+            'concept.seed',
+            'concept.include_subdirectories',
+            'concept.text',
+            'concept.dpo_chosen_pattern',
+            'concept.dpo_rejected_pattern',
+        ]
+        if self._localized_dpo_enabled(config):
+            # Enabling/disabling localization changes the image-cache schema.
+            # The numeric multiplier is live concept metadata and does not
+            # alter either cached pixels/latents or cached text, so changing
+            # it must not force an unnecessary cache rebuild.
+            image_variation_groups.append('concept.dpo_masked')
 
         image_disk_cache = MultiResolutionDiskCache(
             cache_dir=image_cache_dir,
@@ -478,14 +655,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             variations_in_name='concept.image_variations',
             balancing_in_name='concept.balancing',
             balancing_strategy_in_name='concept.balancing_strategy',
-            variations_group_in_name=[
-                'concept.path',
-                'concept.seed',
-                'concept.include_subdirectories',
-                'concept.image',
-                'concept.dpo_chosen_pattern',
-                'concept.dpo_rejected_pattern',
-            ],
+            variations_group_in_name=image_variation_groups,
             group_enabled_in_name='concept.enabled',
             before_cache_fun=before_cache_image_fun,
             encrypted=config.cache_encryption_enabled,
@@ -494,15 +664,17 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             encryption_source_path_in_name=image_encryption_source_names,
             cache_only=config.use_cache_only,
             cache_only_concepts=cache_only_concepts,
+            cache_only_layout=cache_only_layout,
         )
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun,
+                                    variations_group_in_name=text_variation_groups, group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun,
                                     encrypted=config.cache_encryption_enabled, encryption_context="text",
                                     encrypt_all=encrypt_all_cache_files,
                                     encryption_source_path_in_name=['sample_prompt_path', 'concept.text.prompt_path'],
                                     cache_only=config.use_cache_only,
-                                    cache_only_concepts=cache_only_concepts)
+                                    cache_only_concepts=cache_only_concepts,
+                                    cache_only_layout=cache_only_layout)
 
         modules = []
 
@@ -523,7 +695,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                     f"values: {', '.join(sort_names)}"
                 )
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled')
+                                                 variations_group_in_name=text_variation_groups, group_enabled_in_name='concept.enabled')
 
             modules.append(variation_sorting)
 
@@ -577,15 +749,36 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         if supports_inpainting:
             inpainting_modules = self._inpainting_modules(config)
         preparation_modules = self._preparation_modules(config, model)
+        if self._localized_dpo_enabled(config):
+            preparation_modules = preparation_modules + [
+                PrepareDPOLocalizedMask(
+                    mask_in_name="dpo_mask_image",
+                    latent_in_name="latent_image",
+                    mask_out_name="dpo_mask",
+                )
+            ]
         if config.rlhf_enabled:
+            rejected_vae_contexts = [model.autocast_context]
+            rejected_vae_autocast_context = getattr(
+                model,
+                'vae_autocast_context',
+                None,
+            )
+            if rejected_vae_autocast_context is not None:
+                rejected_vae_contexts.append(rejected_vae_autocast_context)
+            rejected_vae_dtype = getattr(
+                model,
+                'vae_train_dtype',
+                model.train_dtype,
+            ).torch_dtype()
             preparation_modules = preparation_modules + [EncodeDPORejectedOrDummyLatent(
                 image_in_name='image_rejected',
                 latent_image_in_name='latent_image',
                 is_paired_in_name='dpo_is_paired',
                 latent_out_name='latent_image_rejected',
                 vae=getattr(model, "vae", None),
-                autocast_contexts=[model.autocast_context],
-                dtype=model.train_dtype.torch_dtype(),
+                autocast_contexts=rejected_vae_contexts,
+                dtype=rejected_vae_dtype,
                 dummy_mode='zeros',
             )]
         cache_modules = self._cache_modules(config, model, model_setup)
