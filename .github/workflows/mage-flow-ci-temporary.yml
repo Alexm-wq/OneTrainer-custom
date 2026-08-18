@@ -80,3 +80,87 @@ jobs:
           assert 'self.vae.encode(' in src, 'Expected direct Mage VAE encode path missing'
           print('Microsoft Mage API assumptions: PASS')
           PY
+
+  onetrainer-cpu-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Mage implementation branch
+        uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+
+      - name: Install Pixi
+        uses: prefix-dev/setup-pixi@v0.9.1
+        with:
+          pixi-version: v0.71.2
+          cache: true
+          environments: cpu
+
+      - name: Verify pinned OneTrainer environment
+        run: |
+          pixi run -e cpu python - <<'PY'
+          import sys, torch
+          assert sys.version_info[:2] == (3, 13), sys.version
+          assert torch.__version__.startswith('2.12.0'), torch.__version__
+          print('OneTrainer CPU environment:', sys.version.split()[0], torch.__version__)
+          PY
+
+      - name: Install current Microsoft Mage without dependency mutation
+        run: |
+          git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
+          pixi run -e cpu python -m pip install --no-deps /tmp/Mage-runtime
+
+      - name: Import Mage runtime on OneTrainer torch 2.12
+        run: |
+          pixi run -e cpu python - <<'PY'
+          import inspect
+          import torch
+          from mage_flow.pipeline import load_from_repo, generate_images
+          from mage_flow.models.mage_flow import MageFlow
+
+          sig = inspect.signature(MageFlow.forward)
+          required = {'img','txt','timesteps','img_shapes','img_cu_seqlens','txt_cu_seqlens'}
+          assert required <= set(sig.parameters), sig
+          assert callable(load_from_repo)
+          assert callable(generate_images)
+          print('Microsoft Mage imports successfully on OneTrainer torch', torch.__version__)
+          PY
+
+      - name: Import and verify OneTrainer Mage registrations
+        run: |
+          pixi run -e cpu python - <<'PY'
+          from modules.util import factory
+          from modules.util.enum.ModelType import ModelType
+          from modules.util.enum.TrainingMethod import TrainingMethod
+          from modules.modelLoader.BaseModelLoader import BaseModelLoader
+          from modules.modelSetup.BaseModelSetup import BaseModelSetup
+          from modules.dataLoader.BaseDataLoader import BaseDataLoader
+          from modules.modelSampler.BaseModelSampler import BaseModelSampler
+          from modules.modelSaver.BaseModelSaver import BaseModelSaver
+
+          import modules.model.MageFlowModel
+          import modules.modelLoader.MageFlowLoRAModelLoader
+          import modules.modelLoader.MageFlowFineTuneModelLoader
+          import modules.modelSetup.MageFlowLoRASetup
+          import modules.modelSetup.MageFlowFineTuneSetup
+          import modules.dataLoader.MageFlowBaseDataLoader
+          import modules.modelSampler.MageFlowSampler
+          import modules.modelSaver.MageFlowLoRAModelSaver
+          import modules.modelSaver.MageFlowFineTuneModelSaver
+
+          assert ModelType.MAGE_FLOW.is_mage_flow()
+          assert ModelType.MAGE_FLOW.is_flow_matching()
+          assert ModelType.MAGE_FLOW.model_parts() == ('transformer','text_encoder','vae')
+          assert TrainingMethod.LORA in ModelType.MAGE_FLOW.supported_training_methods()
+          assert TrainingMethod.FINE_TUNE in ModelType.MAGE_FLOW.supported_training_methods()
+
+          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
+          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
+          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
+          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
+          assert factory.get(BaseDataLoader, ModelType.MAGE_FLOW) is not None
+          assert factory.get(BaseModelSampler, ModelType.MAGE_FLOW) is not None
+          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
+          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
+          print('OneTrainer Mage factory registrations: PASS')
+          PY
