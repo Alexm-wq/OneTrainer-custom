@@ -41,13 +41,16 @@ class BaseMageFlowSetup(
     }
 
     def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
-        # Mage ships its own activation checkpointing inside MageFlow.forward.
-        # Our tokenwise Self-Flow forward observes the same flag.
         model.transformer.checkpoint = bool(config.transformer.gradient_checkpointing)
         if model.text_encoder is not None and config.text_encoder.gradient_checkpointing:
             enable = getattr(model.text_encoder, "gradient_checkpointing_enable", None)
             if enable is not None:
                 enable()
+
+        scheduler_shift = float(getattr(model.noise_scheduler.config, "shift", 6.0))
+        if float(config.timestep_shift) == 1.0 and scheduler_shift != 1.0:
+            config.timestep_shift = scheduler_shift
+            print(f"[Mage-Flow] timestep_shift defaulted to checkpoint static shift {scheduler_shift:g}")
 
         model.autocast_context, model.train_dtype = create_autocast_context(
             self.train_device, config.train_dtype, config.enable_autocast_cache
@@ -67,12 +70,17 @@ class BaseMageFlowSetup(
     def _flat_sigma(sigma: Tensor, batch_size: int) -> Tensor:
         return sigma.reshape(batch_size, -1)[:, 0]
 
+    @staticmethod
+    def _image_shapes(batch_size: int, height: int, width: int):
+        return [[(1, int(height), int(width))] for _ in range(batch_size)]
+
     def _encode_conditioning(
             self,
             model: MageFlowModel,
             batch: dict,
             config: TrainConfig,
             rand: Random,
+            generator: torch.Generator,
             deterministic: bool,
     ) -> tuple[Tensor, Tensor]:
         cached = batch.get("text_encoder_hidden_state")
@@ -89,14 +97,13 @@ class BaseMageFlowSetup(
             ) if not deterministic else None,
         )
         if config.cep_gamma > 0 and not deterministic and not self._dpo_conditioning_locked():
-            output = self._apply_conditional_embedding_perturbation(output, config.cep_gamma, None)
+            output = self._apply_conditional_embedding_perturbation(output, config.cep_gamma, generator)
         return output, mask
 
     def _packed_inputs(self, model: MageFlowModel, latent_tokens: Tensor, text: Tensor, text_mask: Tensor):
         packed_img, img_cu = model.prepare_packed_images(latent_tokens)
         packed_txt, txt_cu = model.prepare_packed_text(text, text_mask)
-        batch_size, _, _ = latent_tokens.shape
-        return packed_img, packed_txt, img_cu, txt_cu, batch_size
+        return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0]
 
     def _predict_normal(
             self,
@@ -112,7 +119,7 @@ class BaseMageFlowSetup(
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
 
-            text, text_mask = self._encode_conditioning(model, batch, config, rand, deterministic)
+            text, text_mask = self._encode_conditioning(model, batch, config, rand, generator, deterministic)
             latent = batch['latent_image'].float()
             noise = self._create_noise(latent, config, generator)
             batch_size, _, height, width = latent.shape
@@ -124,30 +131,26 @@ class BaseMageFlowSetup(
                 config,
                 shift=config.timestep_shift,
             )
-            noisy, sigma = self._add_noise_discrete(
-                latent, noise, timestep, model.noise_scheduler.timesteps
-            )
+            noisy, sigma = self._add_noise_discrete(latent, noise, timestep, model.noise_scheduler.timesteps)
             sigma_flat = self._flat_sigma(sigma, batch_size)
 
             tokens = model.pack_latents(noisy)
             packed_img, packed_txt, img_cu, txt_cu, _ = self._packed_inputs(model, tokens, text, text_mask)
-            shapes = [[(1, height, width)] * batch_size]
             packed_pred = model.transformer(
                 img=packed_img.to(dtype=model.train_dtype.torch_dtype()),
                 txt=packed_txt.to(dtype=model.train_dtype.torch_dtype()),
                 timesteps=sigma_flat.to(dtype=model.train_dtype.torch_dtype()),
-                img_shapes=shapes,
+                img_shapes=self._image_shapes(batch_size, height, width),
                 img_cu_seqlens=img_cu,
                 txt_cu_seqlens=txt_cu,
             )
             pred_tokens = model.unprepare_packed_images(packed_pred, batch_size)
             predicted = model.unpack_latents(pred_tokens, height, width)
-            target = noise - latent
             data = {
                 'loss_type': 'target',
                 'timestep': timestep,
                 'predicted': predicted,
-                'target': target,
+                'target': noise - latent,
             }
             if config.loss_weight_fn == LossWeight.SIGMA:
                 data['element_loss_weight'] = sigma
@@ -175,7 +178,7 @@ class BaseMageFlowSetup(
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
-            text, text_mask = self._encode_conditioning(model, batch, config, rand, deterministic)
+            text, text_mask = self._encode_conditioning(model, batch, config, rand, generator, deterministic)
 
             clean = batch['latent_image'].float()
             noise = self._create_noise(clean, config, generator)
@@ -198,10 +201,9 @@ class BaseMageFlowSetup(
             sigma_t = self._flat_sigma(sigma_t, batch_size)
             sigma_s = self._flat_sigma(sigma_s, batch_size)
 
-            clean_tokens = model.pack_latents(clean)
             t_tokens = model.pack_latents(noisy_t)
             s_tokens = model.pack_latents(noisy_s)
-            image_tokens = clean_tokens.shape[1]
+            image_tokens = t_tokens.shape[1]
             token_mask = torch.rand(
                 (batch_size, image_tokens), generator=generator, device=clean.device
             ) < config.self_flow_mask_ratio
@@ -210,18 +212,13 @@ class BaseMageFlowSetup(
             token_sigma = torch.where(token_mask, sigma_s[:, None], sigma_t[:, None])
             student_tokens = torch.where(token_mask[..., None], s_tokens, t_tokens)
 
-            choose_t = (timestep <= second)
-            clean_timestep = torch.minimum(timestep, second)
+            choose_t = timestep <= second
             clean_sigma = torch.where(choose_t, sigma_t, sigma_s)
             teacher_tokens = torch.where(choose_t[:, None, None], t_tokens, s_tokens)
 
-            packed_student, packed_txt, img_cu, txt_cu, _ = self._packed_inputs(
-                model, student_tokens, text, text_mask
-            )
-            packed_teacher, _, _, _, _ = self._packed_inputs(
-                model, teacher_tokens, text, text_mask
-            )
-            shapes = [[(1, height, width)] * batch_size]
+            packed_student, packed_txt, img_cu, txt_cu, _ = self._packed_inputs(model, student_tokens, text, text_mask)
+            packed_teacher, _, _, _, _ = self._packed_inputs(model, teacher_tokens, text, text_mask)
+            shapes = self._image_shapes(batch_size, height, width)
 
             teacher_feature = None
             if not dpo_reference:
@@ -260,6 +257,8 @@ class BaseMageFlowSetup(
             cosine = None
             structural = None
             if not dpo_reference:
+                if student_out.feature is None:
+                    raise RuntimeError("Mage Self-Flow student feature is missing")
                 student_feature = model.unprepare_packed_images(student_out.feature, batch_size)
                 teacher_feature = model.unprepare_packed_images(
                     teacher_feature.to(student_feature.device, student_feature.dtype), batch_size
@@ -274,12 +273,11 @@ class BaseMageFlowSetup(
 
             pred_tokens = model.unprepare_packed_images(student_out.predicted, batch_size)
             predicted = model.unpack_latents(pred_tokens, height, width)
-            target = noise - clean
             data = {
                 'loss_type': 'target',
                 'timestep': token_timestep,
                 'predicted': predicted,
-                'target': target,
+                'target': noise - clean,
                 'self_flow_training_pass': training_pass,
                 'self_flow_dpo_policy': dpo_policy,
             }
