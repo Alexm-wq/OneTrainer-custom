@@ -92,6 +92,20 @@ cuda13 = [
   "bitsandbytes==0.49.2",
 ]
 
+# Mage-Flow uses its own CUDA 13 environment so the existing OneTrainer cuda13
+# environment remains reproducible on torch 2.12. Mage itself requires torch
+# >=2.13 and torchvision >=0.28. The source revision is pinned so a future
+# upstream API change cannot silently alter a working OneTrainer install.
+mage-cuda13 = [
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "onnxruntime-gpu==1.23.2",
+  "nvidia-nccl-cu13==2.29.7; sys_platform == 'linux'",
+  "triton-windows==3.7.0.post26; sys_platform == 'win32'",
+  "bitsandbytes==0.49.2",
+  "mage-flow @ git+https://github.com/microsoft/Mage.git@76bec2bb3818863f470de7e867c2dc7f1d0bfd83#subdirectory=mage_flow",
+]
+
 # CUDA 12 has the same dependencies as CUDA 13.
 # However, CUDA 12 requires a different version of torch.
 # This is managed via the `extra-index-urls` options below.
@@ -166,11 +180,18 @@ requires-pixi = ">=0.71.2"
 [tool.pixi.tasks]
 train = { cmd = "python scripts/train.py", cwd = "." }
 ui = { cmd = "python scripts/train_ui.py", cwd = "." }
+mage-setup = { cmd = "python -m pip install --no-deps --no-build-isolation --force-reinstall flash-attn==2.8.3 && python -c \"import torch, mage_flow, flash_attn; print('torch', torch.__version__); print('cuda', torch.version.cuda); print('mage_flow', mage_flow.__file__); print('flash_attn', flash_attn.__version__)\"", cwd = "." }
 
 [tool.pixi.feature.cuda13]
 platforms = ["linux-cuda13", "win-cuda13"]
 
 [tool.pixi.feature.cuda13.pypi-options]
+extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
+
+[tool.pixi.feature.mage-cuda13]
+platforms = ["linux-cuda13", "win-cuda13"]
+
+[tool.pixi.feature.mage-cuda13.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
 
 [tool.pixi.feature.cuda12]
@@ -193,6 +214,7 @@ extra-index-urls = ["https://download.pytorch.org/whl/cpu"]
 
 [tool.pixi.dependencies]
 python = "3.13.*"
+pip = "*"
 c-compiler = "*"
 cxx-compiler = "*"
 
@@ -208,5 +230,6 @@ index-strategy = "unsafe-best-match"
 [tool.pixi.environments]
 cpu = ["cpu"]
 cuda13 = ["cuda13"]
+mage-cuda13 = ["mage-cuda13"]
 cuda12 = ["cuda12"]
 rocm = ["rocm"]
