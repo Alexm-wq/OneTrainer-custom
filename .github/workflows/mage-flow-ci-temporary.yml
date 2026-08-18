@@ -109,6 +109,11 @@ jobs:
       - name: Checkout current Microsoft Mage without dependency mutation
         run: git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
 
+      - name: Install only missing lightweight Mage runtime dependencies
+        run: |
+          pixi run -e cpu python -m ensurepip --upgrade
+          pixi run -e cpu python -m pip install --no-deps 'einops>=0.8.0' 'loguru>=0.7.0'
+
       - name: Import Mage runtime on OneTrainer torch 2.12
         env:
           PYTHONPATH: /tmp/Mage-runtime
