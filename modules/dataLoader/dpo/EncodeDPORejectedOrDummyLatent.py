@@ -100,12 +100,15 @@ class EncodeDPORejectedOrDummyLatent(
             with self._all_contexts():
                 vae_output = self.vae.encode(image.unsqueeze(0))
 
-                if hasattr(vae_output, "latent_dist"):
+                if isinstance(vae_output, torch.Tensor):
+                    # MageVAE returns its encoded latent tensor directly.
+                    latent = vae_output
+                elif hasattr(vae_output, "latent_dist"):
                     latent = vae_output.latent_dist.mode()
                 elif hasattr(vae_output, "latent"):
                     latent = vae_output.latent
                 else:
-                    raise RuntimeError("VAE output has neither latent_dist nor latent")
+                    raise RuntimeError("VAE output is neither a tensor nor an object with latent_dist/latent")
 
         return latent.squeeze(dim=0).detach()
 
@@ -113,9 +116,6 @@ class EncodeDPORejectedOrDummyLatent(
         is_paired = self._as_bool(self._get_previous_item(variation, self.is_paired_in_name, index))
 
         if is_paired:
-            # Do not request latent_image here. During an in-place cache
-            # upgrade that would unnecessarily VAE-encode the already cached
-            # chosen image before encoding the rejected image.
             image_rejected = self._get_previous_item(variation, self.image_in_name, index)
             if image_rejected is None:
                 raise RuntimeError("DPO row has no image_rejected tensor")
