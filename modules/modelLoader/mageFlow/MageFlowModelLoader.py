@@ -8,17 +8,9 @@ from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 
-import torch
-
 
 class MageFlowModelLoader:
-    """Load Microsoft's official diffusers-style Mage repository.
-
-    ``mage_flow`` is deliberately imported lazily. OneTrainer can therefore be
-    used for every existing model without installing Mage's optional package.
-    Install Mage with ``--no-deps`` in the existing pixi environment so its
-    metadata cannot silently replace OneTrainer's CUDA/PyTorch stack.
-    """
+    """Load Microsoft's official diffusers-style Mage repository lazily."""
 
     @staticmethod
     def _require_mage():
@@ -48,8 +40,6 @@ class MageFlowModelLoader:
         load_from_repo = self._require_mage()
         official = load_from_repo(model_names.base_model, device="cpu")
 
-        # Optional denoiser override follows OneTrainer's normal transformer_model
-        # convention. This is useful for a raw fine-tuned transformer safetensor.
         if model_names.transformer_model:
             from safetensors.torch import load_file
             override = model_names.transformer_model
@@ -68,6 +58,7 @@ class MageFlowModelLoader:
 
         model.model_type = model_type
         model.base_model_name = model_names.base_model
+        model.official_model = official
         model.tokenizer = official.txt_enc.tokenizer
         model.noise_scheduler = official.scheduler
         model.text_encoder_wrapper = official.txt_enc
@@ -75,9 +66,6 @@ class MageFlowModelLoader:
         model.vae = official.vae
         model.transformer = official.transformer
 
-        # The official loader constructs BF16 modules. Respect an explicit
-        # OneTrainer component dtype when it is an ordinary torch dtype; later
-        # setup/quantization remains handled by OneTrainer.
         transformer_dtype = weight_dtypes.transformer.torch_dtype()
         vae_dtype = weight_dtypes.vae.torch_dtype()
         text_dtype = weight_dtypes.text_encoder.torch_dtype()
