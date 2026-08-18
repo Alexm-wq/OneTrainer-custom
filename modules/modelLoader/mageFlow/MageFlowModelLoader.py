@@ -85,17 +85,28 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
     @staticmethod
     def _quantization_summary(module: nn.Module, requested_dtype) -> tuple[int, int]:
-        """Return total Linear count and count with an OT quantized weight."""
+        """Return eligible Linear count and count backed by OT quantization."""
         total = 0
         quantized = 0
+        extra_quantized_types = {
+            "LinearA8",
+            "LinearGGUFA8",
+            "GGUFLinear",
+        }
         for child in module.modules():
-            if isinstance(child, nn.Linear):
-                total += 1
-                try:
-                    if is_quantized_parameter(child, "weight"):
-                        quantized += 1
-                except (AttributeError, TypeError):
-                    pass
+            is_linear = isinstance(child, nn.Linear) or child.__class__.__name__ in extra_quantized_types
+            if not is_linear:
+                continue
+            total += 1
+            try:
+                is_quantized = any(
+                    is_quantized_parameter(child, parameter_name)
+                    for parameter_name in child._parameters
+                )
+            except (AttributeError, TypeError):
+                is_quantized = False
+            if is_quantized or child.__class__.__name__ in extra_quantized_types:
+                quantized += 1
         print(
             f"[Mage-Flow] {module.__class__.__name__} "
             f"weight_dtype={requested_dtype} linear_layers={total} "
@@ -191,7 +202,17 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         )
 
         self._quantization_summary(official.transformer, weight_dtypes.transformer)
-        self._quantization_summary(official.txt_enc.hf_module, weight_dtypes.text_encoder)
+        _, te_quantized = self._quantization_summary(
+            official.txt_enc.hf_module,
+            weight_dtypes.text_encoder,
+        )
+        if weight_dtypes.text_encoder.is_quantized() and te_quantized == 0:
+            raise RuntimeError(
+                "Mage text encoder is configured with quantized weight dtype "
+                f"{weight_dtypes.text_encoder}, but zero Qwen Linear layers were "
+                "replaced. Check the Quantization layer filter; it may exclude "
+                "all text-encoder layer names."
+            )
 
         model.model_type = model_type
         model.base_model_name = model_names.base_model
