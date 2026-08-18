@@ -36,7 +36,8 @@ jobs:
             modules/modelSaver/MageFlowLoRAModelSaver.py \
             modules/modelSaver/MageFlowFineTuneModelSaver.py \
             modules/util/enum/ModelType.py \
-            tests/test_mage_flow_self_flow.py
+            tests/test_mage_flow_self_flow.py \
+            tests/test_mage_flow_model_helpers.py
 
       - name: Install CPU torch for isolated Self-Flow tests
         run: python -m pip install --quiet torch
@@ -166,3 +167,8 @@ jobs:
           assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
           print('OneTrainer Mage factory registrations: PASS')
           PY
+
+      - name: Run Mage model helper tests in full OneTrainer environment
+        env:
+          PYTHONPATH: /tmp/Mage-runtime
+        run: pixi run -e cpu python -m unittest -v tests.test_mage_flow_model_helpers
