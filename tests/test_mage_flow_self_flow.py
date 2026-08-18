@@ -135,6 +135,32 @@ class MageSelfFlowSmokeTests(unittest.TestCase):
         grads = [p.grad for p in self.model.parameters() if p.requires_grad]
         self.assertTrue(any(g is not None and torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads))
 
+    def test_checkpointed_forward_matches_noncheckpointed_forward(self):
+        image_t = torch.tensor([[0.2, 0.8, 0.2, 0.8, 0.7, 0.1, 0.7, 0.1]])
+        text_t = torch.tensor([0.2, 0.7])
+        direct = self._forward(image_t, text_t, checkpoint=False)
+        checkpointed = self._forward(image_t, text_t, checkpoint=True)
+        torch.testing.assert_close(direct.predicted, checkpointed.predicted, rtol=1e-6, atol=1e-7)
+        torch.testing.assert_close(direct.feature, checkpointed.feature, rtol=1e-6, atol=1e-7)
+
+    def test_teacher_early_exit_returns_selected_hidden_feature(self):
+        per_sample = torch.tensor([0.2, 0.7])
+        self.model.eval()
+        result = mage_flow_forward(
+            transformer=self.model,
+            img=self.img,
+            txt=self.txt,
+            image_timesteps=per_sample,
+            text_timesteps=per_sample,
+            img_shapes=self.shapes,
+            img_cu_seqlens=self.img_cu,
+            txt_cu_seqlens=self.txt_cu,
+            stop_layer=1,
+        )
+        self.assertEqual(result.predicted.shape, self.img.shape)
+        self.assertIsNotNone(result.feature)
+        torch.testing.assert_close(result.predicted, result.feature)
+
     def test_cpu_ema_teacher_swap_restores_student_and_updates(self):
         module = nn.Linear(4, 4, bias=False)
         ema = MageFlowSelfFlowEMA([module], decay=0.5)
@@ -150,6 +176,20 @@ class MageSelfFlowSmokeTests(unittest.TestCase):
         expected = original.float().cpu().mul(0.5).add(student.float().cpu(), alpha=0.5)
         torch.testing.assert_close(ema.ema_parameters[0], expected)
         self.assertEqual(ema.optimization_steps, 1)
+
+    def test_cpu_ema_state_dict_round_trip(self):
+        module = nn.Linear(4, 4, bias=False)
+        ema = MageFlowSelfFlowEMA([module], decay=0.75)
+        with torch.no_grad():
+            module.weight.add_(1.25)
+        ema.update_after_optimizer_step()
+        state = ema.state_dict()
+
+        restored = MageFlowSelfFlowEMA([module], decay=0.1, state_dict=state)
+        self.assertEqual(restored.decay, ema.decay)
+        self.assertEqual(restored.optimization_steps, ema.optimization_steps)
+        for left, right in zip(restored.ema_parameters, ema.ema_parameters, strict=True):
+            torch.testing.assert_close(left, right)
 
     def test_structural_loss_zero_for_identical_features(self):
         x = torch.randn(2, 16, 8)
