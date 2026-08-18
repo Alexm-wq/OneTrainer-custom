@@ -27,11 +27,7 @@ class MageFlowSelfFlowProjector(nn.Module):
 
 
 class MageFlowSelfFlowEMA:
-    """VRAM-safe CPU float32 EMA for the active Mage policy parameters.
-
-    Student snapshots live on CPU as well. Teacher swaps therefore never make a
-    second GPU copy of the active LoRA/full-finetune parameters.
-    """
+    """VRAM-safe CPU float32 EMA for the active Mage policy parameters."""
 
     def __init__(self, modules: Iterable[nn.Module], decay: float = 0.9999, state_dict: dict | None = None):
         self.modules = [module for module in modules if module is not None]
@@ -106,9 +102,6 @@ class MageFlowSelfFlowEMA:
         self.student_parameters = new_students
         self.optimization_steps += 1
 
-    # Backwards-compatible short name used by the initial Mage adapter.
-    update = lambda self, _modules=None: self.update_after_optimizer_step()
-
     def state_dict(self) -> dict:
         return {
             "decay": self.decay,
@@ -138,12 +131,12 @@ class MageFlowForwardResult:
 
 
 def _apply_modulation(block: nn.Module, x: Tensor, params: Tensor, cu_lens: Tensor | None):
-    """Use native per-sample modulation or direct already-tokenwise modulation."""
-    # Tokenwise image conditioning: [1,total_tokens,3D] exactly matches x.
+    # A tokenwise Self-Flow modulation already has one shift/scale/gate vector
+    # per packed image token and must not be repeat_interleaved again.
     if params.ndim == 3 and params.shape[:2] == x.shape[:2]:
         shift, scale, gate = params.chunk(3, dim=-1)
         return x * (1.0 + scale) + shift, gate
-    return block._modulate(x, params, cu_lens=cu_lens)
+    return block._modulate(x, params, cu_lens)
 
 
 def _split_block_forward(
@@ -153,11 +146,10 @@ def _split_block_forward(
         temb_img: Tensor,
         temb_txt: Tensor,
         image_rotary_emb: Tensor,
-        txt_cu_lens: Tensor | None = None,
-        img_cu_lens: Tensor | None = None,
+        txt_cu_lens: Tensor | None,
+        img_cu_lens: Tensor | None,
         joint_attention_kwargs: dict | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Official Mage block semantics with independent image/text time embeddings."""
     img_mod1, img_mod2 = block.img_mod(temb_img).chunk(2, dim=-1)
     txt_mod1, txt_mod2 = block.txt_mod(temb_txt).chunk(2, dim=-1)
 
@@ -166,14 +158,13 @@ def _split_block_forward(
     txt_normed = block.txt_norm1(encoder_hidden_states)
     txt_modulated, txt_gate1 = _apply_modulation(block, txt_normed, txt_mod1, txt_cu_lens)
 
-    kwargs = joint_attention_kwargs or {}
     img_attn_output, txt_attn_output = block.attn(
         hidden_states=img_modulated,
         encoder_hidden_states=txt_modulated,
         image_rotary_emb=image_rotary_emb,
         txt_cu_lens=txt_cu_lens,
         img_cu_lens=img_cu_lens,
-        **kwargs,
+        **(joint_attention_kwargs or {}),
     )
     hidden_states = hidden_states + img_gate1 * img_attn_output
     encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
@@ -194,8 +185,6 @@ def _split_block_forward(
 
 
 def _final_norm(transformer: nn.Module, hidden: Tensor, temb_img: Tensor, img_cu_lens: Tensor | None) -> Tensor:
-    # Native final norm repeats one conditioning vector per packed sample. With
-    # Self-Flow we already have one vector per token, so apply it directly.
     if temb_img.ndim == 3 and temb_img.shape[:2] == hidden.shape[:2]:
         norm = transformer.norm_out
         emb = norm.linear(norm.silu(temb_img).to(hidden.dtype))
@@ -217,12 +206,7 @@ def mage_flow_forward(
         stop_layer: int | None = None,
         attention_kwargs: dict | None = None,
 ) -> MageFlowForwardResult:
-    """Mage training forward supporting scalar or per-image-token timesteps.
-
-    For packed input ``img`` is [1,sum(N_i),C]. ``image_timesteps`` may either
-    be [B] (native Mage semantics) or [1,sum(N_i)] (Self-Flow tokenwise
-    conditioning). Text keeps [B] homogeneous timesteps.
-    """
+    """Official Mage dense/packed semantics plus per-image-token time conditioning."""
     if img.ndim != 3 or txt.ndim != 3:
         raise ValueError("Mage training expects rank-3 image and text token tensors")
 
@@ -247,17 +231,39 @@ def mage_flow_forward(
     feature = None
     kwargs = attention_kwargs or {}
     for index, block in enumerate(transformer.transformer_blocks):
-        text, hidden = _split_block_forward(
-            block,
-            hidden,
-            text,
-            temb_img,
-            temb_txt,
-            ms_pe,
-            txt_cu_lens=txt_cu_seqlens,
-            img_cu_lens=img_cu_seqlens,
-            joint_attention_kwargs=kwargs,
-        )
+        if transformer.training and getattr(transformer, "checkpoint", False):
+            def block_forward(img_state: Tensor, txt_state: Tensor):
+                return _split_block_forward(
+                    block,
+                    img_state,
+                    txt_state,
+                    temb_img,
+                    temb_txt,
+                    ms_pe,
+                    txt_cu_seqlens,
+                    img_cu_seqlens,
+                    kwargs,
+                )
+
+            text, hidden = torch.utils.checkpoint.checkpoint(
+                block_forward,
+                hidden,
+                text,
+                use_reentrant=False,
+            )
+        else:
+            text, hidden = _split_block_forward(
+                block,
+                hidden,
+                text,
+                temb_img,
+                temb_txt,
+                ms_pe,
+                txt_cu_seqlens,
+                img_cu_seqlens,
+                kwargs,
+            )
+
         if capture_layer is not None and index == capture_layer:
             feature = hidden
         if stop_layer is not None and index >= stop_layer:
@@ -276,11 +282,9 @@ def dual_timestep_view(clean: Tensor, noise: Tensor, sigma: Tensor) -> Tensor:
 
 
 def structural_alignment_loss(student: Tensor, teacher: Tensor, sample_count: int | None = None) -> Tensor:
-    """Per-sample off-diagonal relational loss on optionally sampled tokens."""
     if student.ndim != 3 or teacher.ndim != 3 or student.shape != teacher.shape:
         raise ValueError("Mage structural Self-Flow expects matching [B,N,D] features")
     if sample_count is not None and student.shape[1] > sample_count:
-        # Deterministic evenly-spaced samples avoid an O(N^2) full Gram matrix.
         idx = torch.linspace(0, student.shape[1] - 1, sample_count, device=student.device).round().long()
         student = student.index_select(1, idx)
         teacher = teacher.index_select(1, idx)
