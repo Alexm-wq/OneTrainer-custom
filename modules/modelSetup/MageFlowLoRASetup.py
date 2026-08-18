@@ -86,8 +86,6 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
             "transformer",
             config,
             config.layer_filter.split(","),
-            fusion_spec=None,
-            fuse=False,
         )
         if model.lora_state_dict:
             model.transformer_lora.load_state_dict(model.lora_state_dict)
@@ -97,11 +95,12 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
         model.transformer_lora.hook_to_module()
 
         if config.self_flow_enabled:
-            params = model.transformer_lora.parameters()
-            if not params:
+            self._setup_requires_grad(model, config)
+            first = next((p for p in model.transformer_lora.parameters() if p.requires_grad), None)
+            if first is None:
                 raise RuntimeError("Mage LoRA has no trainable parameters for Self-Flow")
             model.self_flow_projector = MageFlowSelfFlowProjector(model.transformer.inner_dim).to(
-                device=params[0].device, dtype=params[0].dtype
+                device=first.device, dtype=first.dtype
             )
             saved = model.self_flow_state_dict
             if saved is not None and saved.get("projector") is not None:
