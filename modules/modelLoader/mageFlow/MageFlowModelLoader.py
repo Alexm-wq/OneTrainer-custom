@@ -19,9 +19,9 @@ class MageFlowModelLoader:
             return load_from_repo
         except ImportError as exc:
             raise RuntimeError(
-                "Mage-Flow support is installed by OneTrainer's dedicated mage-cuda13 Pixi environment. "
-                "From the OneTrainer repository run: pixi run -e mage-cuda13 mage-setup. "
-                "Then launch OneTrainer with: pixi run -e mage-cuda13 ui."
+                "Mage-Flow is part of OneTrainer's cuda13 Pixi environment. "
+                "From the OneTrainer repository run: pixi install -e cuda13. "
+                "Then launch OneTrainer with: pixi run -e cuda13 ui."
             ) from exc
 
     def load(
