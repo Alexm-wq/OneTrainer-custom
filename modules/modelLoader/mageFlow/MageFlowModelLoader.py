@@ -3,14 +3,18 @@ from __future__ import annotations
 import os
 
 from modules.model.MageFlowModel import MageFlowModel
+from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 
 
-class MageFlowModelLoader:
+class MageFlowModelLoader(HFModelLoaderMixin):
     """Load Microsoft's official diffusers-style Mage repository lazily."""
+
+    def __init__(self):
+        super().__init__()
 
     @staticmethod
     def _require_mage():
@@ -103,6 +107,28 @@ class MageFlowModelLoader:
             if missing:
                 print(f"WARNING: Mage transformer override has {len(missing)} missing keys")
 
+        # Mage's official loader returns fully materialized torch modules. Run
+        # those modules through OneTrainer's normal conversion pass so configured
+        # weight dtypes and quantized Linear replacements are applied before the
+        # setup phase calls quantize_layers(). The transformer receives the full
+        # user QuantizationConfig (layer filter/SVD/etc.), matching Flux2.
+        official.transformer = self._convert_diffusers_sub_module_to_dtype(
+            official.transformer,
+            weight_dtypes.transformer,
+            weight_dtypes.train_dtype,
+            quantization,
+        )
+        official.txt_enc.hf_module = self._convert_transformers_sub_module_to_dtype(
+            official.txt_enc.hf_module,
+            weight_dtypes.text_encoder,
+            weight_dtypes.fallback_train_dtype,
+        )
+        official.vae = self._convert_diffusers_sub_module_to_dtype(
+            official.vae,
+            weight_dtypes.vae,
+            weight_dtypes.train_dtype,
+        )
+
         model.model_type = model_type
         model.base_model_name = model_names.base_model
         model.tokenizer = official.txt_enc.tokenizer
@@ -112,13 +138,3 @@ class MageFlowModelLoader:
         model.vae = official.vae
         model.transformer = official.transformer
         model.official_model = official
-
-        transformer_dtype = weight_dtypes.transformer.torch_dtype()
-        vae_dtype = weight_dtypes.vae.torch_dtype()
-        text_dtype = weight_dtypes.text_encoder.torch_dtype()
-        if transformer_dtype is not None:
-            model.transformer.to(dtype=transformer_dtype)
-        if vae_dtype is not None:
-            model.vae.to(dtype=vae_dtype)
-        if text_dtype is not None:
-            model.text_encoder_wrapper.to(dtype=text_dtype)
