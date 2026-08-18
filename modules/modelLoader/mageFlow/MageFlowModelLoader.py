@@ -8,6 +8,10 @@ from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
+from modules.util.quantization_util import is_quantized_parameter
+
+import torch
+from torch import nn
 
 
 class MageFlowModelLoader(HFModelLoaderMixin):
@@ -30,19 +34,74 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
     @staticmethod
     def _resolve_attention_backend() -> tuple[str, str]:
-        """Select Mage's native FA4 backend when available, otherwise SDPA.
+        """Select a safe Mage packed-attention backend.
 
-        Mage upstream defaults to FlashAttention2. On CUDA 13/Blackwell our
-        environment installs the CuTeDSL FlashAttention4 package instead. The
-        first value controls Mage's shared packed-varlen attention shim; the
-        second is the Hugging Face Qwen3-VL attention implementation used while
-        constructing the frozen text encoder.
+        ``OT_MAGE_ATTN_BACKEND`` can explicitly select ``sdpa`` or ``flash4``.
+        Without an override, consumer Blackwell (SM120/SM121) uses SDPA. FA4's
+        CuTeDSL varlen path has had native-process crashes and kernel failures on
+        these architectures, and Mage uses varlen attention for both the Qwen
+        conditioning encoder and the image transformer. A Python ImportError
+        probe therefore is not a sufficient runtime-safety test on RTX 50-series.
+
+        Datacenter Hopper/Blackwell keeps the previous FA4-if-importable policy.
+        The second return value is the Hugging Face Qwen attention implementation
+        used for non-packed Qwen forwards; packed conditioning still goes through
+        Mage's shared backend shim.
         """
+        override = os.environ.get("OT_MAGE_ATTN_BACKEND", "").strip().lower()
+        if override:
+            if override in {"sdpa", "sdp", "torch_sdpa"}:
+                print("[Mage-Flow] OT_MAGE_ATTN_BACKEND=sdpa")
+                return "sdpa", "sdpa"
+            if override in {"flash4", "fa4", "flash_attention_4"}:
+                try:
+                    from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "OT_MAGE_ATTN_BACKEND=flash4 was requested, but "
+                        "flash_attn.cute is not importable."
+                    ) from exc
+                print("[Mage-Flow] OT_MAGE_ATTN_BACKEND=flash4")
+                return "flash4", "flash_attention_4"
+            raise ValueError(
+                "OT_MAGE_ATTN_BACKEND must be one of: sdpa, flash4"
+            )
+
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            if major == 12:
+                print(
+                    f"[Mage-Flow] CUDA capability sm_{major}{minor}: using SDPA "
+                    "for packed attention by default. Set "
+                    "OT_MAGE_ATTN_BACKEND=flash4 to explicitly test FA4."
+                )
+                return "sdpa", "sdpa"
+
         try:
             from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
             return "flash4", "flash_attention_4"
         except ImportError:
             return "sdpa", "sdpa"
+
+    @staticmethod
+    def _quantization_summary(module: nn.Module, requested_dtype) -> tuple[int, int]:
+        """Return total Linear count and count with an OT quantized weight."""
+        total = 0
+        quantized = 0
+        for child in module.modules():
+            if isinstance(child, nn.Linear):
+                total += 1
+                try:
+                    if is_quantized_parameter(child, "weight"):
+                        quantized += 1
+                except (AttributeError, TypeError):
+                    pass
+        print(
+            f"[Mage-Flow] {module.__class__.__name__} "
+            f"weight_dtype={requested_dtype} linear_layers={total} "
+            f"quantized_weight_layers={quantized}"
+        )
+        return total, quantized
 
     def load(
             self,
@@ -64,8 +123,8 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         # which otherwise selects its default "flash2" before the text encoder
         # is created. Force the backend at the actual ModelConfig construction
         # point so BOTH Mage's packed-varlen attention and Qwen3-VL are created
-        # with FA4. Keep the HF env override as a belt-and-suspenders override
-        # for the Qwen constructor, then restore all upstream globals afterward.
+        # consistently. Keep the HF env override as a belt-and-suspenders
+        # override for the Qwen constructor, then restore all upstream globals.
         original_model_config = mage_pipeline.ModelConfig
         previous_hf_attn_impl = os.environ.get("VF_HF_ATTN_IMPL")
 
@@ -110,8 +169,9 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         # Mage's official loader returns fully materialized torch modules. Run
         # those modules through OneTrainer's normal conversion pass so configured
         # weight dtypes and quantized Linear replacements are applied before the
-        # setup phase calls quantize_layers(). The transformer receives the full
-        # user QuantizationConfig (layer filter/SVD/etc.), matching Flux2.
+        # setup phase calls quantize_layers(). Pass the user's QuantizationConfig
+        # to BOTH transformer and text encoder so layer filtering/SVD settings are
+        # not silently dropped for Qwen.
         official.transformer = self._convert_diffusers_sub_module_to_dtype(
             official.transformer,
             weight_dtypes.transformer,
@@ -122,12 +182,16 @@ class MageFlowModelLoader(HFModelLoaderMixin):
             official.txt_enc.hf_module,
             weight_dtypes.text_encoder,
             weight_dtypes.fallback_train_dtype,
+            quantization,
         )
         official.vae = self._convert_diffusers_sub_module_to_dtype(
             official.vae,
             weight_dtypes.vae,
             weight_dtypes.train_dtype,
         )
+
+        self._quantization_summary(official.transformer, weight_dtypes.transformer)
+        self._quantization_summary(official.txt_enc.hf_module, weight_dtypes.text_encoder)
 
         model.model_type = model_type
         model.base_model_name = model_names.base_model
