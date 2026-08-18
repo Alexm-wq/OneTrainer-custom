@@ -146,7 +146,8 @@ class MageFlowModel(BaseModel):
     @staticmethod
     def _cu_seqlens(lengths: list[int], device: torch.device) -> Tensor:
         lens = torch.tensor(lengths, dtype=torch.int32, device=device)
-        return torch.cat([torch.zeros(1, dtype=torch.int32, device=device), lens.cumsum(0)])
+        offsets = torch.cumsum(lens, dim=0, dtype=torch.int32)
+        return torch.cat([torch.zeros(1, dtype=torch.int32, device=device), offsets])
 
     def encode_text(
             self,
