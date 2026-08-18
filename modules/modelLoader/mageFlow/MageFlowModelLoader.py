@@ -195,6 +195,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
         model.model_type = model_type
         model.base_model_name = model_names.base_model
+        model.mage_attention_backend = mage_attn_backend
         model.tokenizer = official.txt_enc.tokenizer
         model.noise_scheduler = official.scheduler
         model.text_encoder_wrapper = official.txt_enc
