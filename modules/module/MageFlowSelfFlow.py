@@ -131,8 +131,6 @@ class MageFlowForwardResult:
 
 
 def _apply_modulation(block: nn.Module, x: Tensor, params: Tensor, cu_lens: Tensor | None):
-    # A tokenwise Self-Flow modulation already has one shift/scale/gate vector
-    # per packed image token and must not be repeat_interleaved again.
     if params.ndim == 3 and params.shape[:2] == x.shape[:2]:
         shift, scale, gate = params.chunk(3, dim=-1)
         return x * (1.0 + scale) + shift, gate
@@ -231,10 +229,10 @@ def mage_flow_forward(
     feature = None
     kwargs = attention_kwargs or {}
     for index, block in enumerate(transformer.transformer_blocks):
-        if transformer.training and getattr(transformer, "checkpoint", False):
-            def block_forward(img_state: Tensor, txt_state: Tensor):
+        if torch.is_grad_enabled() and transformer.training and getattr(transformer, "checkpoint", False):
+            def block_forward(img_state: Tensor, txt_state: Tensor, _block=block):
                 return _split_block_forward(
-                    block,
+                    _block,
                     img_state,
                     txt_state,
                     temb_img,
