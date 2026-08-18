@@ -1,10 +1,21 @@
 from contextlib import ExitStack, nullcontext
+import threading
 
 import torch
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 from modules.model.MageFlowModel import MAGE_PROMPT_CROP_START
+
+
+# MGDS may request cache entries from multiple worker threads. Mage's packed
+# attention backend is a process-global setting, so switching it per item must
+# be serialized or another worker can observe the transient backend. More
+# importantly, the CUDA-13 FA4 varlen kernel has proven unstable in the Qwen
+# text-cache path (native segfault, no Python exception). Text encoding is a
+# one-time cache operation, so use the slower but robust Mage SDPA varlen shim
+# here while leaving the transformer on its selected backend for training.
+_MAGE_TEXT_ATTENTION_LOCK = threading.Lock()
 
 
 class EncodeMageText(PipelineModule, RandomAccessPipelineModule):
@@ -20,6 +31,7 @@ class EncodeMageText(PipelineModule, RandomAccessPipelineModule):
             autocast_contexts=None,
             dtype: torch.dtype | None = None,
             max_output_length: int = 2048,
+            restore_attention_backend: str = "sdpa",
     ):
         super().__init__()
         self.tokens_name = tokens_name
@@ -30,6 +42,7 @@ class EncodeMageText(PipelineModule, RandomAccessPipelineModule):
         self.autocast_contexts = autocast_contexts or [nullcontext()]
         self.dtype = dtype
         self.max_output_length = int(max_output_length)
+        self.restore_attention_backend = str(restore_attention_backend)
 
     def length(self):
         return self._get_previous_length(self.tokens_name)
@@ -48,10 +61,25 @@ class EncodeMageText(PipelineModule, RandomAccessPipelineModule):
         valid = valid.to(device=device, non_blocking=True)
         cu = torch.tensor([0, valid.numel()], device=device, dtype=torch.int32)
 
-        with torch.inference_mode(), ExitStack() as stack:
-            for context in self.autocast_contexts:
-                stack.enter_context(context if context is not None else nullcontext())
-            result = self.text_encoder_wrapper(valid, cu, drop_idx_override=MAGE_PROMPT_CROP_START)
+        # The packed Mage TextEncoder always routes through
+        # mage_flow.models.modules._attn_backend when cu_seqlens are supplied.
+        # Force only this cache forward to the SDPA shim. The lock both avoids
+        # concurrent forwards through one large Qwen module and makes the
+        # process-global backend swap race-free.
+        from mage_flow.models.modules._attn_backend import set_attn_backend
+        with _MAGE_TEXT_ATTENTION_LOCK:
+            set_attn_backend("sdpa")
+            try:
+                with torch.inference_mode(), ExitStack() as stack:
+                    for context in self.autocast_contexts:
+                        stack.enter_context(context if context is not None else nullcontext())
+                    result = self.text_encoder_wrapper(
+                        valid,
+                        cu,
+                        drop_idx_override=MAGE_PROMPT_CROP_START,
+                    )
+            finally:
+                set_attn_backend(self.restore_attention_backend)
 
         hidden = result["txt"]
         valid_length = min(int(hidden.shape[0]), self.max_output_length)
