@@ -64,6 +64,11 @@ class MageFlowBaseDataLoader(BaseDataLoader, DataLoaderText2ImageMixin):
                 autocast_contexts=[model.text_encoder_autocast_context],
                 dtype=model.text_encoder_train_dtype.torch_dtype(),
                 max_output_length=prompt_length,
+                restore_attention_backend=getattr(
+                    model,
+                    "mage_attention_backend",
+                    "sdpa",
+                ),
             ))
         return modules
 
