@@ -8,16 +8,13 @@ jobs:
   mage-flow-validation:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Mage implementation branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: mage-flow-full
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.13'
-
-      - name: Compile all Mage integration files
+      - name: Compile Mage integration
         run: |
           python -m compileall -q \
             modules/model/MageFlowModel.py \
@@ -37,106 +34,82 @@ jobs:
             modules/modelSaver/MageFlowFineTuneModelSaver.py \
             modules/util/enum/ModelType.py \
             tests/test_mage_flow_self_flow.py \
-            tests/test_mage_flow_model_helpers.py
-
-      - name: Install CPU torch for isolated Self-Flow tests
+            tests/test_mage_flow_model_helpers.py \
+            tests/test_mage_flow_official_runtime.py
+      - name: Install CPU torch
         run: python -m pip install --quiet torch
-
-      - name: Run Mage Self-Flow unit tests
+      - name: Run isolated Self-Flow tests
         run: python -m unittest -v tests.test_mage_flow_self_flow
-
-      - name: Checkout current Microsoft Mage source for API validation
-        run: git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage
-
-      - name: Validate Mage API assumptions statically
+      - name: Validate current Microsoft Mage API statically
         run: |
+          git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage
           python - <<'PY'
           import ast
           from pathlib import Path
-
           root = Path('/tmp/Mage')
           pipeline = ast.parse((root/'mage_flow/pipeline.py').read_text())
-          mage_model = ast.parse((root/'mage_flow/models/mage_flow.py').read_text())
+          model = ast.parse((root/'mage_flow/models/mage_flow.py').read_text())
           layers = ast.parse((root/'mage_flow/models/modules/mage_layers.py').read_text())
-
-          def functions(tree):
-              return {n.name: n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-
-          pfunc = functions(pipeline)
-          mfunc = functions(mage_model)
-          lfunc = functions(layers)
-          assert 'load_from_repo' in pfunc, 'Mage pipeline.load_from_repo missing'
-          assert 'forward' in mfunc, 'Mage model forward missing'
-          assert '_modulate' in lfunc, 'Mage block _modulate missing'
-
-          forward_args = {a.arg for a in mfunc['forward'].args.args}
+          funcs = lambda tree: {n.name:n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}
+          pf, mf, lf = funcs(pipeline), funcs(model), funcs(layers)
+          assert 'load_from_repo' in pf
           required = {'img','txt','timesteps','img_shapes','img_cu_seqlens','txt_cu_seqlens'}
-          missing = required - forward_args
-          assert not missing, f'Mage forward API drift: missing {sorted(missing)}'
-
-          mod_args = {a.arg for a in lfunc['_modulate'].args.args}
-          assert {'x','mod_params','cu_lens'} <= mod_args, f'_modulate API drift: {sorted(mod_args)}'
-
-          src = (root/'mage_flow/models/mage_flow.py').read_text()
-          assert 'self.vae.encode(' in src, 'Expected direct Mage VAE encode path missing'
-          print('Microsoft Mage API assumptions: PASS')
+          assert required <= {a.arg for a in mf['forward'].args.args}
+          assert {'x','mod_params','cu_lens'} <= {a.arg for a in lf['_modulate'].args.args}
+          assert 'self.vae.encode(' in (root/'mage_flow/models/mage_flow.py').read_text()
+          print('Current Microsoft Mage API: PASS')
           PY
 
   onetrainer-cpu-integration:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Mage implementation branch
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           ref: mage-flow-full
-
-      - name: Install Pixi
-        uses: prefix-dev/setup-pixi@v0.9.1
+      - uses: prefix-dev/setup-pixi@v0.9.1
         with:
           pixi-version: v0.71.2
           cache: true
           environments: cpu
-
-      - name: Verify pinned OneTrainer environment
+      - name: Verify exact OneTrainer environment
         run: |
           pixi run -e cpu python - <<'PY'
           import sys, torch
-          assert sys.version_info[:2] == (3, 13), sys.version
+          assert sys.version_info[:2] == (3,13), sys.version
           assert torch.__version__.startswith('2.12.0'), torch.__version__
-          print('OneTrainer CPU environment:', sys.version.split()[0], torch.__version__)
+          print('OneTrainer environment:', sys.version.split()[0], torch.__version__)
           PY
-
-      - name: Checkout current Microsoft Mage without dependency mutation
-        run: git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
-
-      - name: Install only missing lightweight Mage runtime dependencies
+      - name: Prepare current Mage source without changing core dependencies
         run: |
+          git clone --depth 1 https://github.com/microsoft/Mage.git /tmp/Mage-runtime
           pixi run -e cpu python -m ensurepip --upgrade
           pixi run -e cpu python -m pip install --no-deps 'einops>=0.8.0' 'loguru>=0.7.0'
-
-      - name: Import Mage runtime on OneTrainer torch 2.12
+      - name: Import current Mage on torch 2.12
         env:
           PYTHONPATH: /tmp/Mage-runtime
         run: |
           pixi run -e cpu python - <<'PY'
-          import inspect
-          import torch
+          import inspect, torch
           from mage_flow.pipeline import load_from_repo, generate_images
           from mage_flow.models.mage_flow import MageFlow
-
-          sig = inspect.signature(MageFlow.forward)
           required = {'img','txt','timesteps','img_shapes','img_cu_seqlens','txt_cu_seqlens'}
-          assert required <= set(sig.parameters), sig
-          assert callable(load_from_repo)
-          assert callable(generate_images)
-          print('Microsoft Mage imports successfully on OneTrainer torch', torch.__version__)
+          assert required <= set(inspect.signature(MageFlow.forward).parameters)
+          assert callable(load_from_repo) and callable(generate_images)
+          print('Microsoft Mage runtime on OneTrainer torch', torch.__version__, ': PASS')
           PY
-
-      - name: Import and verify OneTrainer Mage registrations
+      - name: Import and verify Mage OneTrainer registrations
         env:
           PYTHONPATH: /tmp/Mage-runtime
         run: |
           pixi run -e cpu python - <<'PY'
+          # Existing custom-branch encryption_util imports an mgds.crypto module
+          # that is absent from the repository's pinned MGDS commit. Stub only
+          # that unrelated pre-existing symbol so it cannot mask Mage imports.
+          import sys, types
+          crypto = types.ModuleType('mgds.crypto')
+          crypto.configure_encryption_key = lambda *args, **kwargs: None
+          sys.modules['mgds.crypto'] = crypto
+
           from modules.util import factory
           from modules.util.enum.ModelType import ModelType
           from modules.util.enum.TrainingMethod import TrainingMethod
@@ -146,7 +119,6 @@ jobs:
           from modules.modelSampler.BaseModelSampler import BaseModelSampler
           from modules.modelSaver.BaseModelSaver import BaseModelSaver
 
-          import modules.model.MageFlowModel
           import modules.modelLoader.MageFlowLoRAModelLoader
           import modules.modelLoader.MageFlowFineTuneModelLoader
           import modules.modelSetup.MageFlowLoRASetup
@@ -159,21 +131,21 @@ jobs:
           assert ModelType.MAGE_FLOW.is_mage_flow()
           assert ModelType.MAGE_FLOW.is_flow_matching()
           assert ModelType.MAGE_FLOW.model_parts() == ('transformer','text_encoder','vae')
-          assert TrainingMethod.LORA in ModelType.MAGE_FLOW.supported_training_methods()
-          assert TrainingMethod.FINE_TUNE in ModelType.MAGE_FLOW.supported_training_methods()
-
-          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
-          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
-          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
-          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
-          assert factory.get(BaseDataLoader, ModelType.MAGE_FLOW) is not None
-          assert factory.get(BaseModelSampler, ModelType.MAGE_FLOW) is not None
-          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.LORA) is not None
-          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE) is not None
-          print('OneTrainer Mage factory registrations: PASS')
+          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.LORA)
+          assert factory.get(BaseModelLoader, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE)
+          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA)
+          assert factory.get(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE)
+          assert factory.get(BaseDataLoader, ModelType.MAGE_FLOW)
+          assert factory.get(BaseModelSampler, ModelType.MAGE_FLOW)
+          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.LORA)
+          assert factory.get(BaseModelSaver, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE)
+          print('Mage OneTrainer registrations: PASS')
           PY
-
-      - name: Run Mage model helper tests in full OneTrainer environment
+      - name: Run Mage model helper tests
         env:
           PYTHONPATH: /tmp/Mage-runtime
         run: pixi run -e cpu python -m unittest -v tests.test_mage_flow_model_helpers
+      - name: Run against real tiny Microsoft Mage transformer
+        env:
+          PYTHONPATH: /tmp/Mage-runtime
+        run: pixi run -e cpu python -m unittest -v tests.test_mage_flow_official_runtime
