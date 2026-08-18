@@ -73,10 +73,19 @@ jobs:
           assert 'class MageFlowModelLoader(HFModelLoaderMixin)' in mage
           assert 'official.transformer = self._convert_diffusers_sub_module_to_dtype(' in mage
           assert 'weight_dtypes.transformer' in mage
-          assert 'quantization,' in mage
           assert 'official.txt_enc.hf_module = self._convert_transformers_sub_module_to_dtype(' in mage
+          te_conversion = mage.split(
+              'official.txt_enc.hf_module = self._convert_transformers_sub_module_to_dtype(', 1
+          )[1].split(')', 1)[0]
+          assert 'weight_dtypes.text_encoder' in te_conversion
+          assert 'quantization' in te_conversion
           assert 'official.vae = self._convert_diffusers_sub_module_to_dtype(' in mage
-          print('Encryption recovery and Mage quantization wiring: PASS')
+
+          assert 'OT_MAGE_ATTN_BACKEND' in mage
+          assert 'if major == 12:' in mage
+          assert 'return "sdpa", "sdpa"' in mage
+          assert 'quantized_weight_layers=' in mage
+          print('Encryption recovery, Mage quantization, and SM120 attention guard: PASS')
           PY
       - name: Validate adaptive DPO keep floor and warmup
         run: python -m unittest -v tests.test_adaptive_dpo_dataset_policy
