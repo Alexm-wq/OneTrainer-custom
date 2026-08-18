@@ -42,6 +42,10 @@ class MageFlowModelHelperTests(unittest.TestCase):
         torch.testing.assert_close(packed[0, :3], text[0, :3])
         torch.testing.assert_close(packed[0, 3:], text[1, :4])
 
+    def test_packed_image_shape_layout_matches_official_mage(self):
+        shapes = self.model.image_shapes(3, 5, 7)
+        self.assertEqual(shapes, [[(1, 5, 7), (1, 5, 7), (1, 5, 7)]])
+
     def test_model_type_contract(self):
         self.assertTrue(ModelType.MAGE_FLOW.is_mage_flow())
         self.assertTrue(ModelType.MAGE_FLOW.is_flow_matching())
