@@ -3,6 +3,7 @@ from modules.ui.BaseTrainingTabView import BaseTrainingTabView
 from modules.ui.CtkOptimizerParamsWindowView import CtkOptimizerParamsWindowView
 from modules.ui.CtkSchedulerParamsWindowView import CtkSchedulerParamsWindowView
 from modules.ui.CtkTimestepDistributionWindowView import CtkTimestepDistributionWindowView
+from modules.ui.MageFlowEMAUI import add_mage_self_flow_ema_controls
 from modules.ui.TrainingTabController import TrainingTabController
 from modules.util.ui import ctk_components
 
@@ -47,6 +48,13 @@ class CtkTrainingTabView(BaseTrainingTabView):
         column_2.grid_columnconfigure(0, weight=1)
 
         self.build(column_0, column_1, column_2, self.controller, self.ui_state)
+        add_mage_self_flow_ema_controls(
+            ctk_components,
+            column_1,
+            4,
+            self.controller,
+            self.ui_state,
+        )
 
     def restore_optimizer_config(self, variable: str):
         self.controller.restore_optimizer_config(self.ui_state)
