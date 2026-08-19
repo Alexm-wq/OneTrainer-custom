@@ -31,6 +31,47 @@ class MageFlowLoRASetup(MageFlowLinearDPOGPUReferenceMixin, BaseMageFlowSetup):
     def _image_shapes(batch_size: int, height: int, width: int):
         return MageFlowModel.image_shapes(batch_size, height, width)
 
+    def predict(
+            self,
+            model: MageFlowModel,
+            batch: dict,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+            *,
+            deterministic: bool = False,
+    ) -> dict:
+        # Experimental separation: keep ordinary/chosen-supervised training on
+        # Self-Flow while allowing the DPO preference pair itself to use plain
+        # flow matching. The DPO context covers both reference and policy
+        # forwards, so their corruption/prediction path remains symmetric.
+        bypass_dpo_self_flow = bool(
+            config.self_flow_enabled
+            and not getattr(config, "rlhf_dpo_self_flow", True)
+            and self._dpo_conditioning_locked()
+        )
+        if not bypass_dpo_self_flow:
+            return super().predict(
+                model,
+                batch,
+                config,
+                train_progress,
+                deterministic=deterministic,
+            )
+
+        config.self_flow_enabled = False
+        try:
+            data = super().predict(
+                model,
+                batch,
+                config,
+                train_progress,
+                deterministic=deterministic,
+            )
+        finally:
+            config.self_flow_enabled = True
+        data["self_flow_bypassed_for_dpo"] = True
+        return data
+
     def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
         # BaseMageFlowSetup originally grew its own block.compile(dynamic=True)
         # experiment. Do not run it. Let the shared OneTrainer checkpoint/compile
