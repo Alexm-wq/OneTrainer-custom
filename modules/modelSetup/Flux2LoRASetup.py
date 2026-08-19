@@ -2,6 +2,7 @@ from modules.model.Flux2Model import Flux2Model
 import modules.util.multi_gpu_util as multi
 from modules.modelSetup.BaseFlux2Setup import BaseFlux2Setup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin
 from modules.module.Flux2SelfFlow import Flux2SelfFlowEMA, Flux2SelfFlowProjector
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util import factory
@@ -17,6 +18,7 @@ import torch
 
 @factory.register(BaseModelSetup, ModelType.FLUX_2, TrainingMethod.LORA)
 class Flux2LoRASetup(
+    AnchoredRejectChosenFloorMixin,
     BaseFlux2Setup,
 ):
     def __init__(
