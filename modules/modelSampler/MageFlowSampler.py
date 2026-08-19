@@ -1,8 +1,10 @@
 from collections.abc import Callable
+from contextlib import contextmanager
 
 from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.util import factory
+from modules.util.checkpointing_util import BaseCheckpointLayer
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.FileType import FileType
@@ -12,6 +14,39 @@ from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.torch_util import torch_gc
 
 import torch
+
+
+@contextmanager
+def _eager_mage_transformer_blocks(transformer):
+    """Temporarily expose the original Mage blocks for inference.
+
+    OneTrainer wraps Mage blocks in compiled CheckpointLayers for training. The
+    official Mage sampler calls ``official.transformer`` directly under no_grad,
+    bypassing the Self-Flow dispatch that already unwraps those layers. Inductor
+    can consequently try to autotune BF16 inference inputs against FP32-backed
+    weights and fail before the actual denoising kernel is launched.
+
+    Sampling does not need gradient checkpointing or Inductor. Replace only the
+    ModuleList entries with the original eager Mage blocks for the duration of
+    inference, then restore the exact same wrapper objects so training state,
+    optimizer references and compiled training graphs remain intact.
+    """
+    blocks = transformer.transformer_blocks
+    wrapped = []
+    for index, block in enumerate(list(blocks)):
+        if not isinstance(block, BaseCheckpointLayer):
+            continue
+        eager_block = getattr(block, "checkpoint", None)
+        if eager_block is None:
+            continue
+        wrapped.append((index, block))
+        blocks[index] = eager_block
+
+    try:
+        yield len(wrapped)
+    finally:
+        for index, block in wrapped:
+            blocks[index] = block
 
 
 @factory.register(BaseModelSampler, ModelType.MAGE_FLOW)
@@ -70,23 +105,40 @@ class MageFlowSampler(BaseModelSampler):
 
             official.txt_enc.screen_text = cached_screen_text
 
-            # TextEncoder.forward is wrapped by the Mage loader to temporarily
-            # use packed SDPA; it restores model.mage_attention_backend before
-            # the first DiT denoising call, so FA4 remains active for sampling.
-            images = generate_images(
-                official,
-                prompts=[sample_config.prompt],
-                neg_prompts=[sample_config.negative_prompt or " "],
-                seeds=[seed],
-                steps=steps,
-                cfg=float(sample_config.cfg_scale),
-                heights=[height],
-                widths=[width],
-                device=str(self.train_device),
-                prompt_template="mage-flow",
-                static_shift=None,
-                batch_cfg=True,
-            )
+            # The official Mage pipeline creates BF16 latent/image tokens but
+            # does not establish an autocast context around transformer forwards.
+            # OneTrainer training does. Reuse the exact OneTrainer transformer
+            # autocast here so FP32-backed/quantized Linear weights receive the
+            # same mixed-dtype treatment as they do during training.
+            #
+            # Also unwrap Mage's compiled CheckpointLayers for this no-grad
+            # inference pass. The official sampler walks transformer_blocks
+            # directly, so the Self-Flow no-grad dispatch cannot protect this
+            # path from Inductor's inference-time BF16/FP32 matmul autotuner.
+            with self.model.autocast_context, _eager_mage_transformer_blocks(official.transformer) as eager_blocks:
+                if eager_blocks:
+                    print(
+                        f"[Mage-Flow sample] eager inference blocks={eager_blocks}; "
+                        "training compile remains enabled"
+                    )
+                # TextEncoder.forward is wrapped by the Mage loader to temporarily
+                # use packed SDPA; it restores model.mage_attention_backend before
+                # the first DiT denoising call, so the selected DiT backend remains
+                # active for sampling.
+                images = generate_images(
+                    official,
+                    prompts=[sample_config.prompt],
+                    neg_prompts=[sample_config.negative_prompt or " "],
+                    seeds=[seed],
+                    steps=steps,
+                    cfg=float(sample_config.cfg_scale),
+                    heights=[height],
+                    widths=[width],
+                    device=str(self.train_device),
+                    prompt_template="mage-flow",
+                    static_shift=None,
+                    batch_cfg=True,
+                )
             on_update_progress(steps, steps)
             return ModelSamplerOutput(FileType.IMAGE, images[0])
         finally:
