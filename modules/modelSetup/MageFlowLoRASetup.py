@@ -4,8 +4,12 @@ from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
+from modules.module.MageFlowEMAStorage import (
+    MageFlowLinearDPOGPUReferenceMixin,
+    create_mage_self_flow_ema,
+)
 from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
-from modules.module.MageFlowSelfFlow import MageFlowSelfFlowEMA, MageFlowSelfFlowProjector
+from modules.module.MageFlowSelfFlow import MageFlowSelfFlowProjector
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
@@ -18,7 +22,7 @@ import torch
 
 
 @factory.register(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA)
-class MageFlowLoRASetup(BaseMageFlowSetup):
+class MageFlowLoRASetup(MageFlowLinearDPOGPUReferenceMixin, BaseMageFlowSetup):
     def __init__(self, train_device: torch.device, temp_device: torch.device, debug_mode: bool):
         super().__init__(train_device=train_device, temp_device=temp_device, debug_mode=debug_mode)
 
@@ -46,7 +50,7 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
         if not config.self_flow_enabled:
             return
         if config.multi_gpu or multi.world_size() > 1:
-            raise NotImplementedError("Mage Self-Flow CPU EMA currently supports single-GPU training only")
+            raise NotImplementedError("Mage Self-Flow EMA currently supports single-GPU training only")
         if not config.transformer.train:
             raise ValueError("Mage Self-Flow requires transformer LoRA training")
         if not 0.0 <= config.self_flow_mask_ratio <= 0.5:
@@ -126,9 +130,10 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
             if saved is not None and saved.get("projector") is not None:
                 model.self_flow_projector.load_state_dict(saved["projector"], strict=True)
             self._setup_requires_grad(model, config)
-            model.self_flow_ema = MageFlowSelfFlowEMA(
+            model.self_flow_ema = create_mage_self_flow_ema(
                 model.self_flow_adapter_modules(),
-                decay=config.self_flow_ema_decay,
+                config,
+                first,
                 state_dict=saved.get("ema") if saved is not None else None,
             )
             model.self_flow_state_dict = None
