@@ -31,6 +31,13 @@ class MageFlowLoRASetup(MageFlowLinearDPOGPUReferenceMixin, BaseMageFlowSetup):
     def _image_shapes(batch_size: int, height: int, width: int):
         return MageFlowModel.image_shapes(batch_size, height, width)
 
+    @staticmethod
+    def rlhf_chosen_supervised_weight(config: TrainConfig, objective) -> float:
+        # Do not attenuate chosen supervision merely because Self-Flow is enabled.
+        # Anchored/Balanced therefore keep their full 1.0 chosen objective, while
+        # other objectives use exactly the configured Supervised Mix weight.
+        return BaseModelSetup.rlhf_chosen_supervised_weight(config, objective)
+
     def predict(
             self,
             model: MageFlowModel,
