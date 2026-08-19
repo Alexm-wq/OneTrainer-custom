@@ -3,7 +3,7 @@ from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
-from modules.module.MageFlowEMAStorage import create_mage_self_flow_ema
+from modules.module.MageFlowEMAStorage import create_mage_self_flow_ema, log_mage_runtime_devices
 from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
 from modules.module.MageFlowSelfFlow import MageFlowSelfFlowProjector
 from modules.util import factory
@@ -123,6 +123,12 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
         groups = self.create_parameters(model, config)
         self._setup_requires_grad(model, config)
         init_model_parameters(model, groups, self.train_device)
+        log_mage_runtime_devices(
+            self,
+            model,
+            config,
+            phase="model setup complete",
+        )
 
     def setup_train_device(self, model: MageFlowModel, config: TrainConfig):
         model.text_encoder_to(self.train_device if not config.text_caching else self.temp_device)
