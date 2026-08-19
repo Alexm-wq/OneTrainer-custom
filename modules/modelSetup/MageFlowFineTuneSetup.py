@@ -3,8 +3,9 @@ from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
+from modules.module.MageFlowEMAStorage import create_mage_self_flow_ema
 from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
-from modules.module.MageFlowSelfFlow import MageFlowSelfFlowEMA, MageFlowSelfFlowProjector
+from modules.module.MageFlowSelfFlow import MageFlowSelfFlowProjector
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
@@ -43,7 +44,7 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
         if not config.self_flow_enabled:
             return
         if config.multi_gpu or multi.world_size() > 1:
-            raise NotImplementedError("Mage Self-Flow CPU EMA currently supports single-GPU training only")
+            raise NotImplementedError("Mage Self-Flow EMA currently supports single-GPU training only")
         if not config.transformer.train:
             raise ValueError("Mage Self-Flow requires transformer training")
         if not 0.0 <= config.self_flow_mask_ratio <= 0.5:
@@ -64,8 +65,9 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
         model.self_flow_student_layer = student
         model.self_flow_teacher_layer = teacher
         print(
-            "[Mage Self-Flow] full-finetune EMA enabled. This keeps a CPU FP32 EMA of the trainable transformer "
-            "and is substantially heavier than LoRA Self-Flow."
+            "[Mage Self-Flow] full-finetune EMA enabled. This keeps a complete "
+            "FP32 EMA of the trainable transformer and can consume substantial "
+            "CPU RAM or VRAM depending on the selected EMA storage."
         )
 
     def create_parameters(self, model: MageFlowModel, config: TrainConfig) -> NamedParameterGroupCollection:
@@ -110,9 +112,10 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
             if saved is not None and saved.get("projector") is not None:
                 model.self_flow_projector.load_state_dict(saved["projector"], strict=True)
             self._setup_requires_grad(model, config)
-            model.self_flow_ema = MageFlowSelfFlowEMA(
+            model.self_flow_ema = create_mage_self_flow_ema(
                 model.self_flow_adapter_modules(),
-                decay=config.self_flow_ema_decay,
+                config,
+                first,
                 state_dict=saved.get("ema") if saved is not None else None,
             )
             model.self_flow_state_dict = None
