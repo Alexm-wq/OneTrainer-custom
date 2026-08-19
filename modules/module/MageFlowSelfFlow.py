@@ -57,7 +57,11 @@ class MageFlowSelfFlowEMA:
                 raise RuntimeError(
                     f"Mage Self-Flow EMA shape mismatch at {index}: {tuple(stored.shape)} != {tuple(parameter.shape)}"
                 )
-            parameter.copy_(stored.to(device=parameter.device, dtype=parameter.dtype), non_blocking=False)
+            # Match the Flux2 Self-Flow path: copy directly from CPU storage
+            # into the active parameter. Tensor.copy_ handles device/dtype
+            # conversion itself; materializing stored.to(cuda, dtype) first
+            # created an unnecessary temporary GPU tensor for every LoRA weight.
+            parameter.copy_(stored, non_blocking=False)
 
     @contextmanager
     def teacher_parameters(self, adapter_modules: Iterable[nn.Module] = ()):
