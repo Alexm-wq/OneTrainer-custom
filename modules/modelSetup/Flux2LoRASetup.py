@@ -31,6 +31,13 @@ class Flux2LoRASetup(
             debug_mode=debug_mode,
         )
 
+    @staticmethod
+    def rlhf_chosen_supervised_weight(config: TrainConfig, objective) -> float:
+        # Do not attenuate chosen supervision merely because Self-Flow is enabled.
+        # Anchored/Balanced keep their full 1.0 chosen objective; other objectives
+        # use exactly the configured Supervised Mix weight.
+        return BaseModelSetup.rlhf_chosen_supervised_weight(config, objective)
+
     def create_parameters(
             self,
             model: Flux2Model,
