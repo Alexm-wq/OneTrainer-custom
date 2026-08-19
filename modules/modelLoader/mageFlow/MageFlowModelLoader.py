@@ -6,6 +6,7 @@ from types import MethodType
 
 from modules.model.MageFlowModel import MageFlowModel
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
+from modules.module.quantized.mixin.QuantizedLinearMixin import QuantizedLinearMixin
 from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
@@ -98,10 +99,16 @@ class MageFlowModelLoader(HFModelLoaderMixin):
             "GGUFLinear",
         }
         for child in module.modules():
-            is_linear = isinstance(child, nn.Linear) or child.__class__.__name__ in extra_quantized_types
+            is_linear = (
+                isinstance(child, (nn.Linear, QuantizedLinearMixin))
+                or child.__class__.__name__ in extra_quantized_types
+            )
             if not is_linear:
                 continue
             total += 1
+            if isinstance(child, QuantizedLinearMixin):
+                quantized += 1
+                continue
             try:
                 is_quantized = any(
                     is_quantized_parameter(child, parameter_name)
@@ -199,9 +206,11 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         # Mage's official loader returns fully materialized torch modules. Run
         # those modules through OneTrainer's normal conversion pass so configured
         # weight dtypes and quantized Linear replacements are applied before the
-        # setup phase calls quantize_layers(). Pass the user's QuantizationConfig
-        # to BOTH transformer and text encoder so layer filtering/SVD settings are
-        # not silently dropped for Qwen.
+        # setup phase calls quantize_layers(). The user QuantizationConfig is
+        # applied to the DiT exactly like other diffusers models. For Qwen, match
+        # OneTrainer's standard Transformers loader semantics: the selected text
+        # encoder dtype applies to every eligible TE Linear and does NOT inherit
+        # the transformer's layer-filter/SVD QuantizationConfig.
         official.transformer = self._convert_diffusers_sub_module_to_dtype(
             official.transformer,
             weight_dtypes.transformer,
@@ -212,7 +221,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
             official.txt_enc.hf_module,
             weight_dtypes.text_encoder,
             weight_dtypes.fallback_train_dtype,
-            quantization,
+            None,
         )
         official.vae = self._convert_diffusers_sub_module_to_dtype(
             official.vae,
@@ -228,9 +237,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         if weight_dtypes.text_encoder.is_quantized() and te_quantized == 0:
             raise RuntimeError(
                 "Mage text encoder is configured with quantized weight dtype "
-                f"{weight_dtypes.text_encoder}, but zero Qwen Linear layers were "
-                "replaced. Check the Quantization layer filter; it may exclude "
-                "all text-encoder layer names."
+                f"{weight_dtypes.text_encoder}, but zero Qwen Linear layers were replaced."
             )
 
         model.model_type = model_type
