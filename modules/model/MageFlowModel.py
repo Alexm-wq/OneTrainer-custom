@@ -149,6 +149,15 @@ class MageFlowModel(BaseModel):
         offsets = torch.cumsum(lens, dim=0, dtype=torch.int32)
         return torch.cat([torch.zeros(1, dtype=torch.int32, device=device), offsets])
 
+    @staticmethod
+    def _cu_seqlens_tensor(lengths: Tensor) -> Tensor:
+        lengths = lengths.to(dtype=torch.int32)
+        offsets = torch.cumsum(lengths, dim=0, dtype=torch.int32)
+        return torch.cat([
+            torch.zeros(1, dtype=torch.int32, device=lengths.device),
+            offsets,
+        ])
+
     def encode_text(
             self,
             train_device: torch.device,
@@ -225,10 +234,20 @@ class MageFlowModel(BaseModel):
     def prepare_packed_text(self, text: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
         if text.ndim != 3 or mask.ndim != 2:
             raise ValueError("Mage text conditioning must be [B,T,D] with mask [B,T]")
-        lengths = mask.sum(dim=1).to(dtype=torch.int32)
-        pieces = [text[i, :int(length.item())] for i, length in enumerate(lengths)]
-        packed = torch.cat(pieces, dim=0).unsqueeze(0)
-        return packed, self._cu_seqlens([int(x) for x in lengths.tolist()], text.device)
+        if text.shape[:2] != mask.shape:
+            raise ValueError(
+                f"Mage text/mask shape mismatch: text={tuple(text.shape)} mask={tuple(mask.shape)}"
+            )
+
+        # Boolean indexing preserves sample-major token order and removes all
+        # padding on-device. The old implementation called ``length.item()``
+        # once per sample and then ``lengths.tolist()`` every model forward,
+        # forcing repeated CUDA -> CPU synchronizations in the steady-state
+        # training loop.
+        mask = mask.bool()
+        lengths = mask.sum(dim=1, dtype=torch.int32)
+        packed = text[mask].unsqueeze(0)
+        return packed, self._cu_seqlens_tensor(lengths)
 
     def prepare_packed_images(self, tokens: Tensor) -> tuple[Tensor, Tensor]:
         batch, length, channels = tokens.shape
