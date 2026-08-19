@@ -66,22 +66,22 @@ def _install_dual_timestep_block_forward(transformer) -> None:
 
 
 def _patch_upstream_mage_attention_processor_for_compile() -> None:
-    """Patch only Mage's two CUDA-scalar compile hazards.
+    """Patch Mage's CUDA-scalar compile hazards without changing FA4 semantics.
 
     The pinned upstream Mage processor is retained verbatim except for:
 
-    * ``joint_cu_lens[-1]`` being used as a torch.empty() shape.  This is a CUDA
-      scalar tensor and causes Dynamo's data-dependent-shape failure.  The exact
-      same value is the sum of the already-flattened text/image query lengths,
-      which is available as compile-safe SymInts.
-    * ``joint_lens.max().item()`` forcing a CUDA->CPU synchronization and a graph
-      break in every attention block.  OneTrainer supplies a host-known upper
-      bound for max_seqlen; FA varlen accepts an upper bound.
+    * ``joint_cu_lens[-1]`` being used as a torch.empty() shape. This CUDA
+      scalar causes Dynamo's data-dependent-shape failure. The exact same total
+      is available as the sum of the already-flattened text/image query lengths,
+      which is a compile-safe SymInt.
+    * ``joint_lens.max().item()`` normally synchronizes CUDA once in every
+      transformer block. OneTrainer computes that exact maximum once while
+      packing the batch and supplies it as a Python integer to every block.
+      If the hint is absent, fall back to Mage's original exact calculation.
 
-    Using inspect+exec here avoids maintaining a forked copy of Microsoft's
-    attention processor.  The replacements are asserted against the pinned Mage
-    source so a future upstream change fails during setup instead of silently
-    applying the wrong patch.
+    Importantly, the value passed to FA4 is the exact maximum sequence length,
+    not merely an upper bound. FA4/CuTe uses this value in kernel scheduling and
+    should not be given a larger padded-text bound.
     """
     import mage_flow.models.modules.mage_layers as mage_layers
 
@@ -97,7 +97,7 @@ def _patch_upstream_mage_attention_processor_for_compile() -> None:
     new_max = (
         "    max_seqlen = kwargs.pop(\"ot_max_joint_seqlen\", None)\n"
         "    if max_seqlen is None:\n"
-        "        max_seqlen = txt_query.shape[0] + img_query.shape[0]\n"
+        "        max_seqlen = joint_lens.max().item()\n"
     )
 
     if source.count(old_total) != 1 or source.count(old_max) != 1:
@@ -109,7 +109,7 @@ def _patch_upstream_mage_attention_processor_for_compile() -> None:
     source = source.replace(old_total, new_total, 1).replace(old_max, new_max, 1)
 
     # Execute in Mage's real module globals so the patched method continues to
-    # resolve the backend/RoPE symbols from that module.  This is important when
+    # resolve the backend/RoPE symbols from that module. This is important when
     # the FA4 function is subsequently marked as a Dynamo eager boundary.
     namespace = mage_layers.__dict__
     exec(compile(source, mage_layers.__file__, "exec"), namespace)
@@ -174,17 +174,19 @@ def _install_self_flow_block_dispatch() -> None:
 
 
 def _install_native_packed_inputs(setup) -> None:
-    """Use Microsoft's native packing and provide a compile-safe FA max-seqlen bound."""
+    """Use Microsoft's native packing and compute FA4's exact max sequence length once."""
 
     def packed_inputs(self, model, latent_tokens, text, text_mask):
         packed_img, img_cu = model.prepare_packed_images(latent_tokens)
         packed_txt, txt_cu = model.prepare_packed_text(text, text_mask)
 
-        # Every sample has at most image_token_width + padded_text_width joint
-        # tokens.  FlashAttention accepts this as max_seqlen even when the actual
-        # packed prompt is shorter, and unlike joint_lens.max().item() this needs
-        # no CUDA scalar extraction inside every transformer block.
-        max_joint_seqlen = int(latent_tokens.shape[1] + text.shape[1])
+        # Image token length is identical for every sample. Text is packed from
+        # the validity mask, so the exact longest joint sequence is simply the
+        # image-token length plus the maximum valid text length. Compute it once
+        # here instead of synchronizing joint_lens.max().item() in every block.
+        text_lengths = text_mask.to(dtype=torch.int32).sum(dim=1)
+        max_text_seqlen = int(text_lengths.max().item()) if text_lengths.numel() else 0
+        max_joint_seqlen = int(latent_tokens.shape[1]) + max_text_seqlen
         attention_kwargs = {"ot_max_joint_seqlen": max_joint_seqlen}
         return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0], attention_kwargs
 
@@ -243,5 +245,5 @@ def setup_mage_like_flux2(setup, model, config) -> None:
     print(
         "[Mage-Flow] transformer blocks use OneTrainer CheckpointLayer "
         f"(checkpoint={config.transformer.checkpointing_enabled()}, "
-        f"compile={bool(config.compile)}, packed-shapes=compile-safe, Mage RoPE/FA4 eager)"
+        f"compile={bool(config.compile)}, exact-FA4-varlen, Mage RoPE/FA4 eager)"
     )
