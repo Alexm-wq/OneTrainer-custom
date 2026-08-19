@@ -3,6 +3,7 @@ from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.module.MageFlowAttention import configure_mage_attention_from_config
 from modules.module.MageFlowSelfFlow import MageFlowSelfFlowEMA, MageFlowSelfFlowProjector
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
@@ -84,6 +85,7 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
             model.self_flow_projector.requires_grad_(config.self_flow_enabled and config.transformer.train)
 
     def setup_model(self, model: MageFlowModel, config: TrainConfig):
+        configure_mage_attention_from_config(model, config)
         self._validate_self_flow(model, config)
         model.transformer_lora = LoRAModuleWrapper(
             model.transformer,
