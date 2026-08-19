@@ -49,8 +49,9 @@ def _module_device(module) -> str:
     if module is None:
         return "absent"
     try:
-        parameter = next(module.parameters())
-    except (StopIteration, AttributeError):
+        parameters = module.parameters()
+        parameter = next(iter(parameters))
+    except (StopIteration, AttributeError, TypeError):
         return "no-parameters"
     return f"{parameter.device}/{str(parameter.dtype).removeprefix('torch.')}"
 
