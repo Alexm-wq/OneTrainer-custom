@@ -18,6 +18,19 @@ class BaseConfig:
         self.config_version = config_version if config_version is not None else 0
         self.config_migrations = config_migrations if config_migrations is not None else {}
 
+        # The custom MageFlow branch needs two saved residency switches in the
+        # normal TrainConfig/UI state without bumping OneTrainer's shared config
+        # schema solely for model-specific performance tuning. Add them only to
+        # TrainConfig instances. They serialize like ordinary bool settings and
+        # old configs simply keep the CPU-compatible False defaults.
+        if self.__class__.__name__ == "TrainConfig":
+            data = list(data)
+            existing_names = {entry[0] for entry in data}
+            if "self_flow_ema_on_gpu" not in existing_names:
+                data.append(("self_flow_ema_on_gpu", False, bool, False))
+            if "rlhf_dpo_linear_ema_on_gpu" not in existing_names:
+                data.append(("rlhf_dpo_linear_ema_on_gpu", False, bool, False))
+
         self.types = {}
         self.nullables = {}
         self.default_values = {}
