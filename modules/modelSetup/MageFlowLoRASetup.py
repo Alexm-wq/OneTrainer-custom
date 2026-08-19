@@ -7,6 +7,7 @@ from modules.module.MageFlowAttention import configure_mage_attention_from_confi
 from modules.module.MageFlowEMAStorage import (
     MageFlowLinearDPOGPUReferenceMixin,
     create_mage_self_flow_ema,
+    log_mage_runtime_devices,
 )
 from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
 from modules.module.MageFlowSelfFlow import MageFlowSelfFlowProjector
@@ -141,6 +142,12 @@ class MageFlowLoRASetup(MageFlowLinearDPOGPUReferenceMixin, BaseMageFlowSetup):
         groups = self.create_parameters(model, config)
         self._setup_requires_grad(model, config)
         init_model_parameters(model, groups, self.train_device)
+        log_mage_runtime_devices(
+            self,
+            model,
+            config,
+            phase="model setup complete (before DPO reference initialization)",
+        )
 
     def setup_train_device(self, model: MageFlowModel, config: TrainConfig):
         model.text_encoder_to(self.train_device if not config.text_caching else self.temp_device)
