@@ -59,6 +59,77 @@ def build_packed_attention_routing(
     }
 
 
+@torch.compiler.disable(reason="Mage complex RoPE + FA4/CuTe varlen kernel stay eager outside TorchDynamo")
+def _eager_rotary_varlen_attention(
+        img_query: Tensor,
+        img_key: Tensor,
+        img_value: Tensor,
+        txt_query: Tensor,
+        txt_key: Tensor,
+        txt_value: Tensor,
+        image_rotary_emb: Tensor | None,
+        routing: dict[str, Any],
+) -> tuple[Tensor, Tensor]:
+    """Run only the compile-hostile Mage RoPE/packing/FA4 region eagerly.
+
+    The surrounding Q/K/V projections, output projections, block modulation,
+    norms, residuals and MLPs remain visible to torch.compile. Keeping this
+    small region outside Dynamo also preserves FA4/CuTe's own Python-side
+    compilation caches instead of tracing through them.
+    """
+    from mage_flow.models.modules._attn_backend import flash_attn_varlen_func
+    from mage_flow.models.modules.mage_layers import apply_rotary_emb_mageflow
+
+    img_query = apply_rotary_emb_mageflow(img_query, image_rotary_emb)
+    img_key = apply_rotary_emb_mageflow(img_key, image_rotary_emb)
+
+    joint_cu_lens = routing["joint_cu_lens"]
+    txt_dest_indices = routing["txt_dest_indices"]
+    img_dest_indices = routing["img_dest_indices"]
+    total_tokens = routing["total_joint_tokens"]
+    max_seqlen = routing["max_joint_seqlen"]
+
+    joint_query = torch.empty(
+        (total_tokens, *txt_query.shape[1:]),
+        dtype=txt_query.dtype,
+        device=txt_query.device,
+    )
+    joint_key = torch.empty(
+        (total_tokens, *txt_key.shape[1:]),
+        dtype=txt_key.dtype,
+        device=txt_key.device,
+    )
+    joint_value = torch.empty(
+        (total_tokens, *txt_value.shape[1:]),
+        dtype=txt_value.dtype,
+        device=txt_value.device,
+    )
+
+    joint_query[txt_dest_indices] = txt_query
+    joint_query[img_dest_indices] = img_query
+    joint_key[txt_dest_indices] = txt_key
+    joint_key[img_dest_indices] = img_key
+    joint_value[txt_dest_indices] = txt_value
+    joint_value[img_dest_indices] = img_value
+
+    joint_attn_output = flash_attn_varlen_func(
+        joint_query,
+        joint_key,
+        joint_value,
+        cu_seqlens_q=joint_cu_lens,
+        cu_seqlens_k=joint_cu_lens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        dropout_p=0.0,
+        softmax_scale=None,
+        causal=False,
+    )
+
+    txt_attn_output = joint_attn_output[txt_dest_indices]
+    img_attn_output = joint_attn_output[img_dest_indices]
+    return img_attn_output, txt_attn_output
+
+
 class OneTrainerMageDoubleStreamAttnProcessor:
     """Drop-in Mage double-stream processor with cached packed routing.
 
@@ -108,7 +179,6 @@ class OneTrainerMageDoubleStreamAttnProcessor:
         self._cached_routing = routing
         return routing
 
-    @torch.compiler.disable(reason="Mage RoPE + FA4/CuTe varlen kernel must remain outside TorchDynamo")
     def __call__(
             self,
             attn,
@@ -124,9 +194,6 @@ class OneTrainerMageDoubleStreamAttnProcessor:
             raise ValueError("Mage double-stream attention requires encoder_hidden_states")
         if img_cu_lens is None or txt_cu_lens is None:
             raise ValueError("Mage packed attention requires image/text cu_seqlens")
-
-        from mage_flow.models.modules._attn_backend import flash_attn_varlen_func
-        from mage_flow.models.modules.mage_layers import apply_rotary_emb_mageflow
 
         img_query = attn.to_q(hidden_states)
         img_key = attn.to_k(hidden_states)
@@ -161,9 +228,6 @@ class OneTrainerMageDoubleStreamAttnProcessor:
         if attn.norm_added_k is not None:
             txt_key = attn.norm_added_k(txt_key)
 
-        img_query = apply_rotary_emb_mageflow(img_query, image_rotary_emb)
-        img_key = apply_rotary_emb_mageflow(img_key, image_rotary_emb)
-
         routing = kwargs.get("ot_packed_routing")
         if routing is None:
             routing = self._fallback_routing(
@@ -173,53 +237,19 @@ class OneTrainerMageDoubleStreamAttnProcessor:
                 int(txt_query.shape[0]),
             )
 
-        joint_cu_lens = routing["joint_cu_lens"]
-        txt_dest_indices = routing["txt_dest_indices"]
-        img_dest_indices = routing["img_dest_indices"]
-        total_tokens = routing["total_joint_tokens"]
-        max_seqlen = routing["max_joint_seqlen"]
-
-        joint_query = torch.empty(
-            (total_tokens, *txt_query.shape[1:]),
-            dtype=txt_query.dtype,
-            device=txt_query.device,
-        )
-        joint_key = torch.empty(
-            (total_tokens, *txt_key.shape[1:]),
-            dtype=txt_key.dtype,
-            device=txt_key.device,
-        )
-        joint_value = torch.empty(
-            (total_tokens, *txt_value.shape[1:]),
-            dtype=txt_value.dtype,
-            device=txt_value.device,
+        img_attn_output, txt_attn_output = _eager_rotary_varlen_attention(
+            img_query,
+            img_key,
+            img_value,
+            txt_query,
+            txt_key,
+            txt_value,
+            image_rotary_emb,
+            routing,
         )
 
-        joint_query[txt_dest_indices] = txt_query
-        joint_query[img_dest_indices] = img_query
-        joint_key[txt_dest_indices] = txt_key
-        joint_key[img_dest_indices] = img_key
-        joint_value[txt_dest_indices] = txt_value
-        joint_value[img_dest_indices] = img_value
-
-        joint_attn_output = flash_attn_varlen_func(
-            joint_query,
-            joint_key,
-            joint_value,
-            cu_seqlens_q=joint_cu_lens,
-            cu_seqlens_k=joint_cu_lens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-            dropout_p=0.0,
-            softmax_scale=None,
-            causal=False,
-        )
-
-        txt_attn_output = joint_attn_output[txt_dest_indices]
-        img_attn_output = joint_attn_output[img_dest_indices]
-
-        img_attn_output = img_attn_output.flatten(1, 2).to(joint_query.dtype)
-        txt_attn_output = txt_attn_output.flatten(1, 2).to(joint_query.dtype)
+        img_attn_output = img_attn_output.flatten(1, 2).to(img_query.dtype)
+        txt_attn_output = txt_attn_output.flatten(1, 2).to(txt_query.dtype)
 
         img_attn_output = attn.to_out[0](img_attn_output)
         if len(attn.to_out) > 1:
