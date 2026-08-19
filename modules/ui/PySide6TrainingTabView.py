@@ -1,4 +1,5 @@
 from modules.ui.BaseTrainingTabView import BaseTrainingTabView
+from modules.ui.MageFlowEMAUI import add_mage_self_flow_ema_controls
 from modules.ui.OptimizerParamsWindowController import OptimizerParamsWindowController
 from modules.ui.PySide6OptimizerParamsWindowView import PySide6OptimizerParamsWindowView
 from modules.ui.PySide6SchedulerParamsWindowView import PySide6SchedulerParamsWindowView
@@ -62,6 +63,13 @@ class PySide6TrainingTabView(BaseTrainingTabView, QWidget, metaclass=QtABCMeta):
         pyside6_components._layout(column_2).setColumnStretch(0, 1)
 
         self.build(column_0, column_1, column_2, self.controller, self.ui_state)
+        add_mage_self_flow_ema_controls(
+            pyside6_components,
+            column_1,
+            4,
+            self.controller,
+            self.ui_state,
+        )
 
         for col_widget in (column_0, column_1, column_2):
             lo = pyside6_components._layout(col_widget)
