@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
@@ -207,3 +208,53 @@ def install_optimized_mage_attention(transformer) -> None:
         block.attn.set_processor(OneTrainerMageDoubleStreamAttnProcessor())
         installed += 1
     print(f"[Mage-Flow] optimized packed attention processors installed={installed}")
+
+
+
+def configure_mage_attention_from_config(model, config) -> str:
+    """Apply OneTrainer's Attention Mechanism selector to Mage's DiT backend.
+
+    The loader has to choose a provisional backend before TrainConfig is
+    attached. This function runs during setup_model, after config is available,
+    and updates both Mage's process-global backend and the mutable restore state
+    used by packed Qwen forwards.
+    """
+    from modules.util.enum.AttentionMechanism import AttentionMechanism
+    from mage_flow.models.modules._attn_backend import set_attn_backend
+
+    explicit = os.environ.get("OT_MAGE_ATTN_BACKEND", "").strip().lower()
+    mechanism = config.attention_mechanism
+
+    if explicit:
+        selected = getattr(model, "mage_attention_backend", "sdpa")
+        source = f"OT_MAGE_ATTN_BACKEND={explicit}"
+    elif mechanism == AttentionMechanism.FLASH:
+        try:
+            from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError(
+                "Mage Attention Mechanism=FLASH requires FlashAttention4, but "
+                "flash_attn.cute is not importable in the active environment."
+            ) from exc
+        selected = "flash4"
+        source = "Attention Mechanism=FLASH"
+    else:
+        # Mage's packed shim has no separate cuDNN implementation. CUDNN uses
+        # torch SDPA with cuDNN SDPA enabled; SDP uses the same shim with the
+        # generic trainer's conservative cuDNN-disable behavior.
+        selected = "sdpa"
+        source = f"Attention Mechanism={mechanism}"
+
+    if torch.cuda.is_available():
+        torch.backends.cuda.enable_cudnn_sdp(
+            mechanism == AttentionMechanism.CUDNN and selected == "sdpa"
+        )
+
+    set_attn_backend(selected)
+    model.mage_attention_backend = selected
+    state = getattr(model, "mage_attention_backend_state", None)
+    if state is not None:
+        state["dit"] = selected
+
+    print(f"[Mage-Flow] {source} -> DiT packed backend={selected}")
+    return selected
