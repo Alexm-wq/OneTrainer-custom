@@ -159,10 +159,10 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         from mage_flow.models.modules._attn_backend import set_attn_backend
         set_attn_backend(mage_attn_backend)
 
-        # TextEncoder.forward uses Mage's process-global packed varlen backend,
-        # while Qwen autoregressive generation uses the HF implementation chosen
-        # above. Wrap only the packed conditioning forward: use the robust SDPA
-        # shim for Qwen, then restore FA4/SDPA for DiT training or denoising.
+        # Mutable holder so setup_optimizations() can later honor OneTrainer's
+        # Attention Mechanism selector. Packed Qwen forwards always use SDPA,
+        # then restore whatever DiT backend is current at that moment.
+        backend_state = {"dit": mage_attn_backend}
         original_text_forward = official.txt_enc.forward
 
         def onetrainer_text_forward(_self, *args, **kwargs):
@@ -171,7 +171,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
                 try:
                     return original_text_forward(*args, **kwargs)
                 finally:
-                    set_attn_backend(mage_attn_backend)
+                    set_attn_backend(backend_state["dit"])
 
         official.txt_enc.forward = MethodType(onetrainer_text_forward, official.txt_enc)
 
@@ -236,6 +236,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         model.model_type = model_type
         model.base_model_name = model_names.base_model
         model.mage_attention_backend = mage_attn_backend
+        model.mage_attention_backend_state = backend_state
         model.tokenizer = official.txt_enc.tokenizer
         model.noise_scheduler = official.scheduler
         model.text_encoder_wrapper = official.txt_enc
