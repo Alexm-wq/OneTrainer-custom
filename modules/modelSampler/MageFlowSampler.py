@@ -22,10 +22,14 @@ def _eager_mage_transformer_blocks(transformer):
 
     OneTrainer wraps Mage blocks in compiled CheckpointLayers for training. The
     official Mage sampler calls ``official.transformer`` directly under no_grad,
-    bypassing the Self-Flow dispatch that already unwraps those layers. Sampling
-    does not need gradient checkpointing or Inductor, so replace only the
+    bypassing the Self-Flow dispatch that already unwraps those layers. Inductor
+    can consequently try to autotune BF16 inference inputs against FP32-backed
+    weights and fail before the actual denoising kernel is launched.
+
+    Sampling does not need gradient checkpointing or Inductor. Replace only the
     ModuleList entries with the original eager Mage blocks for the duration of
-    inference, then restore the exact same wrapper objects afterward.
+    inference, then restore the exact same wrapper objects so training state,
+    optimizer references and compiled training graphs remain intact.
     """
     blocks = transformer.transformer_blocks
     wrapped = []
@@ -43,54 +47,6 @@ def _eager_mage_transformer_blocks(transformer):
     finally:
         for index, block in wrapped:
             blocks[index] = block
-
-
-@contextmanager
-def _stable_mage_sampling_attention(model: MageFlowModel):
-    """Use non-FA4 SDPA only while Mage is sampling.
-
-    Repeated FA4/CuTe varlen inference on consumer Blackwell has produced a
-    delayed device-side illegal-memory-access after many denoise steps. Training
-    can still use the configured FA4 backend; inference temporarily switches the
-    Mage backend shim and the mutable Qwen restore state to SDPA. PyTorch Flash
-    SDPA is disabled in this scope as well, preferring cuDNN or memory-efficient
-    SDPA and retaining the math implementation only as a final fallback.
-    """
-    from mage_flow.models.modules._attn_backend import set_attn_backend
-
-    previous_backend = getattr(model, "mage_attention_backend", "sdpa")
-    backend_state = getattr(model, "mage_attention_backend_state", None)
-    previous_state_backend = (
-        backend_state.get("dit", previous_backend)
-        if backend_state is not None
-        else previous_backend
-    )
-
-    model.mage_attention_backend = "sdpa"
-    if backend_state is not None:
-        backend_state["dit"] = "sdpa"
-    set_attn_backend("sdpa")
-
-    try:
-        # The official Mage SDPA shim dispatches each packed segment through
-        # torch.nn.functional.scaled_dot_product_attention. Exclude PyTorch's
-        # Flash backend too so sampling cannot fall back onto another flash
-        # implementation while we are diagnosing/stabilizing Blackwell inference.
-        if torch.cuda.is_available():
-            with torch.backends.cuda.sdp_kernel(
-                    enable_flash=False,
-                    enable_math=True,
-                    enable_mem_efficient=True,
-                    enable_cudnn=True,
-            ):
-                yield
-        else:
-            yield
-    finally:
-        model.mage_attention_backend = previous_backend
-        if backend_state is not None:
-            backend_state["dit"] = previous_state_backend
-        set_attn_backend(previous_state_backend)
 
 
 @factory.register(BaseModelSampler, ModelType.MAGE_FLOW)
@@ -134,6 +90,10 @@ class MageFlowSampler(BaseModelSampler):
         try:
             print("[Mage-Flow sample] Qwen prompt screening...")
             on_update_progress(0, steps)
+            # Upstream allows 160 new tokens for a response whose contract is a
+            # short one-line JSON object. 64 leaves ample room for the complete
+            # verdict while avoiding a long autoregressive prepass before every
+            # OneTrainer sample.
             cached_verdict = original_screen_text(sample_config.prompt, max_new_tokens=64)
             print(
                 "[Mage-Flow sample] prompt screening complete; "
@@ -145,25 +105,25 @@ class MageFlowSampler(BaseModelSampler):
 
             official.txt_enc.screen_text = cached_screen_text
 
-            # Official Mage creates BF16 diffusion tokens but does not establish
-            # the transformer autocast context used by OneTrainer training. Reuse
-            # that context, unwrap training-only compiled/checkpoint wrappers, and
-            # keep sampling off FA4/CuTe. The original backend and wrappers are
-            # restored immediately after inference.
-            with (
-                self.model.autocast_context,
-                _stable_mage_sampling_attention(self.model),
-                _eager_mage_transformer_blocks(official.transformer) as eager_blocks,
-            ):
-                print(
-                    "[Mage-Flow sample] attention=SDPA (Flash disabled; "
-                    "cuDNN/efficient fallback enabled)"
-                )
+            # The official Mage pipeline creates BF16 latent/image tokens but
+            # does not establish an autocast context around transformer forwards.
+            # OneTrainer training does. Reuse the exact OneTrainer transformer
+            # autocast here so FP32-backed/quantized Linear weights receive the
+            # same mixed-dtype treatment as they do during training.
+            #
+            # Also unwrap Mage's compiled CheckpointLayers for this no-grad
+            # inference pass. The official sampler walks transformer_blocks
+            # directly, so the Self-Flow no-grad dispatch cannot protect this
+            # path from Inductor's inference-time BF16/FP32 matmul autotuner.
+            with self.model.autocast_context, _eager_mage_transformer_blocks(official.transformer) as eager_blocks:
                 if eager_blocks:
                     print(
                         f"[Mage-Flow sample] eager inference blocks={eager_blocks}; "
                         "training compile remains enabled"
                     )
+                # TextEncoder.forward is wrapped by the Mage loader to temporarily
+                # use packed SDPA; it restores model.mage_attention_backend before
+                # the first DiT denoising call, so FA4 remains active for sampling.
                 images = generate_images(
                     official,
                     prompts=[sample_config.prompt],
