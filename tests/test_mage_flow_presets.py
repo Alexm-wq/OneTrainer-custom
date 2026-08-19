@@ -16,12 +16,16 @@ class MageFlowPresetTests(unittest.TestCase):
             return json.load(handle)
 
     def _assert_common(self, data: dict):
-        self.assertEqual(data["base_model_name"], "microsoft/Mage-Flow-Base")
+        self.assertEqual(data["base_model_name"], "SceneWorks/Mage-Flow-Base")
         self.assertEqual(data["model_type"], "MAGE_FLOW")
         self.assertEqual(data["training_method"], "LORA")
         self.assertEqual(data["output_model_format"], "DIFFUSERS_LORA")
         self.assertEqual(data["train_dtype"], "BFLOAT_16")
         self.assertEqual(data["output_dtype"], "BFLOAT_16")
+        self.assertEqual(data["attention_mechanism"], "FLASH")
+        # Compile is intentionally opt-in until the new Mage block compile path
+        # has been exercised on the target RTX 5090. The code now honors this
+        # toggle; presets keep the conservative first-run setting.
         self.assertFalse(data["compile"])
         self.assertTrue(data["image_caching"])
         self.assertTrue(data["text_caching"])
