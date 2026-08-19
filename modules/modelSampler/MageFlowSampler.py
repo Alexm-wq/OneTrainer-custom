@@ -55,13 +55,17 @@ class MageFlowSampler(BaseModelSampler):
         try:
             print("[Mage-Flow sample] Qwen prompt screening...")
             on_update_progress(0, steps)
-            cached_verdict = original_screen_text(sample_config.prompt, max_new_tokens=48)
+            # Upstream allows 160 new tokens for a response whose contract is a
+            # short one-line JSON object. 64 leaves ample room for the complete
+            # verdict while avoiding a long autoregressive prepass before every
+            # OneTrainer sample.
+            cached_verdict = original_screen_text(sample_config.prompt, max_new_tokens=64)
             print(
                 "[Mage-Flow sample] prompt screening complete; "
                 f"starting {steps}-step diffusion at {width}x{height}"
             )
 
-            def cached_screen_text(_prompt, max_new_tokens=48):
+            def cached_screen_text(_prompt, max_new_tokens=64):
                 return cached_verdict
 
             official.txt_enc.screen_text = cached_screen_text
