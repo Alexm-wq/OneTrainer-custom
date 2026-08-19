@@ -4,6 +4,7 @@ import os
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 
@@ -17,11 +18,10 @@ def build_packed_attention_routing(
 ) -> dict[str, Any]:
     """Precompute Mage's packed joint-attention routing once per model forward.
 
-    Upstream Mage rebuilds these indices in every transformer block and calls
-    ``joint_lens.max().item()`` in every block. The latter synchronizes CUDA to
-    the host once per block. OneTrainer already has the image/text cu_seqlens
-    before entering the transformer, so all routing tensors can be built once
-    and reused by every block without a host synchronization.
+    Upstream Mage rebuilds these indices in every transformer block. Its SDPA
+    fallback additionally converts CUDA cu_seqlens to Python lists in every
+    block, forcing a device synchronization each time. OneTrainer builds both
+    the GPU routing and the tiny host-side sequence grouping once here instead.
     """
     img_lens = img_cu_lens[1:] - img_cu_lens[:-1]
     txt_lens = txt_cu_lens[1:] - txt_cu_lens[:-1]
@@ -48,18 +48,79 @@ def build_packed_attention_routing(
     txt_dest_indices = joint_cu_lens[txt_sample_ids] + txt_intra_pos
     img_dest_indices = joint_cu_lens[img_sample_ids] + txt_lens[img_sample_ids] + img_intra_pos
 
+    # One synchronization per complete model forward, rather than two .tolist()
+    # synchronizations in every transformer block as in Mage's SDPA fallback.
+    joint_cu_host = [int(value) for value in joint_cu_lens.detach().cpu().tolist()]
+    groups_by_length: dict[int, list[tuple[int, int]]] = {}
+    for sequence_index, (start, end) in enumerate(
+            zip(joint_cu_host[:-1], joint_cu_host[1:], strict=True)
+    ):
+        length = end - start
+        groups_by_length.setdefault(length, []).append((sequence_index, start))
+    sdpa_groups = tuple(
+        (length, tuple(entries))
+        for length, entries in groups_by_length.items()
+    )
+
     return {
         "joint_cu_lens": joint_cu_lens,
         "txt_dest_indices": txt_dest_indices,
         "img_dest_indices": img_dest_indices,
-        # flash-attn accepts an upper bound. ``image_len + padded_text_len`` is
-        # host-known and avoids materializing ``joint_lens.max().item()``.
         "max_joint_seqlen": int(max_joint_seqlen),
         "total_joint_tokens": int(img_token_count + txt_token_count),
+        "sequence_count": batch_size,
+        "sdpa_groups": sdpa_groups,
     }
 
 
-@torch.compiler.disable(reason="Mage complex RoPE + FA4/CuTe varlen kernel stay eager outside TorchDynamo")
+def _grouped_sdpa_attention(
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        routing: dict[str, Any],
+) -> Tensor:
+    """Run packed Mage attention with one SDPA call per distinct sequence length.
+
+    DPO chosen/rejected copies normally have the same prompt length, so the
+    common batch-1 DPO pair becomes one cuDNN SDPA dispatch per block. Variable
+    length batches remain exact by grouping only sequences with equal lengths.
+    """
+    sequence_count = int(routing["sequence_count"])
+    sequence_outputs: list[Tensor | None] = [None] * sequence_count
+
+    for length, entries in routing["sdpa_groups"]:
+        q_batch = torch.stack(
+            [query[start:start + length] for _, start in entries],
+            dim=0,
+        ).transpose(1, 2)
+        k_batch = torch.stack(
+            [key[start:start + length] for _, start in entries],
+            dim=0,
+        ).transpose(1, 2)
+        v_batch = torch.stack(
+            [value[start:start + length] for _, start in entries],
+            dim=0,
+        ).transpose(1, 2)
+
+        out_batch = F.scaled_dot_product_attention(
+            q_batch,
+            k_batch,
+            v_batch,
+            attn_mask=None,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=None,
+        ).transpose(1, 2)
+
+        for group_index, (sequence_index, _) in enumerate(entries):
+            sequence_outputs[sequence_index] = out_batch[group_index]
+
+    if any(output is None for output in sequence_outputs):
+        raise RuntimeError("Mage grouped SDPA failed to produce every packed sequence")
+    return torch.cat(sequence_outputs, dim=0)
+
+
+@torch.compiler.disable(reason="Mage complex RoPE and packed attention stay eager inside compiled blocks")
 def _eager_rotary_varlen_attention(
         img_query: Tensor,
         img_key: Tensor,
@@ -70,14 +131,14 @@ def _eager_rotary_varlen_attention(
         image_rotary_emb: Tensor | None,
         routing: dict[str, Any],
 ) -> tuple[Tensor, Tensor]:
-    """Run only the compile-hostile Mage RoPE/packing/FA4 region eagerly.
+    """Run only Mage's complex RoPE/packed-attention region eagerly.
 
-    The surrounding Q/K/V projections, output projections, block modulation,
-    norms, residuals and MLPs remain visible to torch.compile. Keeping this
-    small region outside Dynamo also preserves FA4/CuTe's own Python-side
-    compilation caches instead of tracing through them.
+    Q/K/V projections, output projections, modulation, norms, residuals and
+    MLPs remain inside torch.compile. For the SDPA/cuDNN backend this bypasses
+    Microsoft's per-block CUDA->host cu_seqlens conversion and Python
+    per-sequence dispatch loop.
     """
-    from mage_flow.models.modules._attn_backend import flash_attn_varlen_func
+    from mage_flow.models.modules import _attn_backend
     from mage_flow.models.modules.mage_layers import apply_rotary_emb_mageflow
 
     img_query = apply_rotary_emb_mageflow(img_query, image_rotary_emb)
@@ -112,18 +173,26 @@ def _eager_rotary_varlen_attention(
     joint_value[txt_dest_indices] = txt_value
     joint_value[img_dest_indices] = img_value
 
-    joint_attn_output = flash_attn_varlen_func(
-        joint_query,
-        joint_key,
-        joint_value,
-        cu_seqlens_q=joint_cu_lens,
-        cu_seqlens_k=joint_cu_lens,
-        max_seqlen_q=max_seqlen,
-        max_seqlen_k=max_seqlen,
-        dropout_p=0.0,
-        softmax_scale=None,
-        causal=False,
-    )
+    if getattr(_attn_backend, "_BACKEND", None) == "sdpa":
+        joint_attn_output = _grouped_sdpa_attention(
+            joint_query,
+            joint_key,
+            joint_value,
+            routing,
+        )
+    else:
+        joint_attn_output = _attn_backend.flash_attn_varlen_func(
+            joint_query,
+            joint_key,
+            joint_value,
+            cu_seqlens_q=joint_cu_lens,
+            cu_seqlens_k=joint_cu_lens,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=max_seqlen,
+            dropout_p=0.0,
+            softmax_scale=None,
+            causal=False,
+        )
 
     txt_attn_output = joint_attn_output[txt_dest_indices]
     img_attn_output = joint_attn_output[img_dest_indices]
@@ -131,15 +200,7 @@ def _eager_rotary_varlen_attention(
 
 
 class OneTrainerMageDoubleStreamAttnProcessor:
-    """Drop-in Mage double-stream processor with cached packed routing.
-
-    Numerical operations are intentionally the same as Microsoft's
-    ``MageDoubleStreamAttnProcessor``. Training supplies a routing object built
-    once by BaseMageFlowSetup. Official Mage sampling does not expose an
-    attention_kwargs hook at the pipeline level, so all transformer blocks share
-    one processor instance whose tiny fallback cache reuses routing while the
-    same cu_seqlens tensor objects remain active.
-    """
+    """Drop-in Mage double-stream processor with one routing build per forward."""
 
     def __init__(self):
         self._cached_img_cu = None
@@ -169,7 +230,6 @@ class OneTrainerMageDoubleStreamAttnProcessor:
             txt_cu_lens,
             img_token_count=img_token_count,
             txt_token_count=txt_token_count,
-            # Accepted upper bound; avoids any CUDA -> CPU reduction/sync.
             max_joint_seqlen=img_token_count + txt_token_count,
         )
         self._cached_img_cu = img_cu_lens
@@ -280,17 +340,14 @@ def install_optimized_mage_attention(transformer) -> None:
             continue
         block.attn.set_processor(shared)
         installed += 1
-    print(f"[Mage-Flow] optimized packed attention processors installed={installed} shared_cache=on")
+    print(
+        f"[Mage-Flow] optimized packed attention processors installed={installed} "
+        "shared-routing=on grouped-SDPA=on"
+    )
 
 
 def configure_mage_attention_from_config(model, config) -> str:
-    """Apply OneTrainer's Attention Mechanism selector to Mage's DiT backend.
-
-    The loader has to choose a provisional backend before TrainConfig is
-    attached. This function runs during setup_model, after config is available,
-    and updates both Mage's process-global backend and the mutable restore state
-    used by packed Qwen forwards.
-    """
+    """Apply OneTrainer's Attention Mechanism selector to Mage's DiT backend."""
     from modules.util.enum.AttentionMechanism import AttentionMechanism
     from mage_flow.models.modules._attn_backend import set_attn_backend
 
@@ -311,9 +368,6 @@ def configure_mage_attention_from_config(model, config) -> str:
         selected = "flash4"
         source = "Attention Mechanism=FLASH"
     else:
-        # Mage's packed shim has no separate cuDNN implementation. CUDNN uses
-        # torch SDPA with cuDNN SDPA enabled; SDP uses the same shim with the
-        # generic trainer's conservative cuDNN-disable behavior.
         selected = "sdpa"
         source = f"Attention Mechanism={mechanism}"
 
@@ -328,5 +382,6 @@ def configure_mage_attention_from_config(model, config) -> str:
     if state is not None:
         state["dit"] = selected
 
-    print(f"[Mage-Flow] {source} -> DiT packed backend={selected}")
+    extra = " grouped-varlen=on" if selected == "sdpa" else ""
+    print(f"[Mage-Flow] {source} -> DiT packed backend={selected}{extra}")
     return selected
