@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from abc import ABCMeta
 from random import Random
+import time
 
 import modules.util.multi_gpu_util as multi
 from modules.model.MageFlowModel import MageFlowModel
@@ -11,6 +12,10 @@ from modules.modelSetup.mixin.ModelSetupDiffusionLossMixin import ModelSetupDiff
 from modules.modelSetup.mixin.ModelSetupFlowMatchingMixin import ModelSetupFlowMatchingMixin
 from modules.modelSetup.mixin.ModelSetupNoiseMixin import ModelSetupNoiseMixin
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
+from modules.module.MageFlowAttention import (
+    build_packed_attention_routing,
+    install_optimized_mage_attention,
+)
 from modules.module.MageFlowSelfFlow import mage_flow_forward, structural_alignment_loss
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
@@ -40,6 +45,51 @@ class BaseMageFlowSetup(
         "full": [],
     }
 
+    def __init__(
+            self,
+            train_device: torch.device,
+            temp_device: torch.device,
+            debug_mode: bool,
+    ):
+        super().__init__(
+            train_device=train_device,
+            temp_device=temp_device,
+            debug_mode=debug_mode,
+        )
+        self._self_flow_metric_sums: dict[str, float] = {}
+        self._self_flow_metric_counts: dict[str, int] = {}
+        self._self_flow_cuda_timers: dict[str, list[tuple[torch.cuda.Event, torch.cuda.Event]]] = {}
+        self._self_flow_student_timer = None
+
+    def _record_self_flow_metric(self, name: str, value: float):
+        self._self_flow_metric_sums[name] = self._self_flow_metric_sums.get(name, 0.0) + float(value)
+        self._self_flow_metric_counts[name] = self._self_flow_metric_counts.get(name, 0) + 1
+
+    def _start_self_flow_timer(self):
+        if self.train_device.type == "cuda" and torch.cuda.is_available():
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return ("cuda", event)
+        return ("cpu", time.perf_counter())
+
+    def _finish_self_flow_timer(self, name: str, timer):
+        if timer is None:
+            return
+        timer_type, start = timer
+        if timer_type == "cuda":
+            end = torch.cuda.Event(enable_timing=True)
+            end.record()
+            self._self_flow_cuda_timers.setdefault(name, []).append((start, end))
+        else:
+            self._record_self_flow_metric(name, (time.perf_counter() - start) * 1000.0)
+
+    def _resolve_self_flow_cuda_timers(self):
+        for name, timers in self._self_flow_cuda_timers.items():
+            for start, end in timers:
+                end.synchronize()
+                self._record_self_flow_metric(name, start.elapsed_time(end))
+        self._self_flow_cuda_timers.clear()
+
     def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
         model.transformer.checkpoint = bool(config.transformer.gradient_checkpointing)
         if model.text_encoder is not None and config.text_encoder.gradient_checkpointing:
@@ -66,13 +116,40 @@ class BaseMageFlowSetup(
         quantize_layers(model.vae, self.train_device, model.train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
 
+        # Upstream Mage rebuilds packed routing and synchronizes max sequence
+        # length in every block. Install the OneTrainer processor before the
+        # first forward so routing is built once per packed model invocation.
+        install_optimized_mage_attention(model.transformer)
+
+        # Mage previously ignored OneTrainer's Compile toggle entirely. Compile
+        # the native block forward in-place and also compile the dedicated
+        # dual-timestep Self-Flow block function. Do not require fullgraph: the
+        # selected FlashAttention/CuTe backend is an external custom kernel and
+        # is allowed to remain a graph boundary.
+        import modules.module.MageFlowSelfFlow as mage_self_flow
+        if not hasattr(mage_self_flow, "_ot_uncompiled_split_block_forward"):
+            mage_self_flow._ot_uncompiled_split_block_forward = mage_self_flow._split_block_forward
+        if config.compile:
+            for block in model.transformer.transformer_blocks:
+                block.compile(dynamic=True)
+            mage_self_flow._split_block_forward = torch.compile(
+                mage_self_flow._ot_uncompiled_split_block_forward,
+                dynamic=True,
+            )
+            print(
+                f"[Mage-Flow] torch.compile enabled for "
+                f"{len(model.transformer.transformer_blocks)} transformer blocks + Self-Flow block path"
+            )
+        else:
+            mage_self_flow._split_block_forward = mage_self_flow._ot_uncompiled_split_block_forward
+
     @staticmethod
     def _flat_sigma(sigma: Tensor, batch_size: int) -> Tensor:
         return sigma.reshape(batch_size, -1)[:, 0]
 
     @staticmethod
     def _image_shapes(batch_size: int, height: int, width: int):
-        return [[(1, int(height), int(width))] for _ in range(batch_size)]
+        return [[(1, int(height), int(width)) for _ in range(batch_size)]]
 
     def _encode_conditioning(
             self,
@@ -103,7 +180,17 @@ class BaseMageFlowSetup(
     def _packed_inputs(self, model: MageFlowModel, latent_tokens: Tensor, text: Tensor, text_mask: Tensor):
         packed_img, img_cu = model.prepare_packed_images(latent_tokens)
         packed_txt, txt_cu = model.prepare_packed_text(text, text_mask)
-        return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0]
+        routing = build_packed_attention_routing(
+            img_cu,
+            txt_cu,
+            img_token_count=int(packed_img.shape[1]),
+            txt_token_count=int(packed_txt.shape[1]),
+            # Every sample has the same image-token length. The padded text
+            # width is a host-known upper bound for the longest valid prompt.
+            max_joint_seqlen=int(latent_tokens.shape[1] + text.shape[1]),
+        )
+        attention_kwargs = {"ot_packed_routing": routing}
+        return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0], attention_kwargs
 
     def _predict_normal(
             self,
@@ -135,7 +222,9 @@ class BaseMageFlowSetup(
             sigma_flat = self._flat_sigma(sigma, batch_size)
 
             tokens = model.pack_latents(noisy)
-            packed_img, packed_txt, img_cu, txt_cu, _ = self._packed_inputs(model, tokens, text, text_mask)
+            packed_img, packed_txt, img_cu, txt_cu, _, attention_kwargs = self._packed_inputs(
+                model, tokens, text, text_mask
+            )
             packed_pred = model.transformer(
                 img=packed_img.to(dtype=model.train_dtype.torch_dtype()),
                 txt=packed_txt.to(dtype=model.train_dtype.torch_dtype()),
@@ -143,6 +232,7 @@ class BaseMageFlowSetup(
                 img_shapes=self._image_shapes(batch_size, height, width),
                 img_cu_seqlens=img_cu,
                 txt_cu_seqlens=txt_cu,
+                attention_kwargs=attention_kwargs,
             )
             pred_tokens = model.unprepare_packed_images(packed_pred, batch_size)
             predicted = model.unpack_latents(pred_tokens, height, width)
@@ -172,6 +262,14 @@ class BaseMageFlowSetup(
         dpo_reference = self._dpo_reference_prediction()
         dpo_policy = self._dpo_conditioning_locked() and not dpo_reference
         training_pass = torch.is_grad_enabled() and not dpo_reference
+        if (
+            training_pass
+            and self.train_device.type == "cuda"
+            and torch.cuda.is_available()
+            and not self._self_flow_metric_sums
+            and not self._self_flow_cuda_timers
+        ):
+            torch.cuda.reset_peak_memory_stats(self.train_device)
 
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
@@ -216,13 +314,18 @@ class BaseMageFlowSetup(
             clean_sigma = torch.where(choose_t, sigma_t, sigma_s)
             teacher_tokens = torch.where(choose_t[:, None, None], t_tokens, s_tokens)
 
-            packed_student, packed_txt, img_cu, txt_cu, _ = self._packed_inputs(model, student_tokens, text, text_mask)
-            packed_teacher, _, _, _, _ = self._packed_inputs(model, teacher_tokens, text, text_mask)
+            packed_student, packed_txt, img_cu, txt_cu, _, attention_kwargs = self._packed_inputs(
+                model, student_tokens, text, text_mask
+            )
+            # Teacher image tokens have identical packed shape/cu_seqlens. Do
+            # not repack text or rebuild routing for the second forward.
+            packed_teacher, _ = model.prepare_packed_images(teacher_tokens)
             shapes = self._image_shapes(batch_size, height, width)
 
             teacher_feature = None
             if not dpo_reference:
                 with model.self_flow_ema.teacher_parameters(model.self_flow_adapter_modules()):
+                    teacher_timer = self._start_self_flow_timer() if training_pass else None
                     with torch.inference_mode():
                         teacher_out = mage_flow_forward(
                             transformer=model.transformer,
@@ -234,12 +337,19 @@ class BaseMageFlowSetup(
                             img_cu_seqlens=img_cu,
                             txt_cu_seqlens=txt_cu,
                             stop_layer=model.self_flow_teacher_layer,
+                            attention_kwargs=attention_kwargs,
                         )
+                    self._finish_self_flow_timer("performance/teacher_forward_ms", teacher_timer)
                     if teacher_out.feature is None:
                         raise RuntimeError("Mage Self-Flow teacher feature is missing")
                     teacher_feature = teacher_out.feature.detach().clone()
                 if config.self_flow_teacher_target_offload:
                     teacher_feature = teacher_feature.cpu()
+
+                if training_pass:
+                    if self._self_flow_student_timer is not None:
+                        raise RuntimeError("A previous Mage Self-Flow student timer was not completed by backward")
+                    self._self_flow_student_timer = self._start_self_flow_timer()
 
             student_out = mage_flow_forward(
                 transformer=model.transformer,
@@ -251,6 +361,7 @@ class BaseMageFlowSetup(
                 img_cu_seqlens=img_cu,
                 txt_cu_seqlens=txt_cu,
                 capture_layer=None if dpo_reference else model.self_flow_student_layer,
+                attention_kwargs=attention_kwargs,
             )
 
             representation_loss = None
@@ -267,9 +378,11 @@ class BaseMageFlowSetup(
                 cosine = F.cosine_similarity(projected.float(), teacher_feature.float(), dim=-1).mean(dim=1)
                 representation_loss = 1.0 - cosine
                 if config.self_flow_structural_enabled:
+                    structural_timer = self._start_self_flow_timer() if training_pass else None
                     structural = structural_alignment_loss(
                         projected, teacher_feature, sample_count=config.self_flow_structural_tokens
                     )
+                    self._finish_self_flow_timer("performance/structural_loss_ms", structural_timer)
 
             pred_tokens = model.unprepare_packed_images(student_out.predicted, batch_size)
             predicted = model.unpack_latents(pred_tokens, height, width)
@@ -288,6 +401,12 @@ class BaseMageFlowSetup(
                 data['self_flow_structural_loss_per_sample'] = structural
             if config.loss_weight_fn == LossWeight.SIGMA:
                 data['element_loss_weight'] = token_sigma.reshape(batch_size, 1, height, width)
+
+            if training_pass:
+                self._record_self_flow_metric("self_flow/t_mean", sigma_t.detach().float().mean().item())
+                self._record_self_flow_metric("self_flow/s_mean", sigma_s.detach().float().mean().item())
+                self._record_self_flow_metric("self_flow/clean_t_mean", clean_sigma.detach().float().mean().item())
+                self._record_self_flow_metric("self_flow/mask_ratio_actual", token_mask.detach().float().mean().item())
             return data
 
     def predict(
@@ -338,15 +457,26 @@ class BaseMageFlowSetup(
     ) -> Tensor | None:
         if not config.self_flow_enabled or not data.get('self_flow_dpo_policy', False):
             return None
-        rep = data.get('self_flow_representation_loss_per_sample')
-        if rep is None:
+        rep_per_sample = data.get('self_flow_representation_loss_per_sample')
+        if rep_per_sample is None:
             raise RuntimeError("Mage Self-Flow DPO policy forward is missing representation loss")
-        result = config.self_flow_rep_weight * rep.mean()
+        rep = rep_per_sample.mean()
+        result = config.self_flow_rep_weight * rep
+        structural = None
         if config.self_flow_structural_enabled:
-            structural = data.get('self_flow_structural_loss_per_sample')
-            if structural is None:
+            structural_per_sample = data.get('self_flow_structural_loss_per_sample')
+            if structural_per_sample is None:
                 raise RuntimeError("Mage structural Self-Flow DPO forward is missing structural loss")
-            result = result + config.self_flow_structural_weight * structural.mean()
+            structural = structural_per_sample.mean()
+            result = result + config.self_flow_structural_weight * structural
+        if data.get('self_flow_training_pass', False):
+            self._record_self_flow_metric("loss/self_flow_rep", rep.detach().item())
+            if structural is not None:
+                self._record_self_flow_metric("loss/self_flow_structural", structural.detach().item())
+            self._record_self_flow_metric(
+                "self_flow/cosine_similarity",
+                data['self_flow_cosine_similarity_per_sample'].detach().mean().item(),
+            )
         return result
 
     def calculate_loss(
@@ -366,17 +496,87 @@ class BaseMageFlowSetup(
         if not config.self_flow_enabled or data.get('self_flow_bypassed_for_dpo', False):
             return generation
         if data.get('self_flow_dpo_policy', False):
+            if data.get('self_flow_training_pass', False):
+                self._record_self_flow_metric("loss/generation", generation.detach().item())
             return generation
-        rep = data.get('self_flow_representation_loss_per_sample')
-        if rep is None:
+
+        rep_per_sample = data.get('self_flow_representation_loss_per_sample')
+        if rep_per_sample is None:
             raise RuntimeError("Mage Self-Flow prediction is missing representation loss")
-        total = generation + config.self_flow_rep_weight * rep.mean()
+        rep = rep_per_sample.mean()
+        total = generation + config.self_flow_rep_weight * rep
+        structural = None
         if config.self_flow_structural_enabled:
-            structural = data.get('self_flow_structural_loss_per_sample')
-            if structural is None:
+            structural_per_sample = data.get('self_flow_structural_loss_per_sample')
+            if structural_per_sample is None:
                 raise RuntimeError("Mage structural Self-Flow prediction is missing structural loss")
-            total = total + config.self_flow_structural_weight * structural.mean()
+            structural = structural_per_sample.mean()
+            total = total + config.self_flow_structural_weight * structural
+
+        if data.get('self_flow_training_pass', False):
+            self._record_self_flow_metric("loss/generation", generation.detach().item())
+            self._record_self_flow_metric("loss/self_flow_rep", rep.detach().item())
+            if structural is not None:
+                self._record_self_flow_metric("loss/self_flow_structural", structural.detach().item())
+            self._record_self_flow_metric("loss/total", total.detach().item())
+            self._record_self_flow_metric(
+                "self_flow/cosine_similarity",
+                data['self_flow_cosine_similarity_per_sample'].detach().mean().item(),
+            )
         return total
+
+    def after_backward(
+            self,
+            model: MageFlowModel,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+    ):
+        if config.self_flow_enabled and self._self_flow_student_timer is not None:
+            self._finish_self_flow_timer(
+                "performance/student_forward_backward_ms",
+                self._self_flow_student_timer,
+            )
+            self._self_flow_student_timer = None
+
+    def after_streamed_dpo_branch_backward(
+            self,
+            model: MageFlowModel,
+            config: TrainConfig,
+            train_progress: TrainProgress,
+    ):
+        self.after_backward(model, config, train_progress)
+
+    def report_to_tensorboard(
+            self,
+            model: MageFlowModel,
+            config: TrainConfig,
+            scheduler,
+            tensorboard,
+    ):
+        super().report_to_tensorboard(model, config, scheduler, tensorboard)
+        if not config.self_flow_enabled:
+            return
+
+        self._resolve_self_flow_cuda_timers()
+        for name, total in self._self_flow_metric_sums.items():
+            count = self._self_flow_metric_counts.get(name, 0)
+            if count > 0:
+                tensorboard.add_scalar(name, total / count, model.train_progress.global_step)
+
+        if self.train_device.type == "cuda" and torch.cuda.is_available():
+            tensorboard.add_scalar(
+                "performance/peak_vram_allocated_mb",
+                torch.cuda.max_memory_allocated(self.train_device) / (1024 ** 2),
+                model.train_progress.global_step,
+            )
+            tensorboard.add_scalar(
+                "performance/peak_vram_reserved_mb",
+                torch.cuda.max_memory_reserved(self.train_device) / (1024 ** 2),
+                model.train_progress.global_step,
+            )
+
+        self._self_flow_metric_sums.clear()
+        self._self_flow_metric_counts.clear()
 
     def prepare_text_caching(self, model: MageFlowModel, config: TrainConfig):
         model.to(self.temp_device)
