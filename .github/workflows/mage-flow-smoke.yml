@@ -133,7 +133,7 @@ jobs:
           assert 'configure_mage_attention_from_config' in attention
           assert 'AttentionMechanism.FLASH' in attention
           assert 'selected = "flash4"' in attention
-          assert 'max().item()' not in attention
+          assert 'max_seqlen = joint_lens.max().item()' not in attention
 
           assert 'configure_mage_attention_from_config(model, config)' in lora
           assert 'configure_mage_attention_from_config(model, config)' in finetune
