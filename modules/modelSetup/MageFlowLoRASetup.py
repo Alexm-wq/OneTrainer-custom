@@ -4,6 +4,7 @@ from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
+from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
 from modules.module.MageFlowSelfFlow import MageFlowSelfFlowEMA, MageFlowSelfFlowProjector
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
@@ -24,6 +25,19 @@ class MageFlowLoRASetup(BaseMageFlowSetup):
     @staticmethod
     def _image_shapes(batch_size: int, height: int, width: int):
         return MageFlowModel.image_shapes(batch_size, height, width)
+
+    def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
+        # BaseMageFlowSetup originally grew its own block.compile(dynamic=True)
+        # experiment. Do not run it. Let the shared OneTrainer checkpoint/compile
+        # machinery own Mage exactly as it already owns Flux2.
+        requested_compile = bool(config.compile)
+        config.compile = False
+        try:
+            super().setup_optimizations(model, config)
+        finally:
+            config.compile = requested_compile
+
+        setup_mage_like_flux2(self, model, config)
 
     @staticmethod
     def _validate_self_flow(model: MageFlowModel, config: TrainConfig):
