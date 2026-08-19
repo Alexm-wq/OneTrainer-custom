@@ -145,7 +145,7 @@ def _install_mage_compile_boundaries() -> None:
 
 
 def _install_self_flow_block_dispatch() -> None:
-    """Route Mage Self-Flow through the same wrapped blocks as normal training."""
+    """Route Mage Self-Flow through compiled blocks only when gradients are needed."""
 
     def wrapped_block_forward(
             block,
@@ -158,7 +158,21 @@ def _install_self_flow_block_dispatch() -> None:
             img_cu_lens,
             joint_attention_kwargs=None,
     ):
-        return block(
+        # Mage's FA4/CuTe eager boundary is stable in the ordinary eager block,
+        # but running a no-grad/inference forward through a torch.compile'd
+        # CheckpointLayer has produced device-side illegal accesses on the
+        # Self-Flow teacher and Linear-DPO reference paths. Those paths do not
+        # need checkpointing or Inductor at all, so unwrap the OT wrapper and
+        # call the original Mage block directly. The trainable student/policy
+        # path keeps gradients enabled and therefore still uses the compiled
+        # CheckpointLayer below.
+        dispatch_block = block
+        if not torch.is_grad_enabled() and isinstance(block, BaseCheckpointLayer):
+            eager_block = getattr(block, "checkpoint", None)
+            if eager_block is not None:
+                dispatch_block = eager_block
+
+        return dispatch_block(
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb=None,
@@ -245,5 +259,5 @@ def setup_mage_like_flux2(setup, model, config) -> None:
     print(
         "[Mage-Flow] transformer blocks use OneTrainer CheckpointLayer "
         f"(checkpoint={config.transformer.checkpointing_enabled()}, "
-        f"compile={bool(config.compile)}, exact-FA4-varlen, Mage RoPE/FA4 eager)"
+        f"compile={bool(config.compile)}, exact-FA4-varlen, no-grad=eager, Mage RoPE/FA4 eager)"
     )
