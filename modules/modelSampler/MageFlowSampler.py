@@ -42,13 +42,39 @@ class MageFlowSampler(BaseModelSampler):
         seed = -1 if sample_config.random_seed else int(sample_config.seed)
         height = self.quantize_resolution(sample_config.height, 16)
         width = self.quantize_resolution(sample_config.width, 16)
+        steps = int(sample_config.diffusion_steps)
+
+        # Microsoft's top-level generate_images() always runs an autoregressive
+        # Qwen policy-screening generate() before diffusion. On a quantized
+        # Qwen3-VL this can otherwise look like a frozen sampler because the
+        # diffusion progress bar has not started yet. Run it explicitly with a
+        # bounded response length, report the phase, and feed the cached verdict
+        # back to generate_images so the expensive prepass is not repeated.
+        original_screen_text = official.txt_enc.screen_text
+        cached_verdict = None
         try:
+            print("[Mage-Flow sample] Qwen prompt screening...")
+            on_update_progress(0, steps)
+            cached_verdict = original_screen_text(sample_config.prompt, max_new_tokens=48)
+            print(
+                "[Mage-Flow sample] prompt screening complete; "
+                f"starting {steps}-step diffusion at {width}x{height}"
+            )
+
+            def cached_screen_text(_prompt, max_new_tokens=48):
+                return cached_verdict
+
+            official.txt_enc.screen_text = cached_screen_text
+
+            # TextEncoder.forward is wrapped by the Mage loader to temporarily
+            # use packed SDPA; it restores model.mage_attention_backend before
+            # the first DiT denoising call, so FA4 remains active for sampling.
             images = generate_images(
                 official,
                 prompts=[sample_config.prompt],
                 neg_prompts=[sample_config.negative_prompt or " "],
                 seeds=[seed],
-                steps=int(sample_config.diffusion_steps),
+                steps=steps,
                 cfg=float(sample_config.cfg_scale),
                 heights=[height],
                 widths=[width],
@@ -57,9 +83,10 @@ class MageFlowSampler(BaseModelSampler):
                 static_shift=None,
                 batch_cfg=True,
             )
-            on_update_progress(int(sample_config.diffusion_steps), int(sample_config.diffusion_steps))
+            on_update_progress(steps, steps)
             return ModelSamplerOutput(FileType.IMAGE, images[0])
         finally:
+            official.txt_enc.screen_text = original_screen_text
             self.model.to(self.temp_device)
             torch_gc()
 
