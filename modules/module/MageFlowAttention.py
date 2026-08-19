@@ -6,6 +6,10 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+
+_FORCE_CUDNN_SDPA = False
 
 
 def build_packed_attention_routing(
@@ -73,6 +77,31 @@ def build_packed_attention_routing(
     }
 
 
+def _run_sdpa(query: Tensor, key: Tensor, value: Tensor) -> Tensor:
+    if _FORCE_CUDNN_SDPA:
+        # The CUDNN UI option means exactly that for Mage. Do not leave Flash,
+        # efficient attention, or math enabled as silent dispatcher fallbacks.
+        with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):
+            return F.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                attn_mask=None,
+                dropout_p=0.0,
+                is_causal=False,
+                scale=None,
+            )
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+        scale=None,
+    )
+
+
 def _grouped_sdpa_attention(
         query: Tensor,
         key: Tensor,
@@ -102,15 +131,7 @@ def _grouped_sdpa_attention(
             dim=0,
         ).transpose(1, 2)
 
-        out_batch = F.scaled_dot_product_attention(
-            q_batch,
-            k_batch,
-            v_batch,
-            attn_mask=None,
-            dropout_p=0.0,
-            is_causal=False,
-            scale=None,
-        ).transpose(1, 2)
+        out_batch = _run_sdpa(q_batch, k_batch, v_batch).transpose(1, 2)
 
         for group_index, (sequence_index, _) in enumerate(entries):
             sequence_outputs[sequence_index] = out_batch[group_index]
@@ -351,6 +372,8 @@ def configure_mage_attention_from_config(model, config) -> str:
     from modules.util.enum.AttentionMechanism import AttentionMechanism
     from mage_flow.models.modules._attn_backend import set_attn_backend
 
+    global _FORCE_CUDNN_SDPA
+
     explicit = os.environ.get("OT_MAGE_ATTN_BACKEND", "").strip().lower()
     mechanism = config.attention_mechanism
 
@@ -371,10 +394,11 @@ def configure_mage_attention_from_config(model, config) -> str:
         selected = "sdpa"
         source = f"Attention Mechanism={mechanism}"
 
+    _FORCE_CUDNN_SDPA = bool(
+        mechanism == AttentionMechanism.CUDNN and selected == "sdpa"
+    )
     if torch.cuda.is_available():
-        torch.backends.cuda.enable_cudnn_sdp(
-            mechanism == AttentionMechanism.CUDNN and selected == "sdpa"
-        )
+        torch.backends.cuda.enable_cudnn_sdp(_FORCE_CUDNN_SDPA)
 
     set_attn_backend(selected)
     model.mage_attention_backend = selected
@@ -382,6 +406,11 @@ def configure_mage_attention_from_config(model, config) -> str:
     if state is not None:
         state["dit"] = selected
 
-    extra = " grouped-varlen=on" if selected == "sdpa" else ""
+    if _FORCE_CUDNN_SDPA:
+        extra = " grouped-varlen=on cudnn-forced=on"
+    elif selected == "sdpa":
+        extra = " grouped-varlen=on"
+    else:
+        extra = ""
     print(f"[Mage-Flow] {source} -> DiT packed backend={selected}{extra}")
     return selected
