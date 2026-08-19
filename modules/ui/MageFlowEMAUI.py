@@ -1,9 +1,22 @@
 from __future__ import annotations
 
 
+def _controller_config(controller):
+    """Return the TrainConfig exposed by either OneTrainer tab-controller shape."""
+    config = getattr(controller, "config", None)
+    if config is None:
+        config = getattr(controller, "train_config", None)
+    if config is None:
+        raise AttributeError(
+            f"{type(controller).__name__} exposes neither 'config' nor 'train_config'"
+        )
+    return config
+
+
 def add_mage_self_flow_ema_controls(components, master, row, controller, ui_state):
     """Add Mage-only Self-Flow EMA residency controls to the Training tab."""
-    if not controller.config.model_type.is_mage_flow():
+    config = _controller_config(controller)
+    if not config.model_type.is_mage_flow():
         return None
 
     frame = components.section_frame(master, row)
@@ -37,7 +50,8 @@ def add_mage_self_flow_ema_controls(components, master, row, controller, ui_stat
 
 def add_mage_linear_dpo_ema_controls(components, master, row, controller, ui_state):
     """Add Mage-only Linear-DPO EMA residency controls to the RLHF tab."""
-    if not controller.config.model_type.is_mage_flow():
+    config = _controller_config(controller)
+    if not config.model_type.is_mage_flow():
         return None
 
     frame = components.section_frame(master, row)
