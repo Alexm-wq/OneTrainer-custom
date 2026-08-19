@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import io
 import os
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 
 from modules.module.MageFlowSelfFlow import MageFlowSelfFlowEMA
 from modules.util.enum.DPORefMode import DPORefMode
@@ -15,32 +16,92 @@ _TRUE_VALUES = {"1", "true", "yes", "on", "gpu", "cuda"}
 _FALSE_VALUES = {"0", "false", "no", "off", "cpu", "host"}
 
 
-def _read_gpu_choice(config, config_attr: str, env_name: str) -> bool:
-    """Resolve an opt-in GPU EMA setting without breaking older TrainConfig files."""
-    configured = getattr(config, config_attr, None)
-    if configured is not None:
-        if isinstance(configured, str):
-            value = configured.strip().lower()
-            if value in _TRUE_VALUES:
-                return True
-            if value in _FALSE_VALUES:
-                return False
-            raise ValueError(
-                f"{config_attr} must select CPU or GPU, got {configured!r}"
-            )
-        return bool(configured)
-
-    raw = os.environ.get(env_name)
-    if raw is None:
-        raw = os.environ.get("OT_MAGE_EMA_DEVICE", "cpu")
-    value = raw.strip().lower()
-    if value in _TRUE_VALUES:
+def _parse_gpu_choice(value: str, source: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
         return True
-    if value in _FALSE_VALUES:
+    if normalized in _FALSE_VALUES:
         return False
     raise ValueError(
-        f"{env_name}/OT_MAGE_EMA_DEVICE must be one of "
-        "cpu, gpu, false, true, 0, or 1"
+        f"{source} must be one of cpu, gpu, false, true, 0, or 1"
+    )
+
+
+def _read_gpu_choice(config, config_attr: str, env_name: str) -> bool:
+    """Resolve EMA residency, with explicit environment overrides taking priority."""
+    raw = os.environ.get(env_name)
+    source = env_name
+    if raw is None:
+        raw = os.environ.get("OT_MAGE_EMA_DEVICE")
+        source = "OT_MAGE_EMA_DEVICE"
+    if raw is not None:
+        return _parse_gpu_choice(raw, source)
+
+    configured = getattr(config, config_attr, None)
+    if configured is None:
+        return False
+    if isinstance(configured, str):
+        return _parse_gpu_choice(configured, config_attr)
+    return bool(configured)
+
+
+def _module_device(module) -> str:
+    if module is None:
+        return "absent"
+    try:
+        parameter = next(module.parameters())
+    except (StopIteration, AttributeError):
+        return "no-parameters"
+    return f"{parameter.device}/{str(parameter.dtype).removeprefix('torch.')}"
+
+
+def _first_nested_tensor_device(groups) -> str:
+    if groups is None:
+        return "not-initialized"
+    for group in groups:
+        for tensor in group:
+            return f"{tensor.device}/{str(tensor.dtype).removeprefix('torch.')}"
+    return "empty"
+
+
+def log_mage_runtime_devices(setup, model, config, *, phase: str) -> None:
+    """Print actual live residency after setup/reference relocation has completed."""
+    self_flow_ema = getattr(model, "self_flow_ema", None)
+    if self_flow_ema is None:
+        self_flow_ema_device = "disabled"
+        self_flow_shadow_device = "disabled"
+    else:
+        ema_parameters = getattr(self_flow_ema, "ema_parameters", [])
+        student_parameters = getattr(self_flow_ema, "student_parameters", [])
+        self_flow_ema_device = (
+            f"{ema_parameters[0].device}/{str(ema_parameters[0].dtype).removeprefix('torch.')}"
+            if ema_parameters else "empty"
+        )
+        self_flow_shadow_device = (
+            f"{student_parameters[0].device}/{str(student_parameters[0].dtype).removeprefix('torch.')}"
+            if student_parameters else "empty"
+        )
+
+    dpo_ema = _first_nested_tensor_device(
+        getattr(setup, "_dpo_ema_ref_params_cpu", None)
+    )
+    dpo_stash = _first_nested_tensor_device(
+        getattr(setup, "_dpo_ema_policy_cpu_buffers", None)
+    )
+
+    print(f"[Mage-Flow devices] {phase}")
+    print(f"  transformer:       {_module_device(getattr(model, 'transformer', None))}")
+    print(f"  LoRA adapter:      {_module_device(getattr(model, 'transformer_lora', None))}")
+    print(f"  text encoder:      {_module_device(getattr(model, 'text_encoder', None))}")
+    print(f"  VAE:               {_module_device(getattr(model, 'vae', None))}")
+    print(f"  Self-Flow EMA:     {self_flow_ema_device}")
+    print(f"  Self-Flow shadow:  {self_flow_shadow_device}")
+    print(f"  Linear-DPO EMA:    {dpo_ema}")
+    print(f"  Linear-DPO stash:  {dpo_stash}")
+    print(
+        "  requested:         "
+        f"self-flow={'GPU' if _read_gpu_choice(config, 'self_flow_ema_on_gpu', 'OT_MAGE_SELF_FLOW_EMA_DEVICE') else 'CPU'}, "
+        f"linear-dpo={'GPU' if _read_gpu_choice(config, 'rlhf_dpo_linear_ema_on_gpu', 'OT_MAGE_LINEAR_DPO_EMA_DEVICE') else 'CPU'}"
     )
 
 
@@ -83,17 +144,15 @@ class MageFlowSelfFlowDeviceEMA(MageFlowSelfFlowEMA):
         super().__init__(modules, decay=decay, state_dict=state_dict)
 
     def _cpu_copy(self, parameter: Tensor) -> Tensor:
-        # Base MageFlowSelfFlowEMA deliberately routes all persistent storage
-        # through _cpu_copy(). Override that storage primitive only; the teacher
-        # swap/update semantics remain identical while all copies stay on CUDA.
+        # Base MageFlowSelfFlowEMA routes persistent storage through this helper.
+        # Override the storage primitive only; swap/update semantics stay intact.
         return parameter.detach().to(
             device=self.storage_device,
             dtype=torch.float32,
         ).clone()
 
     def state_dict(self) -> dict:
-        # Keep checkpoint payloads device-agnostic and backward-compatible even
-        # when the live EMA is GPU-resident.
+        # Backups remain device-agnostic even with a live CUDA EMA.
         return {
             "decay": self.decay,
             "optimization_steps": self.optimization_steps,
@@ -168,15 +227,7 @@ def create_mage_self_flow_ema(
 
 
 class MageFlowLinearDPOGPUReferenceMixin:
-    """Optional CUDA-resident Linear-DPO EMA for Mage LoRA training.
-
-    The generic OneTrainer implementation remains the CPU-offloaded default.
-    When GPU storage is requested, only the EMA_ADAPTER path is specialized:
-    EMA tensors are float32 CUDA tensors and reusable policy stashes stay on
-    the same CUDA device in the adapter's native dtype. Backup serialization is
-    still handled by BaseModelSetup.save_dpo_reference(), which explicitly
-    writes CPU tensors.
-    """
+    """Optional CUDA-resident Linear-DPO EMA for Mage LoRA training."""
 
     @staticmethod
     def _mage_linear_dpo_gpu_requested(config) -> bool:
@@ -194,19 +245,48 @@ class MageFlowLinearDPOGPUReferenceMixin:
             force_existing_adapter: bool = False,
             force_cpu_existing_adapter: bool = False,
     ):
-        result = super().initialize_dpo_reference(
-            model,
-            config,
-            snapshot_path,
-            force_existing_adapter=force_existing_adapter,
-            force_cpu_existing_adapter=force_cpu_existing_adapter,
+        gpu_ema = (
+            DPORefMode(config.effective_dpo_ref_mode()) == DPORefMode.EMA_ADAPTER
+            and self._mage_linear_dpo_gpu_requested(config)
         )
 
-        if (
-            DPORefMode(config.effective_dpo_ref_mode())
-            != DPORefMode.EMA_ADAPTER
-            or not self._mage_linear_dpo_gpu_requested(config)
-        ):
+        # The generic loader intentionally deserializes reference checkpoints on
+        # CPU first. In GPU mode that is only staging, not the final runtime
+        # residency. Rewrite that one diagnostic so it cannot falsely claim the
+        # active EMA remains on CPU.
+        if gpu_ema:
+            captured = io.StringIO()
+            with redirect_stdout(captured):
+                result = super().initialize_dpo_reference(
+                    model,
+                    config,
+                    snapshot_path,
+                    force_existing_adapter=force_existing_adapter,
+                    force_cpu_existing_adapter=force_cpu_existing_adapter,
+                )
+            for line in captured.getvalue().splitlines():
+                if "restored DPO reference from" in line and "CPU fp32 EMA" in line:
+                    line = line.replace(
+                        "CPU fp32 EMA",
+                        "CPU fp32 checkpoint staging for EMA",
+                    )
+                print(line)
+        else:
+            result = super().initialize_dpo_reference(
+                model,
+                config,
+                snapshot_path,
+                force_existing_adapter=force_existing_adapter,
+                force_cpu_existing_adapter=force_cpu_existing_adapter,
+            )
+
+        if not gpu_ema:
+            log_mage_runtime_devices(
+                self,
+                model,
+                config,
+                phase="DPO reference initialized (final runtime residency)",
+            )
             return result
 
         references = self._dpo_ema_ref_params_cpu
@@ -254,9 +334,6 @@ class MageFlowLinearDPOGPUReferenceMixin:
                         dtype=torch.float32,
                     ).clone()
                 )
-                # Policy restore buffers do not need FP32. Keeping the live
-                # adapter dtype cuts their persistent VRAM footprint while
-                # preserving an exact round trip of the policy parameters.
                 gpu_buffer_group.append(
                     torch.empty_like(
                         parameter,
@@ -268,16 +345,21 @@ class MageFlowLinearDPOGPUReferenceMixin:
             gpu_references.append(gpu_ref_group)
             gpu_policy_buffers.append(gpu_buffer_group)
 
-        # Keep the legacy attribute names so BaseModelSetup checkpoint code and
-        # old backups remain compatible; in this opt-in mode their tensors live
-        # on CUDA rather than CPU.
+        # Retain legacy attribute names for generic backup compatibility; their
+        # tensors are CUDA-resident in this mode despite the historical suffix.
         self._dpo_ema_ref_params_cpu = gpu_references
         self._dpo_ema_policy_cpu_buffers = gpu_policy_buffers
 
         first_device = gpu_references[0][0].device if gpu_references and gpu_references[0] else "cuda"
         print(
-            "[OT-RLHF] Linear-DPO EMA storage=GPU FP32 "
+            "[OT-RLHF] Linear-DPO EMA active runtime storage=GPU FP32 "
             f"({first_device}); policy stash remains on-device"
+        )
+        log_mage_runtime_devices(
+            self,
+            model,
+            config,
+            phase="DPO reference initialized (final runtime residency)",
         )
         return result
 
@@ -331,9 +413,6 @@ class MageFlowLinearDPOGPUReferenceMixin:
                         f"EMA={ema_parameter.device}, policy={parameter.device}."
                     )
 
-                # add_ accepts the live adapter dtype and accumulates into the
-                # FP32 EMA tensor, so this stays entirely on the GPU without an
-                # intermediate FP32 allocation.
                 ema_parameter.mul_(decay).add_(
                     parameter.detach(),
                     alpha=one_minus_decay,
