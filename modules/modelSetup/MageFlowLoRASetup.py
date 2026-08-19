@@ -2,6 +2,7 @@ import modules.util.multi_gpu_util as multi
 from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
 from modules.module.MageFlowEMAStorage import (
@@ -23,7 +24,11 @@ import torch
 
 
 @factory.register(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA)
-class MageFlowLoRASetup(MageFlowLinearDPOGPUReferenceMixin, BaseMageFlowSetup):
+class MageFlowLoRASetup(
+    AnchoredRejectChosenFloorMixin,
+    MageFlowLinearDPOGPUReferenceMixin,
+    BaseMageFlowSetup,
+):
     def __init__(self, train_device: torch.device, temp_device: torch.device, debug_mode: bool):
         super().__init__(train_device=train_device, temp_device=temp_device, debug_mode=debug_mode)
 
