@@ -49,7 +49,7 @@ def add_mage_self_flow_ema_controls(components, master, row, controller, ui_stat
 
 
 def add_mage_linear_dpo_ema_controls(components, master, row, controller, ui_state):
-    """Add Mage-only Linear-DPO EMA residency controls to the RLHF tab."""
+    """Add Mage-only DPO/Self-Flow experiment and EMA residency controls."""
     config = _controller_config(controller)
     if not config.model_type.is_mage_flow():
         return None
@@ -59,10 +59,9 @@ def add_mage_linear_dpo_ema_controls(components, master, row, controller, ui_sta
         frame,
         0,
         0,
-        "Mage Linear-DPO Residency",
+        "Mage DPO / EMA",
         tooltip=(
-            "Controls where Mage's moving Linear-DPO reference and policy restore stash live. "
-            "Only affects the Linear DPO objective."
+            "Mage-specific DPO execution and Linear-DPO EMA residency controls."
         ),
         wide_tooltip=True,
     )
@@ -70,6 +69,21 @@ def add_mage_linear_dpo_ema_controls(components, master, row, controller, ui_sta
     components.label(
         frame,
         1,
+        0,
+        "DPO Pair Uses Self-Flow",
+        tooltip=(
+            "When enabled, chosen/rejected DPO policy and reference scoring use the dual-timestep Self-Flow path. "
+            "Disable this to make the entire DPO preference pair use ordinary flow matching while keeping the "
+            "separate chosen Supervised Mix forward on normal Self-Flow. This is useful for testing whether "
+            "Self-Flow reconstruction/representation pressure on rejected samples weakens preference separation."
+        ),
+        wide_tooltip=True,
+    )
+    components.switch(frame, 1, 1, ui_state, "rlhf_dpo_self_flow")
+
+    components.label(
+        frame,
+        2,
         0,
         "Linear-DPO EMA on GPU",
         tooltip=(
@@ -79,5 +93,5 @@ def add_mage_linear_dpo_ema_controls(components, master, row, controller, ui_sta
         ),
         wide_tooltip=True,
     )
-    components.switch(frame, 1, 1, ui_state, "rlhf_dpo_linear_ema_on_gpu")
+    components.switch(frame, 2, 1, ui_state, "rlhf_dpo_linear_ema_on_gpu")
     return frame
