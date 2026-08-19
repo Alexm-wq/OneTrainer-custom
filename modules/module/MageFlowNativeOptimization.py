@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+import textwrap
 from types import MethodType
 
 import torch
@@ -22,13 +24,7 @@ else:
 
 
 def _install_dual_timestep_block_forward(transformer) -> None:
-    """Make native Mage blocks accept separate image/text timestep embeddings.
-
-    FLUX.2 Self-Flow calls the transformer's already wrapped blocks directly.
-    Mage's upstream block only accepts one ``temb`` for both streams, so this is
-    the minimal architecture-specific bridge needed to let Mage use the same
-    OneTrainer CheckpointLayer for normal and Self-Flow forwards.
-    """
+    """Make native Mage blocks accept separate image/text timestep embeddings."""
 
     for block in transformer.transformer_blocks:
         if getattr(block, "_ot_mage_dual_timestep_forward", False):
@@ -69,8 +65,61 @@ def _install_dual_timestep_block_forward(transformer) -> None:
         block._ot_mage_dual_timestep_forward = True
 
 
+def _patch_upstream_mage_attention_processor_for_compile() -> None:
+    """Patch only Mage's two CUDA-scalar compile hazards.
+
+    The pinned upstream Mage processor is retained verbatim except for:
+
+    * ``joint_cu_lens[-1]`` being used as a torch.empty() shape.  This is a CUDA
+      scalar tensor and causes Dynamo's data-dependent-shape failure.  The exact
+      same value is the sum of the already-flattened text/image query lengths,
+      which is available as compile-safe SymInts.
+    * ``joint_lens.max().item()`` forcing a CUDA->CPU synchronization and a graph
+      break in every attention block.  OneTrainer supplies a host-known upper
+      bound for max_seqlen; FA varlen accepts an upper bound.
+
+    Using inspect+exec here avoids maintaining a forked copy of Microsoft's
+    attention processor.  The replacements are asserted against the pinned Mage
+    source so a future upstream change fails during setup instead of silently
+    applying the wrong patch.
+    """
+    import mage_flow.models.modules.mage_layers as mage_layers
+
+    if getattr(mage_layers, "_ot_compile_safe_processor_installed", False):
+        return
+
+    cls = mage_layers.MageDoubleStreamAttnProcessor
+    source = textwrap.dedent(inspect.getsource(cls.__call__))
+
+    old_total = "    total_tokens = joint_cu_lens[-1]\n"
+    new_total = "    total_tokens = txt_query.shape[0] + img_query.shape[0]\n"
+    old_max = "    max_seqlen = joint_lens.max().item()\n"
+    new_max = (
+        "    max_seqlen = kwargs.pop(\"ot_max_joint_seqlen\", None)\n"
+        "    if max_seqlen is None:\n"
+        "        max_seqlen = txt_query.shape[0] + img_query.shape[0]\n"
+    )
+
+    if source.count(old_total) != 1 or source.count(old_max) != 1:
+        raise RuntimeError(
+            "Pinned Mage attention source no longer matches the compile-safety patch; "
+            "refusing to guess."
+        )
+
+    source = source.replace(old_total, new_total, 1).replace(old_max, new_max, 1)
+
+    # Execute in Mage's real module globals so the patched method continues to
+    # resolve the backend/RoPE symbols from that module.  This is important when
+    # the FA4 function is subsequently marked as a Dynamo eager boundary.
+    namespace = mage_layers.__dict__
+    exec(compile(source, mage_layers.__file__, "exec"), namespace)
+    patched_call = namespace.pop("__call__")
+    cls.__call__ = patched_call
+    mage_layers._ot_compile_safe_processor_installed = True
+
+
 def _restore_official_mage_attention(transformer) -> None:
-    """Use Microsoft's Mage attention processor; only backend selection is OT-controlled."""
+    """Use Microsoft's Mage processor class, with only the compile-safe scalar patch above."""
     from mage_flow.models.modules.mage_layers import MageDoubleStreamAttnProcessor
 
     for block in transformer.transformer_blocks:
@@ -78,15 +127,7 @@ def _restore_official_mage_attention(transformer) -> None:
 
 
 def _install_mage_compile_boundaries() -> None:
-    """Keep upstream Mage RoPE and FA4/CuTe outside TorchDynamo.
-
-    OneTrainer normally compiles checkpoint wrappers with ``fullgraph=True``.
-    Mage cannot do that with FlashAttention4 because FA4's CuTe Python wrapper
-    performs fake-mode/cache bookkeeping that Dynamo must not trace.  Mark only
-    the two upstream Mage call sites that are compile-hostile as eager regions;
-    QKV/output projections, modulation, norms, MLPs and W8A8 linears remain
-    visible to Inductor.
-    """
+    """Keep only upstream Mage complex RoPE and FA4/CuTe outside TorchDynamo."""
     import mage_flow.models.modules.mage_layers as mage_layers
 
     if getattr(mage_layers, "_ot_compile_boundaries_installed", False):
@@ -133,25 +174,25 @@ def _install_self_flow_block_dispatch() -> None:
 
 
 def _install_native_packed_inputs(setup) -> None:
-    """Use Microsoft's native Mage packing rather than an OT attention processor."""
+    """Use Microsoft's native packing and provide a compile-safe FA max-seqlen bound."""
 
     def packed_inputs(self, model, latent_tokens, text, text_mask):
         packed_img, img_cu = model.prepare_packed_images(latent_tokens)
         packed_txt, txt_cu = model.prepare_packed_text(text, text_mask)
-        return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0], {}
+
+        # Every sample has at most image_token_width + padded_text_width joint
+        # tokens.  FlashAttention accepts this as max_seqlen even when the actual
+        # packed prompt is shorter, and unlike joint_lens.max().item() this needs
+        # no CUDA scalar extraction inside every transformer block.
+        max_joint_seqlen = int(latent_tokens.shape[1] + text.shape[1])
+        attention_kwargs = {"ot_max_joint_seqlen": max_joint_seqlen}
+        return packed_img, packed_txt, img_cu, txt_cu, latent_tokens.shape[0], attention_kwargs
 
     setup._packed_inputs = MethodType(packed_inputs, setup)
 
 
 def _wrap_blocks_with_ot_checkpoint_layer(transformer, config) -> None:
-    """Use OT's existing CheckpointLayer, allowing Mage FA4 graph breaks.
-
-    This intentionally does not invent a second checkpoint/compile system.
-    The wrapper class and checkpoint behavior are exactly OneTrainer's existing
-    implementation.  The only Mage-specific difference is ``fullgraph=False``
-    so the explicitly disabled upstream RoPE/FA4 calls can execute eagerly while
-    the surrounding INT_W8A8 transformer math remains compiled.
-    """
+    """Use OT's existing CheckpointLayer while allowing the FA4 eager boundary."""
     part = config.transformer
     if part.offloading_enabled():
         raise NotImplementedError(
@@ -175,9 +216,8 @@ def _wrap_blocks_with_ot_checkpoint_layer(transformer, config) -> None:
             checkpointing=checkpointing,
         )
         if compile_enabled:
-            # Flux/Flux2 normally use fullgraph=True. Mage's FA4/CuTe call is a
-            # legitimate external graph boundary, so Mage alone permits breaks.
-            # Inductor still compiles the W8A8 projections/MLPs around it.
+            # INT_W8A8 projections/MLPs and the ordinary block math stay under
+            # Inductor; only the explicitly disabled RoPE/FA4 calls graph-break.
             layer.compile(fullgraph=False)
         transformer.transformer_blocks[index] = layer
 
@@ -185,13 +225,9 @@ def _wrap_blocks_with_ot_checkpoint_layer(transformer, config) -> None:
 
 
 def setup_mage_like_flux2(setup, model, config) -> None:
-    """Apply the established OneTrainer/Flux2 block lifecycle to Mage.
+    """Apply OneTrainer's established checkpoint/compile lifecycle to Mage."""
 
-    Normal Mage and Self-Flow both call the same CheckpointLayer-wrapped block.
-    Mage-specific glue is limited to dual timestep modulation plus the necessary
-    eager boundary around Microsoft's RoPE and FA4/CuTe implementation.
-    """
-
+    _patch_upstream_mage_attention_processor_for_compile()
     _restore_official_mage_attention(model.transformer)
     _install_mage_compile_boundaries()
     _install_dual_timestep_block_forward(model.transformer)
@@ -207,5 +243,5 @@ def setup_mage_like_flux2(setup, model, config) -> None:
     print(
         "[Mage-Flow] transformer blocks use OneTrainer CheckpointLayer "
         f"(checkpoint={config.transformer.checkpointing_enabled()}, "
-        f"compile={bool(config.compile)}, fullgraph=False; Mage RoPE/FA4 eager)"
+        f"compile={bool(config.compile)}, packed-shapes=compile-safe, Mage RoPE/FA4 eager)"
     )
