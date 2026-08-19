@@ -5,7 +5,11 @@ from types import MethodType
 import torch
 
 import modules.module.MageFlowSelfFlow as mage_self_flow
-from modules.util.checkpointing_util import enable_checkpointing
+from modules.util.checkpointing_util import (
+    BaseCheckpointLayer,
+    CheckpointLayer,
+    _remove_checkpoint_keys,
+)
 
 
 # Keep one immutable reference to the numerically validated Mage block body.
@@ -20,13 +24,10 @@ else:
 def _install_dual_timestep_block_forward(transformer) -> None:
     """Make native Mage blocks accept separate image/text timestep embeddings.
 
-    FLUX.2 Self-Flow can call the transformer's already wrapped blocks directly.
+    FLUX.2 Self-Flow calls the transformer's already wrapped blocks directly.
     Mage's upstream block only accepts one ``temb`` for both streams, so this is
-    the minimal architecture-specific bridge needed to let Mage use the exact
-    same OneTrainer checkpoint/compile wrappers.
-
-    No parameters or module hierarchy are changed here; only ``forward`` is
-    replaced in-place, preserving LoRA names and checkpoint keys.
+    the minimal architecture-specific bridge needed to let Mage use the same
+    OneTrainer CheckpointLayer for normal and Self-Flow forwards.
     """
 
     for block in transformer.transformer_blocks:
@@ -69,20 +70,41 @@ def _install_dual_timestep_block_forward(transformer) -> None:
 
 
 def _restore_official_mage_attention(transformer) -> None:
-    """Use Microsoft's Mage attention processor; only the backend selection is OT-controlled."""
+    """Use Microsoft's Mage attention processor; only backend selection is OT-controlled."""
     from mage_flow.models.modules.mage_layers import MageDoubleStreamAttnProcessor
 
     for block in transformer.transformer_blocks:
         block.attn.set_processor(MageDoubleStreamAttnProcessor())
 
 
-def _install_self_flow_block_dispatch() -> None:
-    """Route Mage Self-Flow through the same wrapped blocks as normal training.
+def _install_mage_compile_boundaries() -> None:
+    """Keep upstream Mage RoPE and FA4/CuTe outside TorchDynamo.
 
-    This mirrors Flux2SelfFlow: the Self-Flow forward calls ``block(...)`` and
-    leaves checkpointing/torch.compile ownership to OneTrainer's CheckpointLayer
-    instead of manually checkpointing or compiling a second block function.
+    OneTrainer normally compiles checkpoint wrappers with ``fullgraph=True``.
+    Mage cannot do that with FlashAttention4 because FA4's CuTe Python wrapper
+    performs fake-mode/cache bookkeeping that Dynamo must not trace.  Mark only
+    the two upstream Mage call sites that are compile-hostile as eager regions;
+    QKV/output projections, modulation, norms, MLPs and W8A8 linears remain
+    visible to Inductor.
     """
+    import mage_flow.models.modules.mage_layers as mage_layers
+
+    if getattr(mage_layers, "_ot_compile_boundaries_installed", False):
+        return
+
+    mage_layers.apply_rotary_emb_mageflow = torch.compiler.disable(
+        mage_layers.apply_rotary_emb_mageflow,
+        reason="Mage complex RoPE stays eager outside TorchDynamo",
+    )
+    mage_layers.flash_attn_varlen_func = torch.compiler.disable(
+        mage_layers.flash_attn_varlen_func,
+        reason="Mage FA4/CuTe varlen kernel stays eager outside TorchDynamo",
+    )
+    mage_layers._ot_compile_boundaries_installed = True
+
+
+def _install_self_flow_block_dispatch() -> None:
+    """Route Mage Self-Flow through the same wrapped blocks as normal training."""
 
     def wrapped_block_forward(
             block,
@@ -111,7 +133,7 @@ def _install_self_flow_block_dispatch() -> None:
 
 
 def _install_native_packed_inputs(setup) -> None:
-    """Stop building the custom OT routing object; use upstream Mage packing."""
+    """Use Microsoft's native Mage packing rather than an OT attention processor."""
 
     def packed_inputs(self, model, latent_tokens, text, text_mask):
         packed_img, img_cu = model.prepare_packed_images(latent_tokens)
@@ -121,39 +143,69 @@ def _install_native_packed_inputs(setup) -> None:
     setup._packed_inputs = MethodType(packed_inputs, setup)
 
 
-def setup_mage_like_flux2(setup, model, config) -> None:
-    """Apply OneTrainer's proven Flux2 checkpoint/compile lifecycle to Mage.
+def _wrap_blocks_with_ot_checkpoint_layer(transformer, config) -> None:
+    """Use OT's existing CheckpointLayer, allowing Mage FA4 graph breaks.
 
-    BaseMageFlowSetup's experimental per-block ``block.compile(dynamic=True)``
-    path is intentionally bypassed by the caller. This function then installs
-    the smallest Mage-specific forward bridge and hands the transformer blocks
-    to the same ``enable_checkpointing`` implementation used by Flux/Flux2.
+    This intentionally does not invent a second checkpoint/compile system.
+    The wrapper class and checkpoint behavior are exactly OneTrainer's existing
+    implementation.  The only Mage-specific difference is ``fullgraph=False``
+    so the explicitly disabled upstream RoPE/FA4 calls can execute eagerly while
+    the surrounding INT_W8A8 transformer math remains compiled.
+    """
+    part = config.transformer
+    if part.offloading_enabled():
+        raise NotImplementedError(
+            "Mage Flow compile currently cannot combine transformer layer "
+            "offloading with the FA4 eager graph boundary. Disable transformer "
+            "layer offloading; gradient checkpointing remains supported."
+        )
+
+    checkpointing = part.checkpointing_enabled()
+    train_device = torch.device(config.train_device)
+    compile_enabled = bool(config.compile)
+
+    for index, block in enumerate(transformer.transformer_blocks):
+        if isinstance(block, BaseCheckpointLayer):
+            continue
+
+        layer = CheckpointLayer(
+            orig_module=block,
+            orig_forward=None,
+            train_device=train_device,
+            checkpointing=checkpointing,
+        )
+        if compile_enabled:
+            # Flux/Flux2 normally use fullgraph=True. Mage's FA4/CuTe call is a
+            # legitimate external graph boundary, so Mage alone permits breaks.
+            # Inductor still compiles the W8A8 projections/MLPs around it.
+            layer.compile(fullgraph=False)
+        transformer.transformer_blocks[index] = layer
+
+    transformer._register_state_dict_hook(_remove_checkpoint_keys)
+
+
+def setup_mage_like_flux2(setup, model, config) -> None:
+    """Apply the established OneTrainer/Flux2 block lifecycle to Mage.
+
+    Normal Mage and Self-Flow both call the same CheckpointLayer-wrapped block.
+    Mage-specific glue is limited to dual timestep modulation plus the necessary
+    eager boundary around Microsoft's RoPE and FA4/CuTe implementation.
     """
 
     _restore_official_mage_attention(model.transformer)
+    _install_mage_compile_boundaries()
     _install_dual_timestep_block_forward(model.transformer)
     _install_self_flow_block_dispatch()
     _install_native_packed_inputs(setup)
 
-    # Disable Mage upstream's internal checkpoint loop. OneTrainer's existing
-    # CheckpointLayer now owns both checkpointing and compile, exactly as Flux2.
+    # Disable Mage upstream's internal checkpoint loop. OT's CheckpointLayer now
+    # owns checkpointing for both ordinary and Self-Flow forwards.
     model.transformer.checkpoint = False
-
-    model.transformer_offload_conductor = enable_checkpointing(
-        model.transformer,
-        config,
-        config.transformer,
-        bool(config.compile),
-        [
-            (
-                model.transformer.transformer_blocks,
-                ["hidden_states", "encoder_hidden_states"],
-            ),
-        ],
-    )
+    model.transformer_offload_conductor = None
+    _wrap_blocks_with_ot_checkpoint_layer(model.transformer, config)
 
     print(
-        "[Mage-Flow] transformer blocks use OneTrainer Flux2-style "
-        f"CheckpointLayer (checkpoint={config.transformer.gradient_checkpointing}, "
-        f"compile={bool(config.compile)})"
+        "[Mage-Flow] transformer blocks use OneTrainer CheckpointLayer "
+        f"(checkpoint={config.transformer.checkpointing_enabled()}, "
+        f"compile={bool(config.compile)}, fullgraph=False; Mage RoPE/FA4 eager)"
     )
