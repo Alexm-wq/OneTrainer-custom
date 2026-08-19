@@ -7,7 +7,6 @@ import torch
 from torch import Tensor
 
 
-
 def build_packed_attention_routing(
         img_cu_lens: Tensor,
         txt_cu_lens: Tensor,
@@ -64,10 +63,50 @@ class OneTrainerMageDoubleStreamAttnProcessor:
     """Drop-in Mage double-stream processor with cached packed routing.
 
     Numerical operations are intentionally the same as Microsoft's
-    ``MageDoubleStreamAttnProcessor``. The only semantic change is that routing
-    tensors/max sequence length may be supplied through
-    ``joint_attention_kwargs['ot_packed_routing']`` and reused by every block.
+    ``MageDoubleStreamAttnProcessor``. Training supplies a routing object built
+    once by BaseMageFlowSetup. Official Mage sampling does not expose an
+    attention_kwargs hook at the pipeline level, so all transformer blocks share
+    one processor instance whose tiny fallback cache reuses routing while the
+    same cu_seqlens tensor objects remain active.
     """
+
+    def __init__(self):
+        self._cached_img_cu = None
+        self._cached_txt_cu = None
+        self._cached_img_tokens = None
+        self._cached_txt_tokens = None
+        self._cached_routing = None
+
+    def _fallback_routing(
+            self,
+            img_cu_lens: Tensor,
+            txt_cu_lens: Tensor,
+            img_token_count: int,
+            txt_token_count: int,
+    ) -> dict[str, Any]:
+        if (
+            self._cached_routing is not None
+            and self._cached_img_cu is img_cu_lens
+            and self._cached_txt_cu is txt_cu_lens
+            and self._cached_img_tokens == img_token_count
+            and self._cached_txt_tokens == txt_token_count
+        ):
+            return self._cached_routing
+
+        routing = build_packed_attention_routing(
+            img_cu_lens,
+            txt_cu_lens,
+            img_token_count=img_token_count,
+            txt_token_count=txt_token_count,
+            # Accepted upper bound; avoids any CUDA -> CPU reduction/sync.
+            max_joint_seqlen=img_token_count + txt_token_count,
+        )
+        self._cached_img_cu = img_cu_lens
+        self._cached_txt_cu = txt_cu_lens
+        self._cached_img_tokens = img_token_count
+        self._cached_txt_tokens = txt_token_count
+        self._cached_routing = routing
+        return routing
 
     def __call__(
             self,
@@ -126,15 +165,11 @@ class OneTrainerMageDoubleStreamAttnProcessor:
 
         routing = kwargs.get("ot_packed_routing")
         if routing is None:
-            # Safe fallback for external callers. It deliberately uses the
-            # total packed length as max_seqlen (an accepted upper bound) so it
-            # still avoids the upstream per-block CUDA -> CPU ``.item()`` sync.
-            routing = build_packed_attention_routing(
+            routing = self._fallback_routing(
                 img_cu_lens,
                 txt_cu_lens,
-                img_token_count=int(img_query.shape[0]),
-                txt_token_count=int(txt_query.shape[0]),
-                max_joint_seqlen=int(img_query.shape[0] + txt_query.shape[0]),
+                int(img_query.shape[0]),
+                int(txt_query.shape[0]),
             )
 
         joint_cu_lens = routing["joint_cu_lens"]
@@ -197,18 +232,24 @@ class OneTrainerMageDoubleStreamAttnProcessor:
         return img_attn_output, txt_attn_output
 
 
-
 def install_optimized_mage_attention(transformer) -> None:
-    """Replace parameter-free Mage attention processors in-place."""
-    installed = 0
+    """Replace Mage's parameter-free processors with one shared OT processor."""
+    shared = None
     for block in transformer.transformer_blocks:
         processor = block.attn.get_processor()
         if isinstance(processor, OneTrainerMageDoubleStreamAttnProcessor):
-            continue
-        block.attn.set_processor(OneTrainerMageDoubleStreamAttnProcessor())
-        installed += 1
-    print(f"[Mage-Flow] optimized packed attention processors installed={installed}")
+            shared = processor
+            break
+    if shared is None:
+        shared = OneTrainerMageDoubleStreamAttnProcessor()
 
+    installed = 0
+    for block in transformer.transformer_blocks:
+        if block.attn.get_processor() is shared:
+            continue
+        block.attn.set_processor(shared)
+        installed += 1
+    print(f"[Mage-Flow] optimized packed attention processors installed={installed} shared_cache=on")
 
 
 def configure_mage_attention_from_config(model, config) -> str:
