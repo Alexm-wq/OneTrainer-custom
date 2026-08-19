@@ -108,6 +108,7 @@ class OneTrainerMageDoubleStreamAttnProcessor:
         self._cached_routing = routing
         return routing
 
+    @torch.compiler.disable(reason="Mage RoPE + FA4/CuTe varlen kernel must remain outside TorchDynamo")
     def __call__(
             self,
             attn,
