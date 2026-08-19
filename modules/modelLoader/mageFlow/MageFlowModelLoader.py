@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import threading
+from types import MethodType
 
 from modules.model.MageFlowModel import MageFlowModel
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
@@ -12,6 +14,9 @@ from modules.util.quantization_util import is_quantized_parameter
 
 import torch
 from torch import nn
+
+
+_MAGE_TEXT_BACKEND_LOCK = threading.RLock()
 
 
 class MageFlowModelLoader(HFModelLoaderMixin):
@@ -34,25 +39,24 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
     @staticmethod
     def _resolve_attention_backend() -> tuple[str, str]:
-        """Select a safe Mage packed-attention backend.
+        """Select the Mage DiT backend and the independent HF Qwen backend.
 
-        ``OT_MAGE_ATTN_BACKEND`` can explicitly select ``sdpa`` or ``flash4``.
-        Without an override, consumer Blackwell (SM120/SM121) uses SDPA. FA4's
-        CuTeDSL varlen path has had native-process crashes and kernel failures on
-        these architectures, and Mage uses varlen attention for both the Qwen
-        conditioning encoder and the image transformer. A Python ImportError
-        probe therefore is not a sufficient runtime-safety test on RTX 50-series.
+        Qwen is deliberately kept on HF SDPA by default. Mage's packed Qwen
+        path and the autoregressive content-screening ``generate()`` path have
+        both shown native instability on consumer Blackwell with FA4. The DiT
+        can still use FA4; OneTrainer temporarily switches the process-global
+        Mage packed backend to SDPA only while TextEncoder.forward is running.
 
-        Datacenter Hopper/Blackwell keeps the previous FA4-if-importable policy.
-        The second return value is the Hugging Face Qwen attention implementation
-        used for non-packed Qwen forwards; packed conditioning still goes through
-        Mage's shared backend shim.
+        ``OT_MAGE_ATTN_BACKEND`` explicitly selects ``sdpa`` or ``flash4`` for
+        the DiT. ``OT_MAGE_QWEN_ATTN_IMPL`` may override Qwen's HF backend, but
+        leaving it unset is the recommended/stable configuration.
         """
+        qwen_impl = os.environ.get("OT_MAGE_QWEN_ATTN_IMPL", "sdpa").strip() or "sdpa"
         override = os.environ.get("OT_MAGE_ATTN_BACKEND", "").strip().lower()
         if override:
             if override in {"sdpa", "sdp", "torch_sdpa"}:
                 print("[Mage-Flow] OT_MAGE_ATTN_BACKEND=sdpa")
-                return "sdpa", "sdpa"
+                return "sdpa", qwen_impl
             if override in {"flash4", "fa4", "flash_attention_4"}:
                 try:
                     from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
@@ -62,7 +66,7 @@ class MageFlowModelLoader(HFModelLoaderMixin):
                         "flash_attn.cute is not importable."
                     ) from exc
                 print("[Mage-Flow] OT_MAGE_ATTN_BACKEND=flash4")
-                return "flash4", "flash_attention_4"
+                return "flash4", qwen_impl
             raise ValueError(
                 "OT_MAGE_ATTN_BACKEND must be one of: sdpa, flash4"
             )
@@ -72,16 +76,16 @@ class MageFlowModelLoader(HFModelLoaderMixin):
             if major == 12:
                 print(
                     f"[Mage-Flow] CUDA capability sm_{major}{minor}: using SDPA "
-                    "for packed attention by default. Set "
-                    "OT_MAGE_ATTN_BACKEND=flash4 to explicitly test FA4."
+                    "for DiT packed attention by default. Set "
+                    "OT_MAGE_ATTN_BACKEND=flash4 to explicitly enable FA4."
                 )
-                return "sdpa", "sdpa"
+                return "sdpa", qwen_impl
 
         try:
             from flash_attn.cute import flash_attn_varlen_func  # noqa: F401
-            return "flash4", "flash_attention_4"
+            return "flash4", qwen_impl
         except ImportError:
-            return "sdpa", "sdpa"
+            return "sdpa", qwen_impl
 
     @staticmethod
     def _quantization_summary(module: nn.Module, requested_dtype) -> tuple[int, int]:
@@ -131,11 +135,9 @@ class MageFlowModelLoader(HFModelLoaderMixin):
         mage_attn_backend, hf_attn_impl = self._resolve_attention_backend()
 
         # Upstream load_from_repo() constructs ModelConfig without attn_type,
-        # which otherwise selects its default "flash2" before the text encoder
-        # is created. Force the backend at the actual ModelConfig construction
-        # point so BOTH Mage's packed-varlen attention and Qwen3-VL are created
-        # consistently. Keep the HF env override as a belt-and-suspenders
-        # override for the Qwen constructor, then restore all upstream globals.
+        # which otherwise selects its default flash2 before components are
+        # created. Force the DiT backend at ModelConfig construction, while the
+        # independent VF_HF_ATTN_IMPL override keeps Qwen on SDPA.
         original_model_config = mage_pipeline.ModelConfig
         previous_hf_attn_impl = os.environ.get("VF_HF_ATTN_IMPL")
 
@@ -156,9 +158,26 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
         from mage_flow.models.modules._attn_backend import set_attn_backend
         set_attn_backend(mage_attn_backend)
+
+        # TextEncoder.forward uses Mage's process-global packed varlen backend,
+        # while Qwen autoregressive generation uses the HF implementation chosen
+        # above. Wrap only the packed conditioning forward: use the robust SDPA
+        # shim for Qwen, then restore FA4/SDPA for DiT training or denoising.
+        original_text_forward = official.txt_enc.forward
+
+        def onetrainer_text_forward(_self, *args, **kwargs):
+            with _MAGE_TEXT_BACKEND_LOCK:
+                set_attn_backend("sdpa")
+                try:
+                    return original_text_forward(*args, **kwargs)
+                finally:
+                    set_attn_backend(mage_attn_backend)
+
+        official.txt_enc.forward = MethodType(onetrainer_text_forward, official.txt_enc)
+
         print(
-            f"[Mage-Flow] attention backend={mage_attn_backend} "
-            f"qwen_attn_implementation={hf_attn_impl}"
+            f"[Mage-Flow] DiT attention backend={mage_attn_backend} "
+            f"Qwen HF attention={hf_attn_impl} packed_text_backend=sdpa"
         )
 
         if model_names.transformer_model:
