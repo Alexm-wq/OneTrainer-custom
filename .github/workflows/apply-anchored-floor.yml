@@ -1,0 +1,64 @@
+name: Apply Anchored Reject chosen floor
+
+on:
+  push:
+    branches: [mage-flow-full]
+    paths:
+      - .github/workflows/apply-anchored-floor.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+          fetch-depth: 0
+      - name: Patch Anchored Reject
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('modules/modelSetup/BaseModelSetup.py')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''            raw_pair_total_loss = (
+                rejected_pair_loss
+                + margin_penalty_loss
+                + wrong_order_penalty_loss
+            )
+'''
+          new = '''            # Keep chosen reward from falling below the reference. This is a
+            # one-sided floor only: once chosen_reward >= 0 it contributes no
+            # gradient and does not force an arbitrary positive reward target.
+            chosen_floor_violation = F.relu(-chosen_ratio)
+            chosen_floor_pair_loss = F.smooth_l1_loss(
+                chosen_floor_violation,
+                torch.zeros_like(chosen_floor_violation),
+                beta=huber_delta,
+                reduction="none",
+            )
+
+            raw_pair_total_loss = (
+                rejected_pair_loss
+                + chosen_floor_pair_loss
+                + margin_penalty_loss
+                + wrong_order_penalty_loss
+            )
+'''
+          if old not in s:
+              raise SystemExit('Anchored Reject loss block not found; refusing to patch')
+          s = s.replace(old, new, 1)
+          compile(s, str(p), 'exec')
+          p.write_text(s, encoding='utf-8')
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add modules/modelSetup/BaseModelSetup.py
+          git commit -m "Add chosen reward floor to Anchored Reject"
+          git push origin HEAD:mage-flow-full
