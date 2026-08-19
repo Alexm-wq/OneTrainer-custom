@@ -20,6 +20,7 @@ jobs:
             modules/ui/BaseTrainingTabView.py \
             modules/ui/TrainUIController.py \
             modules/model/MageFlowModel.py \
+            modules/module/MageFlowAttention.py \
             modules/module/MageFlowSelfFlow.py \
             modules/modelLoader/mageFlow \
             modules/modelLoader/MageFlowLoRAModelLoader.py \
@@ -84,8 +85,10 @@ jobs:
           assert 'official.vae = self._convert_diffusers_sub_module_to_dtype(' in mage
 
           assert 'OT_MAGE_ATTN_BACKEND' in mage
-          assert 'if major == 12:' in mage
-          assert 'return "sdpa", "sdpa"' in mage
+          assert 'OT_MAGE_QWEN_ATTN_IMPL' in mage
+          assert 'qwen_impl = os.environ.get("OT_MAGE_QWEN_ATTN_IMPL", "sdpa")' in mage
+          assert 'set_attn_backend("sdpa")' in mage
+          assert 'backend_state["dit"]' in mage
           assert 'quantized_weight_layers=' in mage
           assert 'weight_dtypes.text_encoder.is_quantized() and te_quantized == 0' in mage
           assert 'model.mage_attention_backend = mage_attn_backend' in mage
@@ -96,6 +99,51 @@ jobs:
           assert 'restore_attention_backend=getattr(' in mage_loader
 
           print('Encryption recovery, Mage quantization, and text-cache attention guards: PASS')
+          PY
+      - name: Validate Mage performance sampling and Self-Flow metrics wiring
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          setup = Path('modules/modelSetup/BaseMageFlowSetup.py').read_text(encoding='utf-8')
+          model = Path('modules/model/MageFlowModel.py').read_text(encoding='utf-8')
+          attention = Path('modules/module/MageFlowAttention.py').read_text(encoding='utf-8')
+          sampler = Path('modules/modelSampler/MageFlowSampler.py').read_text(encoding='utf-8')
+          lora = Path('modules/modelSetup/MageFlowLoRASetup.py').read_text(encoding='utf-8')
+          finetune = Path('modules/modelSetup/MageFlowFineTuneSetup.py').read_text(encoding='utf-8')
+
+          assert 'install_optimized_mage_attention(model.transformer)' in setup
+          assert 'block.compile(dynamic=True)' in setup
+          assert 'torch.compile(' in setup
+          assert 'ot_packed_routing' in setup
+          assert 'performance/teacher_forward_ms' in setup
+          assert 'performance/student_forward_backward_ms' in setup
+          assert 'loss/self_flow_rep' in setup
+          assert 'loss/self_flow_structural' in setup
+          assert 'self_flow/cosine_similarity' in setup
+          assert 'def report_to_tensorboard(' in setup
+
+          assert 'packed = text[mask].unsqueeze(0)' in model
+          assert 'self._cu_seqlens_tensor(lengths)' in model
+          assert '.tolist()' not in model.split('def prepare_packed_text', 1)[1].split('def prepare_packed_images', 1)[0]
+          assert '.item()' not in model.split('def prepare_packed_text', 1)[1].split('def prepare_packed_images', 1)[0]
+
+          assert 'class OneTrainerMageDoubleStreamAttnProcessor' in attention
+          assert 'shared_cache=on' in attention
+          assert 'configure_mage_attention_from_config' in attention
+          assert 'AttentionMechanism.FLASH' in attention
+          assert 'selected = "flash4"' in attention
+          assert 'max().item()' not in attention
+
+          assert 'configure_mage_attention_from_config(model, config)' in lora
+          assert 'configure_mage_attention_from_config(model, config)' in finetune
+
+          assert '[Mage-Flow sample] Qwen prompt screening...' in sampler
+          assert 'max_new_tokens=64' in sampler
+          assert 'official.txt_enc.screen_text = cached_screen_text' in sampler
+          assert 'official.txt_enc.screen_text = original_screen_text' in sampler
+
+          print('Mage performance, sampling, compile, and Self-Flow metrics wiring: PASS')
           PY
       - name: Validate adaptive DPO keep floor and warmup
         run: python -m unittest -v tests.test_adaptive_dpo_dataset_policy
