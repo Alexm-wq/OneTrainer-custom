@@ -1,4 +1,5 @@
 from modules.ui.BaseRLHFTabView import BaseRLHFTabView
+from modules.ui.MageFlowEMAUI import add_mage_linear_dpo_ema_controls
 from modules.ui.RLHFTabController import RLHFTabController
 from modules.util.ui import pyside6_components
 from modules.util.ui.pyside6_util import QtABCMeta
@@ -23,4 +24,11 @@ class PySide6RLHFTabView(BaseRLHFTabView, QWidget, metaclass=QtABCMeta):
         layout.setColumnStretch(2, 1)
 
         self.build_content(frame, controller, ui_state)
+        add_mage_linear_dpo_ema_controls(
+            pyside6_components,
+            frame,
+            100,
+            controller,
+            ui_state,
+        )
         pyside6_components._pack_form(frame)
