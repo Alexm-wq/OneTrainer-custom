@@ -1,7 +1,10 @@
+import csv
+import math
 import os
 import shutil
 import subprocess
 from abc import ABCMeta, abstractmethod
+from pathlib import Path
 
 from modules.model.BaseModel import BaseModel
 from modules.modelLoader.BaseModelLoader import BaseModelLoader
@@ -66,6 +69,7 @@ class BaseTrainer(
             self.train_device,
             self.temp_device,
             self.config.training_method,
+            self.config,
             self.config.debug_mode,
         )
 
@@ -93,6 +97,70 @@ class BaseTrainer(
             self.config.model_type,
             self.config.training_method
         )
+
+    def _GenericTrainer__backward_dpo_with_gradient_probe(self, loss: torch.Tensor):
+        """Backward a DPO component while measuring its incoming gradient L2 norm.
+
+        The deliberately mangled method name makes this an inherited fallback
+        for ``GenericTrainer.__backward_dpo_with_gradient_probe``.  This keeps
+        older/local GenericTrainer call sites working without changing the DPO
+        loss, accumulation, Self-Flow, or optimizer logic.
+        """
+        grad_sq_by_device: dict[torch.device, torch.Tensor] = {}
+        handles = []
+
+        def capture(grad: torch.Tensor | None):
+            if grad is None:
+                return None
+            detached = grad.detach()
+            device = detached.device
+            sq = torch.sum(detached.float() * detached.float())
+            existing = grad_sq_by_device.get(device)
+            if existing is None:
+                grad_sq_by_device[device] = sq
+            else:
+                grad_sq_by_device[device] = existing + sq
+            return grad
+
+        try:
+            for parameter in self.parameters:
+                if parameter.requires_grad:
+                    handles.append(parameter.register_hook(capture))
+            loss.backward()
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        # GenericTrainer creates TensorBoard only on the master process, so
+        # this also naturally prevents duplicate CSV rows under multi-GPU.
+        if not hasattr(self, "tensorboard"):
+            return
+
+        total_sq = 0.0
+        for value in grad_sq_by_device.values():
+            total_sq += float(value.detach().cpu().item())
+        gradient_magnitude = math.sqrt(max(total_sq, 0.0))
+        if not math.isfinite(gradient_magnitude):
+            raise RuntimeError("DPO gradient magnitude became NaN or Inf.")
+
+        train_progress = getattr(getattr(self, "model", None), "train_progress", None)
+        global_step = int(getattr(train_progress, "global_step", -1))
+
+        self.tensorboard.add_scalar(
+            "rlhf/dpo_gradient_magnitude",
+            gradient_magnitude,
+            global_step,
+        )
+
+        repo_root = Path(__file__).resolve().parents[2]
+        csv_path = repo_root / "gradient_magnitude.csv"
+        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            if write_header:
+                writer.writerow(["global_step", "dpo_gradient_magnitude"])
+            writer.writerow([global_step, f"{gradient_magnitude:.12g}"])
+
     def _start_tensorboard(self):
         tensorboard_executable = shutil.which("tensorboard")
         tensorboard_log_dir = os.path.join(self.config.workspace_dir, "tensorboard")
