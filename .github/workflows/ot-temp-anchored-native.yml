@@ -1,0 +1,117 @@
+name: Temporary Anchored Reject patch trigger
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.issue.title == '__OT_APPLY_ANCHORED_NATIVE__'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+          fetch-depth: 0
+      - name: Apply native Anchored Reject cleanup
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          # BaseModelSetup: native one-sided chosen floor.
+          p = Path('modules/modelSetup/BaseModelSetup.py')
+          s = p.read_text(encoding='utf-8')
+          replacements = [
+              (
+                  '''        margin_penalty_loss = torch.zeros_like(margin)\n        wrong_order_penalty_loss = torch.zeros_like(margin)\n        margin_target_violation = torch.zeros_like(margin)\n        wrong_order_violation = torch.zeros_like(margin)\n''',
+                  '''        margin_penalty_loss = torch.zeros_like(margin)\n        wrong_order_penalty_loss = torch.zeros_like(margin)\n        margin_target_violation = torch.zeros_like(margin)\n        wrong_order_violation = torch.zeros_like(margin)\n        anchored_chosen_floor_weight = 0.0\n        anchored_chosen_floor_loss = torch.zeros_like(margin)\n        anchored_chosen_floor_violation = torch.zeros_like(margin)\n''',
+              ),
+              (
+                  '''        elif objective == DPOObjective.ANCHORED_REJECT:\n            # The chosen branch receives one full ordinary flow-matching loss\n            # below. The preference objective therefore only needs an absolute\n            # rejected anchor plus bounded pairwise terms. Those pairwise terms\n            # provide extra chosen pressure precisely for close or misordered\n            # negatives, without imposing an arbitrary chosen reward target.\n            rejected_target = float(\n                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)\n            )\n            rejected_weight = max(\n''',
+                  '''        elif objective == DPOObjective.ANCHORED_REJECT:\n            # Explicit safe reward region, in addition to the full chosen\n            # ordinary-training loss: chosen >= 0, rejected <= target, and\n            # chosen - rejected >= margin_target. The chosen floor is fixed at\n            # zero so DPO prevents regression without chasing an arbitrary\n            # positive absolute chosen reward.\n            rejected_target = float(\n                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)\n            )\n            anchored_chosen_floor_weight = max(\n                float(getattr(\n                    config,\n                    "rlhf_dpo_anchored_chosen_floor_weight",\n                    1.0,\n                )),\n                0.0,\n            )\n            rejected_weight = max(\n''',
+              ),
+              (
+                  '''            rejected_violation = F.relu(rejected_ratio - rejected_target)\n\n            rejected_pair_loss = rejected_weight * F.smooth_l1_loss(\n''',
+                  '''            anchored_chosen_floor_violation = F.relu(-chosen_ratio)\n            anchored_chosen_floor_loss = (\n                anchored_chosen_floor_weight\n                * F.smooth_l1_loss(\n                    anchored_chosen_floor_violation,\n                    torch.zeros_like(anchored_chosen_floor_violation),\n                    beta=huber_delta,\n                    reduction="none",\n                )\n            )\n\n            rejected_violation = F.relu(rejected_ratio - rejected_target)\n\n            rejected_pair_loss = rejected_weight * F.smooth_l1_loss(\n''',
+              ),
+              (
+                  '''            raw_pair_total_loss = (\n                rejected_pair_loss\n                + margin_penalty_loss\n                + wrong_order_penalty_loss\n            )\n''',
+                  '''            raw_pair_total_loss = (\n                anchored_chosen_floor_loss\n                + rejected_pair_loss\n                + margin_penalty_loss\n                + wrong_order_penalty_loss\n            )\n''',
+              ),
+              (
+                  '''            "wrong_order_violation": wrong_order_violation.detach().mean().item(),\n            "chosen_anchor_active": float(\n''',
+                  '''            "wrong_order_violation": wrong_order_violation.detach().mean().item(),\n            "anchored_chosen_floor_weight": float(anchored_chosen_floor_weight),\n            "anchored_chosen_floor_loss": anchored_chosen_floor_loss.detach().mean().item(),\n            "anchored_chosen_floor_violation": anchored_chosen_floor_violation.detach().mean().item(),\n            "anchored_chosen_floor_active_fraction": (\n                (anchored_chosen_floor_violation.detach() > 0)\n                .float()\n                .mean()\n                .item()\n            ),\n            "chosen_anchor_active": float(\n''',
+              ),
+          ]
+          for old, new in replacements:
+              if s.count(old) != 1:
+                  raise SystemExit(f'BaseModelSetup marker mismatch: {s.count(old)} matches for {old[:80]!r}')
+              s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+
+          # TrainConfig: preserve legacy no-op chosen target/weight for old JSONs,
+          # add only the new active chosen-floor weight.
+          p = Path('modules/util/config/TrainConfig.py')
+          s = p.read_text(encoding='utf-8')
+          old = '    rlhf_dpo_anchored_chosen_weight: float\n    rlhf_dpo_anchored_rejected_weight: float\n'
+          new = '    rlhf_dpo_anchored_chosen_weight: float\n    rlhf_dpo_anchored_chosen_floor_weight: float\n    rlhf_dpo_anchored_rejected_weight: float\n'
+          if s.count(old) < 1:
+              raise SystemExit('TrainConfig declaration marker missing')
+          s = s.replace(old, new)
+          old = '        data.append(("rlhf_dpo_anchored_chosen_weight", 0.0, float, False))\n        data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))\n'
+          new = '        data.append(("rlhf_dpo_anchored_chosen_weight", 0.0, float, False))\n        data.append(("rlhf_dpo_anchored_chosen_floor_weight", 1.0, float, False))\n        data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))\n'
+          if s.count(old) < 1:
+              raise SystemExit('TrainConfig default marker missing')
+          s = s.replace(old, new)
+          p.write_text(s, encoding='utf-8')
+
+          # RLHF UI: show only active Anchored controls.
+          p = Path('modules/ui/BaseRLHFTabView.py')
+          s = p.read_text(encoding='utf-8')
+          start = s.index('        self.components.label(\n            anchored_reject,\n            0,\n            0,\n            "Anchored Reject",')
+          end = s.index('        balanced_reject = self.components.section_frame(frame, 2)', start)
+          block = '''        self.components.label(\n            anchored_reject, 0, 0, "Anchored Reject",\n            tooltip=(\n                "Constrained preference objective: chosen reward is kept at or "\n                "above the fixed reference level (0), rejected reward is pushed "\n                "below its target, and the pair must reach the configured margin. "\n                "Chosen also receives one full normal-training loss."\n            ),\n            wide_tooltip=True,\n        )\n\n        self.components.label(\n            anchored_reject, 1, 0, "Chosen Floor Weight",\n            tooltip=(\n                "Strength of the one-sided chosen reward floor. Active only "\n                "while chosen_reward < 0; the floor itself is fixed at 0."\n            ),\n        )\n        self.components.entry(anchored_reject, 1, 1, ui_state, "rlhf_dpo_anchored_chosen_floor_weight")\n\n        self.components.label(anchored_reject, 2, 0, "Rejected Target")\n        self.components.entry(anchored_reject, 2, 1, ui_state, "rlhf_dpo_anchored_rejected_target")\n\n        self.components.label(anchored_reject, 3, 0, "Rejected Weight")\n        self.components.entry(anchored_reject, 3, 1, ui_state, "rlhf_dpo_anchored_rejected_weight")\n\n        self.components.label(\n            anchored_reject, 4, 0, "Huber Delta",\n            tooltip=(\n                "Smooth-L1 transition point shared by chosen-floor, rejected-"\n                "anchor, margin, and wrong-order penalties."\n            ),\n        )\n        self.components.entry(anchored_reject, 4, 1, ui_state, "rlhf_dpo_anchored_huber_delta")\n\n        self.components.label(\n            anchored_reject, 5, 0, "Margin Target",\n            tooltip="Required chosen_reward - rejected_reward margin.",\n        )\n        self.components.entry(anchored_reject, 5, 1, ui_state, "rlhf_dpo_anchored_margin_target")\n\n        self.components.label(\n            anchored_reject, 6, 0, "Margin Weight",\n            tooltip="Strength of the positive target-margin penalty.",\n        )\n        self.components.entry(anchored_reject, 6, 1, ui_state, "rlhf_dpo_anchored_margin_weight")\n\n        self.components.label(\n            anchored_reject, 7, 0, "Wrong-Order Weight",\n            tooltip=(\n                "Extra rescue pressure only while rejected_reward exceeds "\n                "chosen_reward. Set to 0 to rely on the margin term alone."\n            ),\n        )\n        self.components.entry(anchored_reject, 7, 1, ui_state, "rlhf_dpo_anchored_wrong_order_weight")\n\n'''
+          s = s[:start] + block + s[end:]
+          s = s.replace(
+              '"IPO targets a fixed reward margin. Anchored Reject keeps its "\n                "existing anchor/margin behavior. Balanced Reject trains chosen "',
+              '"IPO targets a fixed reward margin. Anchored Reject enforces a "\n                "chosen floor, rejected ceiling, and minimum pair margin. "\n                "Balanced Reject trains chosen "',
+              1,
+          )
+          p.write_text(s, encoding='utf-8')
+
+          # Remove the temporary model-specific floor mixin wiring.
+          for path in ('modules/modelSetup/MageFlowLoRASetup.py', 'modules/modelSetup/Flux2LoRASetup.py'):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              s = s.replace('from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin\n', '')
+              s = s.replace('    AnchoredRejectChosenFloorMixin,\n', '')
+              p.write_text(s, encoding='utf-8')
+
+          mixin = Path('modules/modelSetup/mixin/AnchoredRejectChosenFloorMixin.py')
+          if mixin.exists():
+              mixin.unlink()
+          branch_workflow = Path('.github/workflows/apply-anchored-native.yml')
+          if branch_workflow.exists():
+              branch_workflow.unlink()
+
+          # Source assertions only; no test suite.
+          base = Path('modules/modelSetup/BaseModelSetup.py').read_text(encoding='utf-8')
+          ui = Path('modules/ui/BaseRLHFTabView.py').read_text(encoding='utf-8')
+          cfg = Path('modules/util/config/TrainConfig.py').read_text(encoding='utf-8')
+          assert 'anchored_chosen_floor_loss' in base
+          assert 'rlhf_dpo_anchored_chosen_floor_weight' in cfg
+          assert 'Chosen Floor Weight' in ui
+          assert '"Chosen Target"' not in ui
+          assert '"Chosen Weight"' not in ui
+          assert not Path('modules/modelSetup/mixin/AnchoredRejectChosenFloorMixin.py').exists()
+          PY
+
+          git add -A
+          git config user.name "Alexm-wq"
+          git config user.email "alexme.travel@gmail.com"
+          git commit -m "Make Anchored Reject chosen floor native"
+          git push origin HEAD:mage-flow-full
