@@ -337,6 +337,27 @@ class BaseRLHFTabView:
             "rlhf_dpo_momentum_bypass",
         )
 
+        self.components.label(
+            core,
+            15,
+            0,
+            "DPO Gradient Scale",
+            tooltip=(
+                "Multiplies only the DPO-side backward gradient while preserving "
+                "the exact forward rewards, margins, losses, curriculum values, "
+                "and normal chosen/Self-Flow supervision. 1.0 is the previous "
+                "strength; 0.25 gives quarter-strength preference gradients."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.entry(
+            core,
+            15,
+            1,
+            ui_state,
+            "rlhf_dpo_gradient_scale",
+        )
+
         anchored_reject = self.components.section_frame(frame, 1)
         mode_frames["anchored"] = anchored_reject
 

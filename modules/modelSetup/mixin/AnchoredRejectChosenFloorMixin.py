@@ -68,9 +68,12 @@ class AnchoredRejectChosenFloorMixin:
                 external_chosen_supervised_loss_value
             ),
         )
-        if self._anchored_floor_active:
-            metrics = getattr(self, "_last_dpo_metrics", None)
-            if isinstance(metrics, dict):
+        metrics = getattr(self, "_last_dpo_metrics", None)
+        if isinstance(metrics, dict):
+            metrics["dpo_gradient_scale"] = float(
+                getattr(config, "rlhf_dpo_gradient_scale", 0.25)
+            )
+            if self._anchored_floor_active:
                 metrics["anchored_chosen_floor_loss"] = float(
                     self._anchored_floor_last_value
                 )
@@ -93,6 +96,17 @@ class AnchoredRejectChosenFloorMixin:
             config,
             objective,
         )
+
+        # Value-preserving DPO gradient scaling. The reference pass is already
+        # no-grad; only policy scores need this autograd identity. Forward values
+        # remain bit-for-bit equal to the raw score, while d(score)/d(theta) is
+        # multiplied by the configured global DPO strength.
+        if not self._dpo_reference_prediction():
+            gradient_scale = float(getattr(config, "rlhf_dpo_gradient_scale", 0.25))
+            if gradient_scale != 1.0:
+                detached_score = score.detach()
+                score = detached_score + gradient_scale * (score - detached_score)
+
         if DPOObjective(objective) != DPOObjective.ANCHORED_REJECT:
             return score
 

@@ -673,6 +673,7 @@ class TrainConfig(BaseConfig):
     rlhf_dpo_timestep_margin_logging: bool
     rlhf_dpo_beta_gradient_decouple: bool
     rlhf_dpo_beta_gradient_reference: float
+    rlhf_dpo_gradient_scale: float
     rlhf_dpo_chosen_reward_anchor: bool
     rlhf_dpo_chosen_reward_anchor_weight: float
     rlhf_dpo_chosen_reward_target: float
@@ -1453,6 +1454,9 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
         data.append(("rlhf_dpo_beta_gradient_decouple", False, bool, False))
         data.append(("rlhf_dpo_beta_gradient_reference", None, float, True))
+        # Value-preserving global DPO backward multiplier. Rewards, margins,
+        # curriculum signals and logged losses stay in their native units.
+        data.append(("rlhf_dpo_gradient_scale", 0.25, float, False))
         data.append(("rlhf_dpo_chosen_reward_anchor", False, bool, False))
         data.append(("rlhf_dpo_chosen_reward_anchor_weight", 0.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_target", 0.05, float, False))
@@ -1522,6 +1526,11 @@ class TrainConfig(BaseConfig):
             return
 
         objective = DPOObjective(self.rlhf_dpo_objective)
+        dpo_gradient_scale = float(getattr(self, "rlhf_dpo_gradient_scale", 0.25))
+        if not math.isfinite(dpo_gradient_scale) or dpo_gradient_scale <= 0.0:
+            raise ValueError(
+                "DPO Gradient Scale must be finite and greater than zero."
+            )
         if objective != DPOObjective.LINEAR:
             if DPORefMode(self.rlhf_dpo_ref_mode) == DPORefMode.EMA_ADAPTER:
                 raise ValueError(
