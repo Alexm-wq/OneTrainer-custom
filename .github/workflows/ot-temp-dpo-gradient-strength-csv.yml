@@ -1,3 +1,4 @@
+# Triggered for overnight diagnostic run
 name: Apply DPO gradient strength CSV
 
 on:
@@ -32,8 +33,6 @@ jobs:
                   raise SystemExit(f'{path}: expected exactly one marker, found {n}: {old[:120]!r}')
               p.write_text(s.replace(old, new, 1), encoding='utf-8')
 
-          # GenericTrainer: exact normal-vs-DPO gradient diagnostics when
-          # No-Momentum DPO keeps the two accumulated gradient buffers separate.
           replace_once(
               'modules/trainer/GenericTrainer.py',
               'import contextlib\nimport copy\nimport json\n',
@@ -53,17 +52,9 @@ jobs:
             *,
             scale: float = 1.0,
     ) -> tuple[float, int, int]:
-        """Return global L2 norm, element count, and active tensor count.
-
-        The reductions stay on each gradient's native device and synchronize
-        only once per device, so diagnostic logging does not copy normal model
-        gradients to CPU. ``scale`` is used to undo GradScaler scaling without
-        mutating the live optimizer gradients.
-        """
         device_sums: dict[torch.device, Tensor] = {}
         element_count = 0
         tensor_count = 0
-
         for gradient in gradients:
             if gradient is None:
                 continue
@@ -72,16 +63,10 @@ jobs:
                 value = value.coalesce().values()
             squared = value.float().square().sum(dtype=torch.float64)
             existing = device_sums.get(value.device)
-            device_sums[value.device] = (
-                squared if existing is None else existing + squared
-            )
+            device_sums[value.device] = squared if existing is None else existing + squared
             element_count += int(value.numel())
             tensor_count += 1
-
-        total_squared = sum(
-            float(device_sum.item())
-            for device_sum in device_sums.values()
-        )
+        total_squared = sum(float(device_sum.item()) for device_sum in device_sums.values())
         norm = math.sqrt(max(total_squared, 0.0)) * abs(float(scale))
         return norm, element_count, tensor_count
 
@@ -103,37 +88,18 @@ jobs:
             scaler,
             dpo_momentum_bypass: bool,
     ):
-        """Log optimizer-window normal/Self-Flow and DPO gradient strength.
-
-        Exact separation is available when No-Momentum DPO is active: normal
-        gradients live in ``parameter.grad`` while DPO gradients live in the
-        existing CPU bypass buffer. The reported effective DPO norm additionally
-        includes the same clipping and ``update_scale`` used by the bypass step.
-        """
-        if not bool(getattr(
-                self.config,
-                "rlhf_dpo_gradient_csv_logging",
-                True,
-        )):
+        if not bool(getattr(self.config, "rlhf_dpo_gradient_csv_logging", True)):
             return
         if not self.config.rlhf_enabled or not multi.is_master():
             return
         if not dpo_momentum_bypass:
             if not self._dpo_gradient_csv_warned:
-                print(
-                    "[OT-DPO-GRAD-CSV] Exact normal-vs-DPO gradient logging "
-                    "requires 'No Momentum DPO'. No rows will be written while "
-                    "that path is disabled or unsupported by the optimizer."
-                )
+                print("[OT-DPO-GRAD-CSV] Exact split logging requires No Momentum DPO; no rows written while disabled/unsupported.")
                 self._dpo_gradient_csv_warned = True
             return
         if multi.is_enabled():
             if not self._dpo_gradient_csv_warned:
-                print(
-                    "[OT-DPO-GRAD-CSV] Multi-GPU exact split logging is "
-                    "currently disabled because the CPU DPO buffer is reduced "
-                    "later in the bypass step."
-                )
+                print("[OT-DPO-GRAD-CSV] Multi-GPU exact split logging is disabled in this diagnostic build.")
                 self._dpo_gradient_csv_warned = True
             return
         if not self._dpo_bypass_cpu_grads:
@@ -146,36 +112,18 @@ jobs:
                 normal_unscale = 1.0 / scaler_value
 
         normal_norm, normal_elements, normal_tensors = self.__gradient_l2_stats(
-            (
-                parameter.grad
-                for parameter in self.parameters
-                if parameter.requires_grad and parameter.grad is not None
-            ),
+            (parameter.grad for parameter in self.parameters if parameter.requires_grad and parameter.grad is not None),
             scale=normal_unscale,
         )
-        dpo_norm, dpo_elements, dpo_tensors = self.__gradient_l2_stats(
-            self._dpo_bypass_cpu_grads.values(),
-        )
+        dpo_norm, dpo_elements, dpo_tensors = self.__gradient_l2_stats(self._dpo_bypass_cpu_grads.values())
 
         max_norm = self.config.clip_grad_norm
         normal_clip_scale = self.__virtual_clip_scale(normal_norm, max_norm)
         dpo_clip_scale = self.__virtual_clip_scale(dpo_norm, max_norm)
         normal_postclip = normal_norm * normal_clip_scale
         dpo_postclip = dpo_norm * dpo_clip_scale
-
         dpo_update_weight = float(self._dpo_bypass_update_weight)
         dpo_effective = dpo_postclip * dpo_update_weight
-
-        normal_rms = (
-            normal_norm / math.sqrt(normal_elements)
-            if normal_elements > 0
-            else 0.0
-        )
-        dpo_rms = (
-            dpo_norm / math.sqrt(dpo_elements)
-            if dpo_elements > 0
-            else 0.0
-        )
 
         row = {
             "global_step": int(train_progress.global_step),
@@ -195,23 +143,16 @@ jobs:
             "dpo_grad_l2_effective": dpo_effective,
             "dpo_to_normal_ratio_preclip": self.__gradient_ratio(dpo_norm, normal_norm),
             "dpo_to_normal_ratio_effective": self.__gradient_ratio(dpo_effective, normal_postclip),
-            "normal_grad_rms_preclip": normal_rms,
-            "dpo_grad_rms_preclip": dpo_rms,
+            "normal_grad_rms_preclip": normal_norm / math.sqrt(normal_elements) if normal_elements > 0 else 0.0,
+            "dpo_grad_rms_preclip": dpo_norm / math.sqrt(dpo_elements) if dpo_elements > 0 else 0.0,
             "normal_active_elements": normal_elements,
             "dpo_active_elements": dpo_elements,
             "normal_active_tensors": normal_tensors,
             "dpo_active_tensors": dpo_tensors,
         }
-
-        output_path = os.path.join(
-            self.config.workspace_dir,
-            "dpo_gradient_strength.csv",
-        )
+        output_path = os.path.join(self.config.workspace_dir, "dpo_gradient_strength.csv")
         os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        write_header = (
-            not os.path.isfile(output_path)
-            or os.path.getsize(output_path) == 0
-        )
+        write_header = not os.path.isfile(output_path) or os.path.getsize(output_path) == 0
         with open(output_path, "a", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
             if write_header:
@@ -229,11 +170,9 @@ jobs:
           replace_once(
               'modules/trainer/GenericTrainer.py',
               '''                        normal_grad_parameters = {\n                            parameter\n                            for parameter in self.parameters\n                            if parameter.grad is not None\n                        }\n\n                        optimizer_step_succeeded = True\n''',
-              '''                        normal_grad_parameters = {\n                            parameter\n                            for parameter in self.parameters\n                            if parameter.grad is not None\n                        }\n\n                        # At this point the complete accumulation window is\n                        # present: normal/Self-Flow gradients remain in .grad,\n                        # while No-Momentum DPO gradients remain in the separate\n                        # CPU buffer. Measure before either optimizer path mutates\n                        # or clears them.\n                        self.__write_dpo_gradient_strength_csv(\n                            train_progress,\n                            scaler,\n                            dpo_momentum_bypass,\n                        )\n\n                        optimizer_step_succeeded = True\n''',
+              '''                        normal_grad_parameters = {\n                            parameter\n                            for parameter in self.parameters\n                            if parameter.grad is not None\n                        }\n\n                        self.__write_dpo_gradient_strength_csv(\n                            train_progress, scaler, dpo_momentum_bypass\n                        )\n\n                        optimizer_step_succeeded = True\n''',
           )
 
-          # TrainConfig: opt-in/out control. Default on for this diagnostic build
-          # so existing configs immediately produce the requested CSV.
           replace_once(
               'modules/util/config/TrainConfig.py',
               '''    rlhf_dpo_beta_gradient_reference: float\n    rlhf_dpo_gradient_scale: float\n    rlhf_dpo_chosen_reward_anchor: bool\n''',
@@ -245,29 +184,20 @@ jobs:
               '''        data.append(("rlhf_dpo_gradient_scale", 0.25, float, False))\n        data.append(("rlhf_dpo_gradient_csv_logging", True, bool, False))\n        data.append(("rlhf_dpo_chosen_reward_anchor", False, bool, False))\n''',
           )
 
-          # RLHF UI toggle directly below the gradient scale.
           replace_once(
               'modules/ui/BaseRLHFTabView.py',
               '''        self.components.entry(\n            core,\n            15,\n            1,\n            ui_state,\n            "rlhf_dpo_gradient_scale",\n        )\n\n        anchored_reject = self.components.section_frame(frame, 1)\n''',
-              '''        self.components.entry(\n            core,\n            15,\n            1,\n            ui_state,\n            "rlhf_dpo_gradient_scale",\n        )\n\n        self.components.label(\n            core,\n            16,\n            0,\n            "Gradient Strength CSV",\n            tooltip=(\n                "Write dpo_gradient_strength.csv in the workspace once per "\n                "optimizer update. With No Momentum DPO active it compares the "\n                "exact accumulated normal/Self-Flow and DPO gradient L2/RMS "\n                "norms, clipping, and the effective DPO-to-normal ratio."\n            ),\n            wide_tooltip=True,\n        )\n        self.components.switch(\n            core,\n            16,\n            1,\n            ui_state,\n            "rlhf_dpo_gradient_csv_logging",\n        )\n\n        anchored_reject = self.components.section_frame(frame, 1)\n''',
+              '''        self.components.entry(\n            core,\n            15,\n            1,\n            ui_state,\n            "rlhf_dpo_gradient_scale",\n        )\n\n        self.components.label(\n            core, 16, 0, "Gradient Strength CSV",\n            tooltip=(\n                "Write dpo_gradient_strength.csv once per optimizer update. "\n                "With No Momentum DPO it compares exact accumulated normal/Self-Flow "\n                "and DPO gradient norms and the effective DPO-to-normal ratio."\n            ),\n            wide_tooltip=True,\n        )\n        self.components.switch(\n            core, 16, 1, ui_state, "rlhf_dpo_gradient_csv_logging"\n        )\n\n        anchored_reject = self.components.section_frame(frame, 1)\n''',
           )
           PY
 
-          python -m py_compile \
-            modules/trainer/GenericTrainer.py \
-            modules/util/config/TrainConfig.py \
-            modules/ui/BaseRLHFTabView.py
-
+          python -m py_compile modules/trainer/GenericTrainer.py modules/util/config/TrainConfig.py modules/ui/BaseRLHFTabView.py
           git diff --check
-          git status --short
 
       - name: Commit patch
         shell: bash
         run: |
-          if git diff --quiet; then
-            echo 'No changes to commit.'
-            exit 0
-          fi
+          if git diff --quiet; then exit 0; fi
           git config user.name 'Alexm-wq'
           git config user.email 'alexme.travel@gmail.com'
           git add modules/trainer/GenericTrainer.py modules/util/config/TrainConfig.py modules/ui/BaseRLHFTabView.py
