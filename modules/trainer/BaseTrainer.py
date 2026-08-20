@@ -69,7 +69,6 @@ class BaseTrainer(
             self.train_device,
             self.temp_device,
             self.config.training_method,
-            self.config,
             self.config.debug_mode,
         )
 
@@ -102,9 +101,9 @@ class BaseTrainer(
         """Backward a DPO component while measuring its incoming gradient L2 norm.
 
         The deliberately mangled method name makes this an inherited fallback
-        for ``GenericTrainer.__backward_dpo_with_gradient_probe``.  This keeps
-        older/local GenericTrainer call sites working without changing the DPO
-        loss, accumulation, Self-Flow, or optimizer logic.
+        for ``GenericTrainer.__backward_dpo_with_gradient_probe``. This keeps
+        local/newer GenericTrainer call sites working without changing DPO,
+        Self-Flow, accumulation, or optimizer behavior.
         """
         grad_sq_by_device: dict[torch.device, torch.Tensor] = {}
         handles = []
@@ -114,7 +113,8 @@ class BaseTrainer(
                 return None
             detached = grad.detach()
             device = detached.device
-            sq = torch.sum(detached.float() * detached.float())
+            detached_f32 = detached.float()
+            sq = torch.sum(detached_f32 * detached_f32)
             existing = grad_sq_by_device.get(device)
             if existing is None:
                 grad_sq_by_device[device] = sq
@@ -131,8 +131,8 @@ class BaseTrainer(
             for handle in handles:
                 handle.remove()
 
-        # GenericTrainer creates TensorBoard only on the master process, so
-        # this also naturally prevents duplicate CSV rows under multi-GPU.
+        # GenericTrainer creates TensorBoard only on the master process, which
+        # also prevents duplicate CSV rows under multi-GPU.
         if not hasattr(self, "tensorboard"):
             return
 
