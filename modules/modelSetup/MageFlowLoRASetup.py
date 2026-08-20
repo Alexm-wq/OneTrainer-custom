@@ -85,6 +85,12 @@ class MageFlowLoRASetup(
         return data
 
     def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
+        # BaseMageFlowSetup still contains a legacy convenience fallback that
+        # interprets training shift=1 as "use the checkpoint scheduler shift".
+        # Mage's checkpoint shift=6 is an inference/static-scheduler property;
+        # training must honor the explicit OneTrainer timestep distribution.
+        requested_timestep_shift = float(config.timestep_shift)
+
         # BaseMageFlowSetup originally grew its own block.compile(dynamic=True)
         # experiment. Do not run it. Let the shared OneTrainer checkpoint/compile
         # machinery own Mage exactly as it already owns Flux2.
@@ -94,6 +100,7 @@ class MageFlowLoRASetup(
             super().setup_optimizations(model, config)
         finally:
             config.compile = requested_compile
+            config.timestep_shift = requested_timestep_shift
 
         setup_mage_like_flux2(self, model, config)
 
