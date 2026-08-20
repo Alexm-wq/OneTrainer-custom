@@ -174,15 +174,21 @@ class BaseTrainer(
             })
 
     def _GenericTrainer__backward_dpo_with_gradient_probe(self, loss: torch.Tensor):
-        """Backward DPO while comparing it with the existing normal/Self-Flow gradient.
+        """Backward DPO while recording DPO and active Self-Flow magnitudes.
 
-        The normal/chosen Self-Flow component is differentiated first in the
-        sequential RLHF path. Its gradient is therefore already present in
-        ``parameter.grad`` when this DPO probe is entered. We measure that L2
-        norm before DPO backward, then use leaf hooks to measure only the
-        incoming DPO contribution without altering either gradient.
+        Historically this probe labeled the full pre-existing ``parameter.grad``
+        norm as Self-Flow. That is only meaningful when Self-Flow is enabled;
+        otherwise those gradients can be ordinary supervised gradients or
+        carry-over from gradient accumulation. Never report those as Self-Flow.
         """
-        self_flow_gradient_magnitude = self._gradient_l2_from_parameter_grads()
+        self_flow_enabled = bool(
+            getattr(self.config, "self_flow_enabled", False)
+        )
+        self_flow_gradient_magnitude = (
+            self._gradient_l2_from_parameter_grads()
+            if self_flow_enabled
+            else 0.0
+        )
         if not math.isfinite(self_flow_gradient_magnitude):
             raise RuntimeError("Self-Flow gradient magnitude became NaN or Inf.")
 
