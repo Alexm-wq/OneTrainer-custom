@@ -1,15 +1,15 @@
 name: Temporary Anchored Reject patch trigger
 
 on:
-  issues:
-    types: [opened]
+  schedule:
+    - cron: '* * * * *'
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: github.event.issue.title == '__OT_APPLY_ANCHORED_NATIVE__'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,7 +22,6 @@ jobs:
           python - <<'PY'
           from pathlib import Path
 
-          # BaseModelSetup: native one-sided chosen floor.
           p = Path('modules/modelSetup/BaseModelSetup.py')
           s = p.read_text(encoding='utf-8')
           replacements = [
@@ -53,8 +52,6 @@ jobs:
               s = s.replace(old, new, 1)
           p.write_text(s, encoding='utf-8')
 
-          # TrainConfig: preserve legacy no-op chosen target/weight for old JSONs,
-          # add only the new active chosen-floor weight.
           p = Path('modules/util/config/TrainConfig.py')
           s = p.read_text(encoding='utf-8')
           old = '    rlhf_dpo_anchored_chosen_weight: float\n    rlhf_dpo_anchored_rejected_weight: float\n'
@@ -69,7 +66,6 @@ jobs:
           s = s.replace(old, new)
           p.write_text(s, encoding='utf-8')
 
-          # RLHF UI: show only active Anchored controls.
           p = Path('modules/ui/BaseRLHFTabView.py')
           s = p.read_text(encoding='utf-8')
           start = s.index('        self.components.label(\n            anchored_reject,\n            0,\n            0,\n            "Anchored Reject",')
@@ -83,7 +79,6 @@ jobs:
           )
           p.write_text(s, encoding='utf-8')
 
-          # Remove the temporary model-specific floor mixin wiring.
           for path in ('modules/modelSetup/MageFlowLoRASetup.py', 'modules/modelSetup/Flux2LoRASetup.py'):
               p = Path(path)
               s = p.read_text(encoding='utf-8')
@@ -98,7 +93,6 @@ jobs:
           if branch_workflow.exists():
               branch_workflow.unlink()
 
-          # Source assertions only; no test suite.
           base = Path('modules/modelSetup/BaseModelSetup.py').read_text(encoding='utf-8')
           ui = Path('modules/ui/BaseRLHFTabView.py').read_text(encoding='utf-8')
           cfg = Path('modules/util/config/TrainConfig.py').read_text(encoding='utf-8')
@@ -113,5 +107,8 @@ jobs:
           git add -A
           git config user.name "Alexm-wq"
           git config user.email "alexme.travel@gmail.com"
+          if git diff --cached --quiet; then
+            exit 0
+          fi
           git commit -m "Make Anchored Reject chosen floor native"
           git push origin HEAD:mage-flow-full
