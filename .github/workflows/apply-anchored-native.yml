@@ -1,0 +1,134 @@
+name: Apply native Anchored Reject cleanup
+
+on:
+  push:
+    branches: [mage-flow-full]
+    paths:
+      - '.github/workflows/apply-anchored-native.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+          fetch-depth: 0
+      - name: Patch Anchored Reject
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              n = s.count(old)
+              if n != 1:
+                  raise SystemExit(f'{path}: expected exactly one match, found {n}: {old[:100]!r}')
+              p.write_text(s.replace(old, new, 1), encoding='utf-8')
+
+          # 1) Native Anchored Reject chosen floor in BaseModelSetup.
+          p = Path('modules/modelSetup/BaseModelSetup.py')
+          s = p.read_text(encoding='utf-8')
+
+          old = '''        margin_penalty_loss = torch.zeros_like(margin)\n        wrong_order_penalty_loss = torch.zeros_like(margin)\n        margin_target_violation = torch.zeros_like(margin)\n        wrong_order_violation = torch.zeros_like(margin)\n'''
+          new = '''        margin_penalty_loss = torch.zeros_like(margin)\n        wrong_order_penalty_loss = torch.zeros_like(margin)\n        margin_target_violation = torch.zeros_like(margin)\n        wrong_order_violation = torch.zeros_like(margin)\n        anchored_chosen_floor_weight = 0.0\n        anchored_chosen_floor_loss = torch.zeros_like(margin)\n        anchored_chosen_floor_violation = torch.zeros_like(margin)\n'''
+          if s.count(old) != 1:
+              raise SystemExit('BaseModelSetup: anchored metric defaults marker mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''        elif objective == DPOObjective.ANCHORED_REJECT:\n            # The chosen branch receives one full ordinary flow-matching loss\n            # below. The preference objective therefore only needs an absolute\n            # rejected anchor plus bounded pairwise terms. Those pairwise terms\n            # provide extra chosen pressure precisely for close or misordered\n            # negatives, without imposing an arbitrary chosen reward target.\n            rejected_target = float(\n                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)\n            )\n            rejected_weight = max(\n'''
+          new = '''        elif objective == DPOObjective.ANCHORED_REJECT:\n            # Anchored Reject defines an explicit safe reward region while the\n            # chosen image also receives one full ordinary training loss:\n            #   chosen_reward >= 0\n            #   rejected_reward <= rejected_target\n            #   chosen_reward - rejected_reward >= margin_target\n            # The chosen floor is deliberately fixed at zero: DPO may prevent\n            # regression relative to the reference, but does not chase an\n            # arbitrary positive absolute chosen reward.\n            rejected_target = float(\n                getattr(config, "rlhf_dpo_anchored_rejected_target", -0.05)\n            )\n            anchored_chosen_floor_weight = max(\n                float(getattr(\n                    config,\n                    "rlhf_dpo_anchored_chosen_floor_weight",\n                    1.0,\n                )),\n                0.0,\n            )\n            rejected_weight = max(\n'''
+          if s.count(old) != 1:
+              raise SystemExit('BaseModelSetup: Anchored header marker mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''            rejected_violation = F.relu(rejected_ratio - rejected_target)\n\n            rejected_pair_loss = rejected_weight * F.smooth_l1_loss(\n'''
+          new = '''            anchored_chosen_floor_violation = F.relu(-chosen_ratio)\n            anchored_chosen_floor_loss = (\n                anchored_chosen_floor_weight\n                * F.smooth_l1_loss(\n                    anchored_chosen_floor_violation,\n                    torch.zeros_like(anchored_chosen_floor_violation),\n                    beta=huber_delta,\n                    reduction="none",\n                )\n            )\n\n            rejected_violation = F.relu(rejected_ratio - rejected_target)\n\n            rejected_pair_loss = rejected_weight * F.smooth_l1_loss(\n'''
+          if s.count(old) != 1:
+              raise SystemExit('BaseModelSetup: rejected violation marker mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''            raw_pair_total_loss = (\n                rejected_pair_loss\n                + margin_penalty_loss\n                + wrong_order_penalty_loss\n            )\n'''
+          new = '''            raw_pair_total_loss = (\n                anchored_chosen_floor_loss\n                + rejected_pair_loss\n                + margin_penalty_loss\n                + wrong_order_penalty_loss\n            )\n'''
+          if s.count(old) != 1:
+              raise SystemExit('BaseModelSetup: Anchored total marker mismatch')
+          s = s.replace(old, new, 1)
+
+          old = '''            "wrong_order_violation": wrong_order_violation.detach().mean().item(),\n            "chosen_anchor_active": float(\n'''
+          new = '''            "wrong_order_violation": wrong_order_violation.detach().mean().item(),\n            "anchored_chosen_floor_weight": float(anchored_chosen_floor_weight),\n            "anchored_chosen_floor_loss": anchored_chosen_floor_loss.detach().mean().item(),\n            "anchored_chosen_floor_violation": anchored_chosen_floor_violation.detach().mean().item(),\n            "anchored_chosen_floor_active_fraction": (\n                (anchored_chosen_floor_violation.detach() > 0)\n                .float()\n                .mean()\n                .item()\n            ),\n            "chosen_anchor_active": float(\n'''
+          if s.count(old) != 1:
+              raise SystemExit('BaseModelSetup: metrics marker mismatch')
+          s = s.replace(old, new, 1)
+          p.write_text(s, encoding='utf-8')
+
+          # 2) Config: retain legacy chosen target/weight for old JSONs, but add
+          # the only chosen-side Anchored knob that is actually used now.
+          p = Path('modules/util/config/TrainConfig.py')
+          s = p.read_text(encoding='utf-8')
+          decl_old = '''    rlhf_dpo_anchored_chosen_weight: float\n    rlhf_dpo_anchored_rejected_weight: float\n'''
+          decl_new = '''    rlhf_dpo_anchored_chosen_weight: float\n    rlhf_dpo_anchored_chosen_floor_weight: float\n    rlhf_dpo_anchored_rejected_weight: float\n'''
+          count = s.count(decl_old)
+          if count < 1:
+              raise SystemExit('TrainConfig: anchored declaration marker missing')
+          s = s.replace(decl_old, decl_new)
+
+          def_old = '''        data.append(("rlhf_dpo_anchored_chosen_weight", 0.0, float, False))\n        data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))\n'''
+          def_new = '''        data.append(("rlhf_dpo_anchored_chosen_weight", 0.0, float, False))\n        data.append(("rlhf_dpo_anchored_chosen_floor_weight", 1.0, float, False))\n        data.append(("rlhf_dpo_anchored_rejected_weight", 1.0, float, False))\n'''
+          count = s.count(def_old)
+          if count < 1:
+              raise SystemExit('TrainConfig: anchored defaults marker missing')
+          s = s.replace(def_old, def_new)
+          p.write_text(s, encoding='utf-8')
+
+          # 3) Clean Anchored UI: remove the legacy/no-op chosen target + chosen
+          # weight, expose only the native chosen floor weight and active terms.
+          p = Path('modules/ui/BaseRLHFTabView.py')
+          s = p.read_text(encoding='utf-8')
+          start = s.index('        self.components.label(\n            anchored_reject,\n            0,\n            0,\n            "Anchored Reject",')
+          end = s.index('        balanced_reject = self.components.section_frame(frame, 2)', start)
+          block = '''        self.components.label(\n            anchored_reject,\n            0,\n            0,\n            "Anchored Reject",\n            tooltip=(\n                "Constrained preference objective: chosen reward is kept at or "\n                "above the fixed reference level (0), rejected reward is pushed "\n                "below its target, and the pair must reach the configured margin. "\n                "Chosen also receives one full normal-training loss."\n            ),\n            wide_tooltip=True,\n        )\n\n        self.components.label(\n            anchored_reject,\n            1,\n            0,\n            "Chosen Floor Weight",\n            tooltip=(\n                "Strength of the one-sided chosen reward floor. It is active "\n                "only while chosen_reward < 0; the floor itself is fixed at 0."\n            ),\n        )\n        self.components.entry(\n            anchored_reject,\n            1,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_chosen_floor_weight",\n        )\n\n        self.components.label(anchored_reject, 2, 0, "Rejected Target")\n        self.components.entry(\n            anchored_reject,\n            2,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_rejected_target",\n        )\n\n        self.components.label(anchored_reject, 3, 0, "Rejected Weight")\n        self.components.entry(\n            anchored_reject,\n            3,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_rejected_weight",\n        )\n\n        self.components.label(\n            anchored_reject,\n            4,\n            0,\n            "Huber Delta",\n            tooltip=(\n                "Smooth-L1 transition point shared by chosen-floor, rejected-"\n                "anchor, margin, and wrong-order penalties."\n            ),\n        )\n        self.components.entry(\n            anchored_reject,\n            4,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_huber_delta",\n        )\n\n        self.components.label(\n            anchored_reject,\n            5,\n            0,\n            "Margin Target",\n            tooltip=(\n                "Require chosen_reward - rejected_reward to reach this value."\n            ),\n        )\n        self.components.entry(\n            anchored_reject,\n            5,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_margin_target",\n        )\n\n        self.components.label(\n            anchored_reject,\n            6,\n            0,\n            "Margin Weight",\n            tooltip="Strength of the positive target-margin penalty.",\n        )\n        self.components.entry(\n            anchored_reject,\n            6,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_margin_weight",\n        )\n\n        self.components.label(\n            anchored_reject,\n            7,\n            0,\n            "Wrong-Order Weight",\n            tooltip=(\n                "Extra rescue pressure only while rejected_reward is greater "\n                "than chosen_reward. Set to 0 to rely on the margin term alone."\n            ),\n        )\n        self.components.entry(\n            anchored_reject,\n            7,\n            1,\n            ui_state,\n            "rlhf_dpo_anchored_wrong_order_weight",\n        )\n\n'''
+          s = s[:start] + block + s[end:]
+          s = s.replace(
+              '"IPO targets a fixed reward margin. Anchored Reject keeps its "\n                "existing anchor/margin behavior. Balanced Reject trains chosen "',
+              '"IPO targets a fixed reward margin. Anchored Reject enforces a "\n                "chosen floor, rejected ceiling, and minimum pair margin. "\n                "Balanced Reject trains chosen "',
+              1,
+          )
+          p.write_text(s, encoding='utf-8')
+
+          # 4) Remove temporary model-specific floor mixin now that the term is native.
+          for path in ('modules/modelSetup/MageFlowLoRASetup.py', 'modules/modelSetup/Flux2LoRASetup.py'):
+              p = Path(path)
+              s = p.read_text(encoding='utf-8')
+              s = s.replace(
+                  'from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin\n',
+                  '',
+              )
+              s = s.replace('    AnchoredRejectChosenFloorMixin,\n', '')
+              p.write_text(s, encoding='utf-8')
+
+          mixin = Path('modules/modelSetup/mixin/AnchoredRejectChosenFloorMixin.py')
+          if mixin.exists():
+              mixin.unlink()
+
+          # Basic source-level assertions only; no tests requested.
+          base = Path('modules/modelSetup/BaseModelSetup.py').read_text(encoding='utf-8')
+          ui = Path('modules/ui/BaseRLHFTabView.py').read_text(encoding='utf-8')
+          cfg = Path('modules/util/config/TrainConfig.py').read_text(encoding='utf-8')
+          assert 'anchored_chosen_floor_loss' in base
+          assert 'rlhf_dpo_anchored_chosen_floor_weight' in cfg
+          assert 'Chosen Floor Weight' in ui
+          assert '"Chosen Target"' not in ui
+          assert '"Chosen Weight"' not in ui
+          PY
+
+          git rm -f .github/workflows/apply-anchored-native.yml
+          git add -A
+          git config user.name "Alexm-wq"
+          git config user.email "alexme.travel@gmail.com"
+          git commit -m "Make Anchored Reject chosen floor native"
+          git push origin mage-flow-full
