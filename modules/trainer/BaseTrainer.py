@@ -97,8 +97,95 @@ class BaseTrainer(
             self.config.training_method
         )
 
+    def _gradient_l2_from_parameter_grads(self) -> float:
+        total_sq = 0.0
+        for parameter in self.parameters:
+            grad = parameter.grad
+            if grad is None:
+                continue
+            detached_f32 = grad.detach().float()
+            total_sq += float(
+                torch.sum(detached_f32 * detached_f32).detach().cpu().item()
+            )
+        return math.sqrt(max(total_sq, 0.0))
+
+    @staticmethod
+    def _format_gradient_value(value: float | None) -> str:
+        return "" if value is None else f"{value:.12g}"
+
+    def _write_gradient_magnitude_row(
+            self,
+            global_step: int,
+            self_flow_gradient_magnitude: float,
+            dpo_gradient_magnitude: float,
+    ):
+        csv_path = Path(__file__).resolve().parents[2] / "gradient_magnitude.csv"
+        fieldnames = [
+            "global_step",
+            "self_flow_gradient_magnitude",
+            "dpo_gradient_magnitude",
+            "dpo_to_self_flow_ratio",
+        ]
+
+        # Transparently upgrade the original two-column CSV while preserving
+        # rows already collected before Self-Flow probing was added.
+        if csv_path.exists() and csv_path.stat().st_size > 0:
+            with csv_path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                old_fieldnames = reader.fieldnames or []
+                old_rows = list(reader)
+            if old_fieldnames != fieldnames:
+                with csv_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for row in old_rows:
+                        writer.writerow({
+                            "global_step": row.get("global_step", ""),
+                            "self_flow_gradient_magnitude": row.get(
+                                "self_flow_gradient_magnitude", ""
+                            ),
+                            "dpo_gradient_magnitude": row.get(
+                                "dpo_gradient_magnitude", ""
+                            ),
+                            "dpo_to_self_flow_ratio": row.get(
+                                "dpo_to_self_flow_ratio", ""
+                            ),
+                        })
+
+        ratio = (
+            dpo_gradient_magnitude / self_flow_gradient_magnitude
+            if self_flow_gradient_magnitude > 0.0
+            else None
+        )
+        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
+        with csv_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "global_step": global_step,
+                "self_flow_gradient_magnitude": self._format_gradient_value(
+                    self_flow_gradient_magnitude
+                ),
+                "dpo_gradient_magnitude": self._format_gradient_value(
+                    dpo_gradient_magnitude
+                ),
+                "dpo_to_self_flow_ratio": self._format_gradient_value(ratio),
+            })
+
     def _GenericTrainer__backward_dpo_with_gradient_probe(self, loss: torch.Tensor):
-        """Backward a DPO component while recording its incoming gradient L2 norm."""
+        """Backward DPO while comparing it with the existing normal/Self-Flow gradient.
+
+        The normal/chosen Self-Flow component is differentiated first in the
+        sequential RLHF path. Its gradient is therefore already present in
+        ``parameter.grad`` when this DPO probe is entered. We measure that L2
+        norm before DPO backward, then use leaf hooks to measure only the
+        incoming DPO contribution without altering either gradient.
+        """
+        self_flow_gradient_magnitude = self._gradient_l2_from_parameter_grads()
+        if not math.isfinite(self_flow_gradient_magnitude):
+            raise RuntimeError("Self-Flow gradient magnitude became NaN or Inf.")
+
         grad_sq_by_device: dict[torch.device, torch.Tensor] = {}
         handles = []
 
@@ -127,26 +214,35 @@ class BaseTrainer(
             float(value.detach().cpu().item())
             for value in grad_sq_by_device.values()
         )
-        gradient_magnitude = math.sqrt(max(total_sq, 0.0))
-        if not math.isfinite(gradient_magnitude):
+        dpo_gradient_magnitude = math.sqrt(max(total_sq, 0.0))
+        if not math.isfinite(dpo_gradient_magnitude):
             raise RuntimeError("DPO gradient magnitude became NaN or Inf.")
 
         train_progress = getattr(getattr(self, "model", None), "train_progress", None)
         global_step = int(getattr(train_progress, "global_step", -1))
 
         self.tensorboard.add_scalar(
-            "rlhf/dpo_gradient_magnitude",
-            gradient_magnitude,
+            "rlhf/self_flow_gradient_magnitude",
+            self_flow_gradient_magnitude,
             global_step,
         )
+        self.tensorboard.add_scalar(
+            "rlhf/dpo_gradient_magnitude",
+            dpo_gradient_magnitude,
+            global_step,
+        )
+        if self_flow_gradient_magnitude > 0.0:
+            self.tensorboard.add_scalar(
+                "rlhf/dpo_to_self_flow_gradient_ratio",
+                dpo_gradient_magnitude / self_flow_gradient_magnitude,
+                global_step,
+            )
 
-        csv_path = Path(__file__).resolve().parents[2] / "gradient_magnitude.csv"
-        write_header = not csv_path.exists() or csv_path.stat().st_size == 0
-        with csv_path.open("a", newline="", encoding="utf-8") as handle:
-            writer = csv.writer(handle)
-            if write_header:
-                writer.writerow(["global_step", "dpo_gradient_magnitude"])
-            writer.writerow([global_step, f"{gradient_magnitude:.12g}"])
+        self._write_gradient_magnitude_row(
+            global_step,
+            self_flow_gradient_magnitude,
+            dpo_gradient_magnitude,
+        )
 
     def _start_tensorboard(self):
         tensorboard_executable = shutil.which("tensorboard")
