@@ -28,12 +28,17 @@ class MageFlowFineTuneSetup(BaseMageFlowSetup):
         return MageFlowModel.image_shapes(batch_size, height, width)
 
     def setup_optimizations(self, model: MageFlowModel, config: TrainConfig):
+        # Keep Mage's checkpoint scheduler shift as an inference property only.
+        # The explicit OneTrainer training timestep shift must survive the base
+        # setup's legacy shift=1 -> checkpoint-shift fallback unchanged.
+        requested_timestep_shift = float(config.timestep_shift)
         requested_compile = bool(config.compile)
         config.compile = False
         try:
             super().setup_optimizations(model, config)
         finally:
             config.compile = requested_compile
+            config.timestep_shift = requested_timestep_shift
 
         setup_mage_like_flux2(self, model, config)
 
