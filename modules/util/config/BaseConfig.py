@@ -33,6 +33,10 @@ class BaseConfig:
                 # Preserve the existing full chosen+rejected Self-Flow DPO
                 # behavior unless the user explicitly opts out.
                 data.append(("rlhf_dpo_self_flow", True, bool, False))
+            if "rlhf_dpo_max_timestep" not in existing_names:
+                # Literal fraction of the scheduler range. For 1000 training
+                # timesteps, 0.95 means DPO samples are limited to t <= 950.
+                data.append(("rlhf_dpo_max_timestep", 0.95, float, False))
 
         self.types = {}
         self.nullables = {}
