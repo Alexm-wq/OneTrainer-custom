@@ -14,6 +14,7 @@ class _BaseSetup:
         self._dpo_stream_active = SimpleNamespace(get=lambda: False)
         self._reference_prediction = False
         self.recorded_metrics = {}
+        self._last_dpo_metrics = {"reward_margin": 0.0}
 
     def rlhf_chosen_supervised_weight(self, config, objective):
         # Simulate BaseMageFlowSetup's legacy Self-Flow attenuation. BR-v2 must
@@ -30,6 +31,13 @@ class _BaseSetup:
     def rlhf_policy_auxiliary_loss(self, model, batch, data, config):
         value = data.get("base_aux")
         return value
+
+    def calculate_dpo_loss(self, model, batch, config, train_progress, **kwargs):
+        self._last_dpo_metrics = {"reward_margin": 0.0}
+        return torch.tensor(0.0, requires_grad=True)
+
+    def get_last_dpo_metrics(self):
+        return self._last_dpo_metrics
 
     def _record_self_flow_metric(self, name, value):
         self.recorded_metrics[name] = float(value)
@@ -197,6 +205,40 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
             rejected_rep.grad,
             torch.tensor([0.25, 0.25]),
         )
+
+    def test_streamed_dispatch_keeps_brv2_active_for_backward_replay(self):
+        setup = _Setup()
+        balanced = self._config(DPOObjective.BALANCED_REJECT)
+        sigmoid = self._config(DPOObjective.SIGMOID)
+
+        setup.calculate_dpo_loss(
+            None,
+            {},
+            balanced,
+            None,
+            streamed=True,
+        )
+        self.assertTrue(setup._brv2_active)
+
+        # The next non-BR dispatch must clear the state left alive for the
+        # previous custom-autograd replay window.
+        setup.calculate_dpo_loss(
+            None,
+            {},
+            sigmoid,
+            None,
+            streamed=True,
+        )
+        self.assertFalse(setup._brv2_active)
+
+        setup.calculate_dpo_loss(
+            None,
+            {},
+            balanced,
+            None,
+            streamed=False,
+        )
+        self.assertFalse(setup._brv2_active)
 
     def test_budget_ema_changes_value_but_not_policy_gradient(self):
         setup = _Setup()
