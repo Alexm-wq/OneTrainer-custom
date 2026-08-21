@@ -151,11 +151,13 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
             config,
         )
         self.assertIsNotNone(loss)
-        self.assertAlmostEqual(loss.item(), 15.0)
+        # Preserve the original 2B mean normalization with a zeroed chosen half:
+        # 0.5 * mean([10, 20]) = 7.5.
+        self.assertAlmostEqual(loss.item(), 7.5)
         loss.backward()
         torch.testing.assert_close(
             rep.grad,
-            torch.tensor([0.0, 0.0, 0.5, 0.5]),
+            torch.tensor([0.0, 0.0, 0.25, 0.25]),
         )
         self.assertIn("loss/self_flow_rep_rejected_dpo", setup.recorded_metrics)
 
@@ -189,11 +191,11 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
             config,
         )
         self.assertIsNotNone(rejected_loss)
-        self.assertAlmostEqual(rejected_loss.item(), 15.0)
+        self.assertAlmostEqual(rejected_loss.item(), 7.5)
         rejected_loss.backward()
         torch.testing.assert_close(
             rejected_rep.grad,
-            torch.tensor([0.5, 0.5]),
+            torch.tensor([0.25, 0.25]),
         )
 
     def test_budget_ema_changes_value_but_not_policy_gradient(self):
