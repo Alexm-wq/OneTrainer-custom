@@ -312,7 +312,31 @@ class BaseTrainer(
             for parameter in self.parameters:
                 if parameter.requires_grad:
                     handles.append(parameter.register_hook(capture))
-            loss.backward()
+
+            # Some local/custom GenericTrainer revisions route DPO backward
+            # through this probe. Preserve the actual momentum-bypass semantics
+            # in that case instead of turning the logger into a training change.
+            bypass_enabled_fn = getattr(
+                self,
+                "_GenericTrainer__dpo_momentum_bypass_enabled",
+                None,
+            )
+            bypass_backward_fn = getattr(
+                self,
+                "_GenericTrainer__backward_dpo_without_momentum",
+                None,
+            )
+            if (
+                callable(bypass_enabled_fn)
+                and callable(bypass_backward_fn)
+                and bool(bypass_enabled_fn())
+            ):
+                # Probe hooks were registered first, so they observe the
+                # original incoming gradient before the bypass hook zeroes the
+                # transient tensor and stores its FP32 CPU copy.
+                bypass_backward_fn(loss)
+            else:
+                loss.backward()
         finally:
             for handle in handles:
                 handle.remove()
