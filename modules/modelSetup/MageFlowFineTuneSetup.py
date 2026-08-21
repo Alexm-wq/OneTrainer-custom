@@ -2,6 +2,7 @@ import modules.util.multi_gpu_util as multi
 from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.modelSetup.mixin.MageCleanDPORewardMixin import MageCleanDPORewardMixin
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
 from modules.module.MageFlowEMAStorage import create_mage_self_flow_ema, log_mage_runtime_devices
 from modules.module.MageFlowNativeOptimization import setup_mage_like_flux2
@@ -19,7 +20,7 @@ import torch
 
 
 @factory.register(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.FINE_TUNE)
-class MageFlowFineTuneSetup(BaseMageFlowSetup):
+class MageFlowFineTuneSetup(MageCleanDPORewardMixin, BaseMageFlowSetup):
     def __init__(self, train_device: torch.device, temp_device: torch.device, debug_mode: bool):
         super().__init__(train_device=train_device, temp_device=temp_device, debug_mode=debug_mode)
 
