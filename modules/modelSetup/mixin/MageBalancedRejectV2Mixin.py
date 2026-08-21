@@ -25,9 +25,12 @@ class MageBalancedRejectV2Mixin:
       a small target;
     * the chosen reward used as the rejected suppression budget is smoothed by
       a per-pair EMA on the ordinary batched DPO path;
-    * the boost remains part of the independent chosen supervised term, so
-      hard-pair curriculum continues to scale only the rejected preference
-      branch.
+    * the chosen positive Self-Flow objective is always a separate normal
+      backward, so DPO curriculum/no-momentum scaling cannot attenuate it;
+    * when full Self-Flow DPO is enabled, its representation/structural
+      auxiliary is applied only to rejected. Chosen already receives the full
+      generation + representation + structural objective in its separate
+      positive pass and must not receive a second copy from the DPO policy pass.
 
     Settings intentionally use getattr defaults for backwards compatibility:
       rlhf_dpo_balanced_margin_target       (default 0.03)
@@ -38,6 +41,7 @@ class MageBalancedRejectV2Mixin:
     _BRV2_MARGIN_TARGET = 0.03
     _BRV2_BOOTSTRAP_WEIGHT = 0.50
     _BRV2_BUDGET_EMA = 0.90
+    _BRV2_BRANCH_KEY = "_ot_brv2_dpo_branch"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -47,6 +51,7 @@ class MageBalancedRejectV2Mixin:
         self._brv2_active = False
         self._brv2_raw_chosen_reward_mean = 0.0
         self._brv2_ema_chosen_reward_mean = 0.0
+        self._brv2_rejected_policy_aux_value = 0.0
         self._brv2_warned_streamed_budget_ema = False
 
     @staticmethod
@@ -118,6 +123,14 @@ class MageBalancedRejectV2Mixin:
                 continue
         return False
 
+    def _create_dpo_stream_batches(self, batch: dict):
+        chosen, rejected, chosen_b = super()._create_dpo_stream_batches(batch)
+        chosen = dict(chosen)
+        rejected = dict(rejected)
+        chosen[self._BRV2_BRANCH_KEY] = "chosen"
+        rejected[self._BRV2_BRANCH_KEY] = "rejected"
+        return chosen, rejected, chosen_b
+
     def rlhf_chosen_supervised_requires_separate_forward(
             self,
             config: TrainConfig,
@@ -135,13 +148,100 @@ class MageBalancedRejectV2Mixin:
             objective,
     ) -> float:
         objective = DPOObjective(objective)
-        base = super().rlhf_chosen_supervised_weight(config, objective)
         if objective != DPOObjective.BALANCED_REJECT:
-            return base
+            return super().rlhf_chosen_supervised_weight(config, objective)
 
+        # Balanced Reject semantics are one full ordinary chosen objective.
+        # Do NOT call BaseMageFlowSetup's legacy Self-Flow attenuation here:
+        # that would silently turn BR-v2's intended 1.0-1.5x positive training
+        # into 0.25-0.375x whenever Self-Flow is enabled.
+        base = 1.0
         target, bootstrap, _ = self._brv2_validate_settings(config)
         factor = self._brv2_bootstrap_factor(self._brv2_last_margin, target)
-        return float(base) * (1.0 + bootstrap * factor)
+        return base * (1.0 + bootstrap * factor)
+
+    def rlhf_policy_auxiliary_loss(
+            self,
+            model,
+            batch: dict,
+            data: dict,
+            config: TrainConfig,
+    ) -> Tensor | None:
+        if not self._brv2_active:
+            return super().rlhf_policy_auxiliary_loss(
+                model,
+                batch,
+                data,
+                config,
+            )
+
+        # The separate chosen BR-v2 pass already contains generation +
+        # representation + optional structural Self-Flow. The DPO policy pass
+        # still needs Self-Flow on rejected, but applying its auxiliary to the
+        # chosen half as well would train chosen representation/structure twice.
+        if not config.self_flow_enabled or not data.get("self_flow_dpo_policy", False):
+            return None
+
+        rep_per_sample = data.get("self_flow_representation_loss_per_sample")
+        if rep_per_sample is None:
+            raise RuntimeError(
+                "Mage BR-v2 Self-Flow DPO policy forward is missing representation loss"
+            )
+
+        branch = batch.get(self._BRV2_BRANCH_KEY)
+        if branch == "chosen":
+            return None
+        if branch == "rejected":
+            rejected_rep = rep_per_sample
+        else:
+            if rep_per_sample.ndim == 0 or int(rep_per_sample.shape[0]) % 2 != 0:
+                raise RuntimeError(
+                    "Mage BR-v2 batched Self-Flow auxiliary requires an even "
+                    "chosen/rejected batch"
+                )
+            half = int(rep_per_sample.shape[0]) // 2
+            rejected_rep = rep_per_sample[half:]
+
+        rep = rejected_rep.mean()
+        result = float(config.self_flow_rep_weight) * rep
+        structural = None
+        if config.self_flow_structural_enabled:
+            structural_per_sample = data.get("self_flow_structural_loss_per_sample")
+            if structural_per_sample is None:
+                raise RuntimeError(
+                    "Mage BR-v2 structural Self-Flow DPO policy forward is "
+                    "missing structural loss"
+                )
+            if branch == "rejected":
+                rejected_structural = structural_per_sample
+            else:
+                if (
+                    structural_per_sample.ndim == 0
+                    or int(structural_per_sample.shape[0]) % 2 != 0
+                ):
+                    raise RuntimeError(
+                        "Mage BR-v2 batched structural auxiliary requires an "
+                        "even chosen/rejected batch"
+                    )
+                half = int(structural_per_sample.shape[0]) // 2
+                rejected_structural = structural_per_sample[half:]
+            structural = rejected_structural.mean()
+            result = result + float(config.self_flow_structural_weight) * structural
+
+        self._brv2_rejected_policy_aux_value = float(
+            result.detach().float().item()
+        )
+        if data.get("self_flow_training_pass", False):
+            self._record_self_flow_metric(
+                "loss/self_flow_rep_rejected_dpo",
+                rep.detach().item(),
+            )
+            if structural is not None:
+                self._record_self_flow_metric(
+                    "loss/self_flow_structural_rejected_dpo",
+                    structural.detach().item(),
+                )
+        return result
 
     def _brv2_pair_key(self, batch: dict, index: int) -> str | None:
         try:
@@ -243,6 +343,7 @@ class MageBalancedRejectV2Mixin:
             self._brv2_reference_chosen_by_pair.clear()
             self._brv2_raw_chosen_reward_mean = 0.0
             self._brv2_ema_chosen_reward_mean = 0.0
+            self._brv2_rejected_policy_aux_value = 0.0
 
         try:
             result = super().calculate_dpo_loss(
@@ -277,6 +378,10 @@ class MageBalancedRejectV2Mixin:
                 "balanced_v2_raw_chosen_reward": self._brv2_raw_chosen_reward_mean,
                 "balanced_v2_ema_chosen_reward": self._brv2_ema_chosen_reward_mean,
                 "balanced_v2_budget_ema_active": float(not streamed),
+                "balanced_v2_chosen_policy_aux_loss": 0.0,
+                "balanced_v2_rejected_policy_aux_loss": (
+                    self._brv2_rejected_policy_aux_value
+                ),
             })
             self._last_dpo_metrics = metrics
 
