@@ -13,19 +13,26 @@ class _BaseSetup:
     def __init__(self):
         self._dpo_stream_active = SimpleNamespace(get=lambda: False)
         self._reference_prediction = False
+        self.recorded_metrics = {}
 
     def rlhf_chosen_supervised_weight(self, config, objective):
-        return (
-            1.0
-            if DPOObjective(objective) == DPOObjective.BALANCED_REJECT
-            else 0.25
-        )
+        # Simulate BaseMageFlowSetup's legacy Self-Flow attenuation. BR-v2 must
+        # deliberately bypass this for Balanced Reject while preserving it for
+        # every other objective.
+        return 0.25
 
     def rlhf_chosen_supervised_requires_separate_forward(self, config):
         return False
 
     def rlhf_logp_per_sample(self, model, batch, data, config):
         return data["score"]
+
+    def rlhf_policy_auxiliary_loss(self, model, batch, data, config):
+        value = data.get("base_aux")
+        return value
+
+    def _record_self_flow_metric(self, name, value):
+        self.recorded_metrics[name] = float(value)
 
     def _dpo_reference_prediction(self):
         return self._reference_prediction
@@ -45,6 +52,10 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
         return SimpleNamespace(
             rlhf_dpo_objective=objective,
             concepts=None,
+            self_flow_enabled=True,
+            self_flow_rep_weight=1.0,
+            self_flow_structural_enabled=False,
+            self_flow_structural_weight=0.25,
         )
 
     def test_bootstrap_factor_tracks_margin_deficit(self):
@@ -71,12 +82,12 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
         adjusted.backward()
         self.assertEqual(value.grad.item(), 1.0)
 
-    def test_chosen_bootstrap_starts_strong_and_turns_off_at_margin(self):
+    def test_chosen_bootstrap_ignores_legacy_self_flow_attenuation(self):
         setup = _Setup()
         config = self._config()
 
-        # First pair intentionally gets the full rescue so zero-margin startup
-        # cannot deadlock Balanced Reject.
+        # Base setup reports 0.25, but Balanced Reject semantics require one
+        # full positive chosen objective plus the dynamic rescue.
         self.assertAlmostEqual(
             setup.rlhf_chosen_supervised_weight(
                 config,
@@ -103,6 +114,15 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
             1.0,
         )
 
+        # Non-Balanced objectives retain the model family's existing policy.
+        self.assertAlmostEqual(
+            setup.rlhf_chosen_supervised_weight(
+                config,
+                DPOObjective.SIGMOID,
+            ),
+            0.25,
+        )
+
     def test_balanced_reject_chosen_backward_is_always_separate(self):
         setup = _Setup()
         balanced = self._config(DPOObjective.BALANCED_REJECT)
@@ -113,6 +133,67 @@ class MageBalancedRejectV2Tests(unittest.TestCase):
         )
         self.assertFalse(
             setup.rlhf_chosen_supervised_requires_separate_forward(sigmoid)
+        )
+
+    def test_fast_policy_auxiliary_trains_rejected_half_only(self):
+        setup = _Setup()
+        setup._brv2_active = True
+        config = self._config()
+        rep = torch.tensor([1.0, 2.0, 10.0, 20.0], requires_grad=True)
+        loss = setup.rlhf_policy_auxiliary_loss(
+            None,
+            {},
+            {
+                "self_flow_dpo_policy": True,
+                "self_flow_training_pass": True,
+                "self_flow_representation_loss_per_sample": rep,
+            },
+            config,
+        )
+        self.assertIsNotNone(loss)
+        self.assertAlmostEqual(loss.item(), 15.0)
+        loss.backward()
+        torch.testing.assert_close(
+            rep.grad,
+            torch.tensor([0.0, 0.0, 0.5, 0.5]),
+        )
+        self.assertIn("loss/self_flow_rep_rejected_dpo", setup.recorded_metrics)
+
+    def test_streamed_policy_auxiliary_skips_chosen_and_keeps_rejected(self):
+        setup = _Setup()
+        setup._brv2_active = True
+        config = self._config()
+
+        chosen_rep = torch.tensor([1.0, 2.0], requires_grad=True)
+        chosen_loss = setup.rlhf_policy_auxiliary_loss(
+            None,
+            {setup._BRV2_BRANCH_KEY: "chosen"},
+            {
+                "self_flow_dpo_policy": True,
+                "self_flow_training_pass": True,
+                "self_flow_representation_loss_per_sample": chosen_rep,
+            },
+            config,
+        )
+        self.assertIsNone(chosen_loss)
+
+        rejected_rep = torch.tensor([10.0, 20.0], requires_grad=True)
+        rejected_loss = setup.rlhf_policy_auxiliary_loss(
+            None,
+            {setup._BRV2_BRANCH_KEY: "rejected"},
+            {
+                "self_flow_dpo_policy": True,
+                "self_flow_training_pass": True,
+                "self_flow_representation_loss_per_sample": rejected_rep,
+            },
+            config,
+        )
+        self.assertIsNotNone(rejected_loss)
+        self.assertAlmostEqual(rejected_loss.item(), 15.0)
+        rejected_loss.backward()
+        torch.testing.assert_close(
+            rejected_rep.grad,
+            torch.tensor([0.5, 0.5]),
         )
 
     def test_budget_ema_changes_value_but_not_policy_gradient(self):
