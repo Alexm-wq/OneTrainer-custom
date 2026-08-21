@@ -3,6 +3,7 @@ from modules.model.MageFlowModel import MageFlowModel
 from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin
+from modules.modelSetup.mixin.MageBalancedRejectV2Mixin import MageBalancedRejectV2Mixin
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
 from modules.module.MageFlowEMAStorage import (
@@ -25,6 +26,7 @@ import torch
 
 @factory.register(BaseModelSetup, ModelType.MAGE_FLOW, TrainingMethod.LORA)
 class MageFlowLoRASetup(
+    MageBalancedRejectV2Mixin,
     AnchoredRejectChosenFloorMixin,
     MageFlowLinearDPOGPUReferenceMixin,
     BaseMageFlowSetup,
@@ -35,13 +37,6 @@ class MageFlowLoRASetup(
     @staticmethod
     def _image_shapes(batch_size: int, height: int, width: int):
         return MageFlowModel.image_shapes(batch_size, height, width)
-
-    @staticmethod
-    def rlhf_chosen_supervised_weight(config: TrainConfig, objective) -> float:
-        # Do not attenuate chosen supervision merely because Self-Flow is enabled.
-        # Anchored/Balanced therefore keep their full 1.0 chosen objective, while
-        # other objectives use exactly the configured Supervised Mix weight.
-        return BaseModelSetup.rlhf_chosen_supervised_weight(config, objective)
 
     def predict(
             self,
