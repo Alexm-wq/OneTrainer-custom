@@ -4,6 +4,7 @@ from modules.modelSetup.BaseMageFlowSetup import BaseMageFlowSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.AnchoredRejectChosenFloorMixin import AnchoredRejectChosenFloorMixin
 from modules.modelSetup.mixin.MageBalancedRejectV2Mixin import MageBalancedRejectV2Mixin
+from modules.modelSetup.mixin.MageCleanDPORewardMixin import MageCleanDPORewardMixin
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.MageFlowAttention import configure_mage_attention_from_config
 from modules.module.MageFlowEMAStorage import (
@@ -28,6 +29,7 @@ import torch
 class MageFlowLoRASetup(
     MageBalancedRejectV2Mixin,
     AnchoredRejectChosenFloorMixin,
+    MageCleanDPORewardMixin,
     MageFlowLinearDPOGPUReferenceMixin,
     BaseMageFlowSetup,
 ):
