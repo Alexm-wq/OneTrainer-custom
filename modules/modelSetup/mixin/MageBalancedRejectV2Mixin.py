@@ -346,10 +346,16 @@ class MageBalancedRejectV2Mixin:
             config.rlhf_dpo_objective if objective is None else objective
         )
         brv2 = effective_objective == DPOObjective.BALANCED_REJECT
+
+        # Always refresh the mode at the start of a dispatch. A streamed BR-v2
+        # call deliberately leaves this True after returning because its custom
+        # autograd function re-enters rlhf_logp_per_sample() and
+        # rlhf_policy_auxiliary_loss() during backward replay.
+        self._brv2_active = brv2
+        self._brv2_reference_chosen_by_pair.clear()
+
         if brv2:
             self._brv2_validate_settings(config)
-            self._brv2_active = True
-            self._brv2_reference_chosen_by_pair.clear()
             self._brv2_raw_chosen_reward_mean = 0.0
             self._brv2_ema_chosen_reward_mean = 0.0
             self._brv2_rejected_policy_aux_value = 0.0
@@ -367,7 +373,12 @@ class MageBalancedRejectV2Mixin:
                 external_chosen_supervised_loss_value=external_chosen_supervised_loss_value,
             )
         finally:
-            if brv2:
+            if not streamed:
+                self._brv2_active = False
+                self._brv2_reference_chosen_by_pair.clear()
+            elif not brv2:
+                # A non-BR streamed dispatch must also clear any state left by
+                # the preceding BR-v2 replay window.
                 self._brv2_active = False
                 self._brv2_reference_chosen_by_pair.clear()
 
