@@ -209,6 +209,51 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
         else:
             return _perturb_cep(embedding)
 
+    def _dpo_cap_timestep_by_rejection(
+            self,
+            timestep: Tensor,
+            num_train_timesteps: int,
+            generator: Generator,
+            config: TrainConfig,
+            shift: float,
+    ) -> Tensor:
+        dpo_active = getattr(self, "_dpo_conditioning_locked", None)
+        if not callable(dpo_active) or not dpo_active():
+            return timestep
+
+        max_fraction = float(getattr(config, "rlhf_dpo_max_timestep", 0.95))
+        if not math.isfinite(max_fraction) or not 0.0 < max_fraction <= 1.0:
+            raise ValueError(
+                "DPO max timestep must satisfy 0 < value <= 1, "
+                f"got {max_fraction}"
+            )
+
+        # This is a literal fraction of the scheduler range, not a percentile.
+        # For 1000 scheduler steps, 0.95 therefore allows t <= 950.
+        cap = min(
+            int(num_train_timesteps * max_fraction),
+            num_train_timesteps - 1,
+        )
+        over_cap = timestep > cap
+        if not bool(over_cap.any()):
+            return timestep
+
+        # Re-sample only rejected draws instead of clamping them to the cap.
+        # That preserves the original timestep distribution conditioned on
+        # t <= cap and avoids creating an artificial probability spike at cap.
+        replacement_count = int(over_cap.sum().item())
+        replacements = self._get_timestep_discrete(
+            num_train_timesteps=num_train_timesteps,
+            deterministic=False,
+            generator=generator,
+            batch_size=replacement_count,
+            config=config,
+            shift=shift,
+        )
+        result = timestep.clone()
+        result[over_cap] = replacements
+        return result
+
     def _get_timestep_discrete(
             self,
             num_train_timesteps: int,
@@ -368,6 +413,13 @@ class ModelSetupNoiseMixin(metaclass=ABCMeta):
 
             timestep = timestep.to(dtype=torch.long, device=generator.device)
         timestep = timestep.clamp(min=min_timestep, max=max_timestep - 1)
+        timestep = self._dpo_cap_timestep_by_rejection(
+            timestep=timestep,
+            num_train_timesteps=num_train_timesteps,
+            generator=generator,
+            config=config,
+            shift=shift,
+        )
         return self._apply_dpo_paired_rng(timestep)
 
     def _get_timestep_continuous(
