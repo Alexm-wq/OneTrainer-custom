@@ -47,6 +47,110 @@ class BaseTrainer(
         self.commands = commands
         self.train_device = torch.device(self.config.train_device)
         self.temp_device = torch.device(self.config.temp_device)
+        # GenericTrainer accumulates a raw DPO item fraction into
+        # _dpo_bypass_update_weight. SinkSGD normalizes the captured DPO
+        # gradient before applying it, so scalar curriculum attenuation would
+        # otherwise disappear. The property below converts that raw fraction
+        # into the effective post-normalization step fraction.
+        self._dpo_bypass_effective_update_weight = 0.0
+        self._dpo_curriculum_metric_sum_seen = 0.0
+        self._dpo_curriculum_metric_weight_seen = 0.0
+
+    @property
+    def _dpo_bypass_update_weight(self) -> float:
+        return self._dpo_bypass_effective_update_weight
+
+    @_dpo_bypass_update_weight.setter
+    def _dpo_bypass_update_weight(self, value: float):
+        """Preserve DPO curriculum magnitude through SinkSGD normalization.
+
+        GenericTrainer updates this field with ``+= dpo_item_fraction / GA``
+        after each RLHF microbatch. The DPO gradient already contains each
+        pair's detached curriculum weight, which correctly changes the weighted
+        gradient direction, but SinkSGD subsequently Sinkhorn/sign-normalizes
+        that gradient and removes its global scalar attenuation. For SinkSGD's
+        momentum-bypass step only, reapply the pair-count-weighted curriculum
+        mean to the step size.
+
+        The DPO metric accumulator is updated once per dispatch group before
+        GenericTrainer increments this field. Taking deltas from that accumulator
+        therefore gives the exact mean curriculum weight for the just-finished
+        microbatch, including mixed per-concept objective dispatch groups. When
+        curriculum is disabled the metric is 1.0, preserving the old behavior.
+        """
+        value = float(value)
+        if not math.isfinite(value):
+            raise RuntimeError(
+                f"Non-finite DPO momentum-bypass update weight: {value!r}"
+            )
+
+        # GenericTrainer resets the accumulator to zero after applying the
+        # isolated DPO update. Keep metric cursors intact: TensorBoard metric
+        # accumulators may continue across optimizer windows.
+        if value == 0.0:
+            self._dpo_bypass_effective_update_weight = 0.0
+            return
+
+        current = float(self._dpo_bypass_effective_update_weight)
+        raw_increment = value - current
+        if raw_increment < -1e-12:
+            raise RuntimeError(
+                "DPO momentum-bypass update weight moved backwards without "
+                "being reset to zero."
+            )
+        if raw_increment <= 0.0:
+            return
+
+        optimizer = getattr(getattr(self, "model", None), "optimizer", None)
+        is_sinksgd = (
+            optimizer is not None
+            and optimizer.__class__.__name__ == "SinkSGD_adv"
+        )
+        if not is_sinksgd:
+            self._dpo_bypass_effective_update_weight = value
+            return
+
+        metric_name = "hard_pair_curriculum_weight"
+        metric_sums = getattr(self, "_dpo_metric_sums", {})
+        metric_weights = getattr(self, "_dpo_metric_weights", {})
+        current_sum = float(metric_sums.get(metric_name, 0.0))
+        current_weight = float(metric_weights.get(metric_name, 0.0))
+
+        previous_sum = float(self._dpo_curriculum_metric_sum_seen)
+        previous_weight = float(self._dpo_curriculum_metric_weight_seen)
+
+        # The trainer periodically flushes its metric accumulators. Detect that
+        # reset and treat the current totals as the new delta.
+        if current_weight + 1e-12 < previous_weight:
+            delta_sum = current_sum
+            delta_weight = current_weight
+        else:
+            delta_sum = current_sum - previous_sum
+            delta_weight = current_weight - previous_weight
+
+        self._dpo_curriculum_metric_sum_seen = current_sum
+        self._dpo_curriculum_metric_weight_seen = current_weight
+
+        if delta_weight > 0.0:
+            curriculum_scale = delta_sum / delta_weight
+            if (
+                not math.isfinite(curriculum_scale)
+                or curriculum_scale < -1e-6
+                or curriculum_scale > 1.0 + 1e-6
+            ):
+                raise RuntimeError(
+                    "Invalid DPO hard-pair curriculum scale for SinkSGD "
+                    f"momentum bypass: {curriculum_scale!r}"
+                )
+            curriculum_scale = min(1.0, max(0.0, curriculum_scale))
+        else:
+            # Defensive compatibility fallback. Older/custom model setups that
+            # do not report the curriculum metric retain the historical scale.
+            curriculum_scale = 1.0
+
+        self._dpo_bypass_effective_update_weight = (
+            current + raw_increment * curriculum_scale
+        )
 
     @abstractmethod
     def start(self):
