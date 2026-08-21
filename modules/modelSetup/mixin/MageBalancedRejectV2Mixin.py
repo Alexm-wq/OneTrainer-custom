@@ -203,7 +203,11 @@ class MageBalancedRejectV2Mixin:
             rejected_rep = rep_per_sample[half:]
 
         rep = rejected_rep.mean()
-        result = float(config.self_flow_rep_weight) * rep
+        # The original 2B auxiliary was mean([chosen, rejected]). After
+        # zeroing the chosen half, retain that same per-pair normalization:
+        # 0.5 * mean(rejected), not mean(rejected). Otherwise removing the
+        # duplicate chosen signal would silently double rejected SF pressure.
+        result = 0.5 * float(config.self_flow_rep_weight) * rep
         structural = None
         if config.self_flow_structural_enabled:
             structural_per_sample = data.get("self_flow_structural_loss_per_sample")
@@ -226,7 +230,12 @@ class MageBalancedRejectV2Mixin:
                 half = int(structural_per_sample.shape[0]) // 2
                 rejected_structural = structural_per_sample[half:]
             structural = rejected_structural.mean()
-            result = result + float(config.self_flow_structural_weight) * structural
+            result = (
+                result
+                + 0.5
+                * float(config.self_flow_structural_weight)
+                * structural
+            )
 
         self._brv2_rejected_policy_aux_value = float(
             result.detach().float().item()
