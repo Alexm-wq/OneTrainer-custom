@@ -13,6 +13,39 @@ def _controller_config(controller):
     return config
 
 
+def add_dpo_timestep_controls(components, master, row, controller, ui_state):
+    """Add the generic DPO-only timestep ceiling to the RLHF tab."""
+    frame = components.section_frame(master, row)
+    components.label(
+        frame,
+        0,
+        0,
+        "DPO Timestep Limit",
+        tooltip=(
+            "Restrict only DPO preference forwards to the lower part of the "
+            "scheduler timestep range. Normal and supervised/Self-Flow training "
+            "keep their configured timestep distribution."
+        ),
+        wide_tooltip=True,
+    )
+    components.label(
+        frame,
+        1,
+        0,
+        "DPO Max Timestep",
+        tooltip=(
+            "Maximum DPO timestep as a literal fraction of the scheduler range. "
+            "For a 1000-step scheduler, 0.95 means the highest allowed DPO "
+            "timestep is 950. Samples above the limit are resampled rather than "
+            "clamped, so probability does not pile up at the ceiling. Valid range: "
+            "0 < value <= 1.0."
+        ),
+        wide_tooltip=True,
+    )
+    components.entry(frame, 1, 1, ui_state, "rlhf_dpo_max_timestep")
+    return frame
+
+
 def add_mage_self_flow_ema_controls(components, master, row, controller, ui_state):
     """Add Mage-only Self-Flow EMA residency controls to the Training tab."""
     config = _controller_config(controller)
