@@ -1,0 +1,148 @@
+name: Apply Balanced Reject ordering rescue
+
+on:
+  push:
+    branches: [mage-flow-full]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'Install temporary Balanced Reject patch runner'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: mage-flow-full
+      - name: Patch Balanced Reject ordering rescue
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path('modules/modelSetup/BaseModelSetup.py')
+          s = p.read_text(encoding='utf-8')
+
+          old_decl = '''        balanced_reject_pair_loss = None
+        balanced_chosen_budget = None
+'''
+          new_decl = '''        balanced_reject_pair_loss = None
+        balanced_chosen_budget = None
+        balanced_ordering_violation = None
+        balanced_ordering_pair_loss = None
+'''
+          assert old_decl in s, 'Balanced Reject declarations marker missing'
+          s = s.replace(old_decl, new_decl, 1)
+
+          old_params = '''            balanced_huber_delta = max(
+                float(getattr(
+                    config, "rlhf_dpo_balanced_huber_delta", 0.1
+                )),
+                1e-8,
+            )
+
+            balanced_chosen_budget = F.relu(chosen_ratio.detach())
+'''
+          new_params = '''            balanced_huber_delta = max(
+                float(getattr(
+                    config, "rlhf_dpo_balanced_huber_delta", 0.1
+                )),
+                1e-8,
+            )
+            balanced_ordering_weight = max(
+                float(getattr(
+                    config, "rlhf_dpo_balanced_ordering_weight", 0.5
+                )),
+                0.0,
+            )
+            balanced_ordering_margin = max(
+                float(getattr(
+                    config, "rlhf_dpo_balanced_ordering_margin", 0.02
+                )),
+                0.0,
+            )
+
+            balanced_chosen_budget = F.relu(chosen_ratio.detach())
+'''
+          assert old_params in s, 'Balanced Reject parameter marker missing'
+          s = s.replace(old_params, new_params, 1)
+
+          old_loss = '''            raw_pair_total_loss = balanced_reject_pair_loss
+'''
+          new_loss = '''            # Rejected-only ordering rescue. The detached chosen reward is a
+            # moving threshold, not a gradient target: while rejected is above
+            # chosen - margin this supplies a constant, bounded downward push
+            # on rejected. Unlike Huber, the corrective gradient does not fade
+            # near the ordering boundary; once the requested margin is reached
+            # it shuts off exactly.
+            balanced_ordering_violation = F.relu(
+                rejected_ratio
+                - chosen_ratio.detach()
+                + balanced_ordering_margin
+            )
+            balanced_ordering_pair_loss = (
+                balanced_ordering_weight * balanced_ordering_violation
+            )
+            raw_pair_total_loss = (
+                balanced_reject_pair_loss
+                + balanced_ordering_pair_loss
+            )
+'''
+          assert old_loss in s, 'Balanced Reject loss marker missing'
+          s = s.replace(old_loss, new_loss, 1)
+
+          old_metrics = '''                "balanced_reject_violation": (
+                    balanced_reject_violation.detach().mean().item()
+                ),
+                "balanced_target_satisfied": (
+'''
+          new_metrics = '''                "balanced_reject_violation": (
+                    balanced_reject_violation.detach().mean().item()
+                ),
+                "balanced_ordering_loss": (
+                    balanced_ordering_pair_loss.detach().mean().item()
+                ),
+                "balanced_ordering_violation": (
+                    balanced_ordering_violation.detach().mean().item()
+                ),
+                "balanced_ordering_active": (
+                    (balanced_ordering_violation.detach() > 0)
+                    .float()
+                    .mean()
+                    .item()
+                ),
+                "balanced_target_satisfied": (
+'''
+          assert old_metrics in s, 'Balanced Reject metric marker missing'
+          s = s.replace(old_metrics, new_metrics, 1)
+
+          p.write_text(s, encoding='utf-8')
+          PY
+
+          python -m py_compile modules/modelSetup/BaseModelSetup.py
+
+          python - <<'PY'
+          from pathlib import Path
+          s = Path('modules/modelSetup/BaseModelSetup.py').read_text(encoding='utf-8')
+          assert 'rlhf_dpo_balanced_ordering_weight", 0.5' in s
+          assert 'rlhf_dpo_balanced_ordering_margin", 0.02' in s
+          assert 'rejected_ratio\n                - chosen_ratio.detach()\n                + balanced_ordering_margin' in s
+          assert 'balanced_ordering_weight * balanced_ordering_violation' in s
+          assert 'balanced_reject_pair_loss\n                + balanced_ordering_pair_loss' in s
+
+          def violation(chosen, rejected, margin=0.02):
+              return max(rejected - chosen + margin, 0.0)
+
+          assert abs(violation(-0.08, 0.03) - 0.13) < 1e-12
+          assert violation(0.06, -0.08) == 0.0
+          assert abs(violation(0.03, 0.03) - 0.02) < 1e-12
+          print('Balanced Reject ordering rescue smoke: PASS')
+          PY
+
+      - name: Commit patch
+        run: |
+          git config user.name 'Alexm-wq'
+          git config user.email 'alexm-wq@users.noreply.github.com'
+          git add modules/modelSetup/BaseModelSetup.py
+          git commit -m 'Add rejected-only ordering rescue to Balanced Reject'
+          git push origin HEAD:mage-flow-full
