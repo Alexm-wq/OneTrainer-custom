@@ -129,7 +129,16 @@ def _build_calculate_dpo_loss():
     return namespace["_Patched"].calculate_dpo_loss
 
 
-_CoreBaseModelSetup.calculate_dpo_loss = _build_calculate_dpo_loss()
+def _install_balanced_reject_ordering_rescue():
+    current = _CoreBaseModelSetup.calculate_dpo_loss
+    if getattr(current, "_ot_balanced_ordering_rescue", False):
+        return
+    patched = _build_calculate_dpo_loss()
+    patched._ot_balanced_ordering_rescue = True
+    _CoreBaseModelSetup.calculate_dpo_loss = patched
+
+
+_install_balanced_reject_ordering_rescue()
 _CoreBaseModelSetup.__module__ = __name__
 BaseModelSetup = _CoreBaseModelSetup
 
