@@ -1,15 +1,16 @@
 name: Apply Balanced Reject ordering rescue
 
 on:
-  push:
+  pull_request:
     branches: [mage-flow-full]
+    types: [opened, synchronize, reopened]
 
 permissions:
   contents: write
 
 jobs:
   patch:
-    if: startsWith(github.event.head_commit.message, 'Trigger Balanced Reject ordering rescue')
+    if: github.event.pull_request.title == 'Apply Balanced Reject ordering rescue'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
