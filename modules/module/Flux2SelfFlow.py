@@ -333,6 +333,27 @@ def _token_conditioned_output_norm(
     return norm_out.norm(hidden_states) * (1.0 + scale) + shift
 
 
+def _call_self_flow_block(block: nn.Module, **kwargs):
+    """Enter compiled Flux2 checkpoint blocks without Module.compile's _call_impl wrapper.
+
+    PyTorch 2.12 can reject ``nn.Module.compile(fullgraph=True)`` calls when the
+    module is entered manually from the Self-Flow traversal, reporting that no
+    compiled frames were found. OneTrainer's non-offloaded compiled blocks are
+    CheckpointLayer modules whose ``forward`` still contains the exact same
+    checkpoint/original-block computation. Compile that bound forward directly
+    and cache it for the Self-Flow path. Normal Flux2 keeps using its existing
+    module-level compiled call path.
+    """
+    if getattr(block, "_compiled_call_impl", None) is None:
+        return block(**kwargs)
+
+    compiled_forward = getattr(block, "_ot_flux2_self_flow_compiled_forward", None)
+    if compiled_forward is None:
+        compiled_forward = torch.compile(block.forward, fullgraph=True)
+        object.__setattr__(block, "_ot_flux2_self_flow_compiled_forward", compiled_forward)
+    return compiled_forward(**kwargs)
+
+
 def flux2_self_flow_forward(
         transformer: nn.Module,
         hidden_states: Tensor,
@@ -406,7 +427,8 @@ def flux2_self_flow_forward(
     )
 
     for block in transformer.transformer_blocks:
-        encoder_hidden_states, hidden_states = block(
+        encoder_hidden_states, hidden_states = _call_self_flow_block(
+            block,
             hidden_states=hidden_states,
             encoder_hidden_states=encoder_hidden_states,
             temb_mod_img=double_stream_mod_img,
@@ -419,7 +441,8 @@ def flux2_self_flow_forward(
     captured_feature = None
 
     for layer_index, block in enumerate(transformer.single_transformer_blocks):
-        hidden_states = block(
+        hidden_states = _call_self_flow_block(
+            block,
             hidden_states=hidden_states,
             encoder_hidden_states=None,
             temb_mod=single_stream_mod,
