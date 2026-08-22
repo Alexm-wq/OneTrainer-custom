@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   patch:
-    if: github.event.head_commit.message == 'Install temporary Balanced Reject patch runner'
+    if: github.event.head_commit.message == 'Trigger Balanced Reject ordering rescue'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
