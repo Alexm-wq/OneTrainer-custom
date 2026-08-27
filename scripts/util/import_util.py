@@ -14,7 +14,11 @@ def script_imports(allow_zluda: bool = True):
     # always found without any risk of being shadowed by another import path.
     # 3 .parent calls to navigate from /scripts/util/import_util.py to the main directory
     onetrainer_lib_path = Path(__file__).absolute().parent.parent.parent
+    onetrainer_src_path = onetrainer_lib_path / "src"
+
+    # Vendored dependencies take precedence over environment-installed packages.
     sys.path.insert(0, str(onetrainer_lib_path))
+    sys.path.insert(0, str(onetrainer_src_path))
 
     if allow_zluda and sys.platform.startswith('win'):
         from modules.zluda import ZLUDAInstaller

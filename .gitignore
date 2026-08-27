@@ -86,3 +86,11 @@ dpo_bad_pairs.csv
 gradient_magnitude.csv
 
 gradient_magnitude.csv
+
+# Vendored OneTrainer dependencies
+!src/
+src/*
+!src/mgds/
+!src/mgds/**
+!src/adv_optm/
+!src/adv_optm/**
