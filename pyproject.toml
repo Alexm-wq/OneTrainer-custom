@@ -82,8 +82,8 @@ cpu = [
 
 cuda13 = [
   # pytorch
-  "torch==2.13.0",
-  "torchvision==0.28.0",
+  "torch==2.12.0",
+  "torchvision==0.27.0",
   "onnxruntime-gpu==1.23.2",
   "nvidia-nccl-cu13==2.29.7; sys_platform == 'linux'",
   "triton-windows==3.7.0.post26; sys_platform == 'win32'",
@@ -93,7 +93,6 @@ cuda13 = [
 
   # Mage-Flow. Keep the upstream revision pinned so the integration and its
   # dependency contract cannot silently change underneath a working install.
-  "mage-flow @ git+https://github.com/microsoft/Mage.git@76bec2bb3818863f470de7e867c2dc7f1d0bfd83#subdirectory=mage_flow",
 ]
 
 # CUDA 12 uses the same dependency group and resolves the CUDA 12.6 torch wheel

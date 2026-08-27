@@ -82,3 +82,7 @@ dpo_bad_pairs.csv
 
 # Temporary patch scripts
 /patch_dpo_full_self_flow_experiment.py
+
+gradient_magnitude.csv
+
+gradient_magnitude.csv

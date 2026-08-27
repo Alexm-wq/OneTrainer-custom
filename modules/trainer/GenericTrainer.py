@@ -1,6 +1,7 @@
 import time
 import contextlib
 import copy
+import csv
 import json
 import math
 import os
@@ -109,6 +110,12 @@ class GenericTrainer(BaseTrainer):
         # a momentum-bypass step.  This avoids a second GPU momentum buffer.
         self._dpo_bypass_cpu_grads: dict[Parameter, Tensor] = {}
         self._dpo_bypass_update_weight = 0.0
+        # Diagnostic-only DPO gradient accumulator used when DPO follows the
+        # optimizer's ordinary momentum path. Unlike the bypass buffer, these
+        # gradients are still returned unchanged to autograd and therefore still
+        # accumulate into parameter.grad exactly as before.
+        self._dpo_probe_cpu_grads: dict[Parameter, Tensor] = {}
+        self._dpo_gradient_csv_warned = False
         self._adaptive_dpo_dataset_module: AdaptiveDPODataset | None = None
         # Pair-loss observations are staged for the current gradient-
         # accumulation window and committed only after its optimizer step.
@@ -1840,6 +1847,174 @@ class GenericTrainer(BaseTrainer):
             sequential_backward,
         )
 
+    @staticmethod
+    def __gradient_l2_stats(gradients) -> tuple[float, int, int]:
+        total_sq = 0.0
+        element_count = 0
+        tensor_count = 0
+        for gradient in gradients:
+            if gradient is None:
+                continue
+            value = gradient.detach()
+            if value.is_sparse:
+                value = value.coalesce().values()
+            total_sq += float(value.float().square().sum(dtype=torch.float64).item())
+            element_count += int(value.numel())
+            tensor_count += 1
+        return math.sqrt(max(total_sq, 0.0)), element_count, tensor_count
+
+    @staticmethod
+    def __virtual_clip_scale(norm: float, max_norm: float | None) -> float:
+        if max_norm is None or norm <= 0.0 or not math.isfinite(norm):
+            return 1.0
+        return min(1.0, float(max_norm) / (float(norm) + 1e-6))
+
+    @staticmethod
+    def __gradient_ratio(numerator: float, denominator: float) -> float:
+        if denominator > 0.0:
+            return float(numerator) / float(denominator)
+        return math.inf if numerator > 0.0 else 0.0
+
+    def __write_dpo_gradient_strength_csv(
+            self,
+            train_progress: TrainProgress,
+            scaler,
+            dpo_momentum_bypass: bool,
+    ):
+        if not self.config.rlhf_enabled or not multi.is_master():
+            return
+        if multi.is_enabled():
+            if not self._dpo_gradient_csv_warned:
+                print("[OT-DPO-GRAD-CSV] Multi-GPU split logging is currently disabled.")
+                self._dpo_gradient_csv_warned = True
+            return
+
+        dpo_buffer = (
+            self._dpo_bypass_cpu_grads
+            if dpo_momentum_bypass
+            else self._dpo_probe_cpu_grads
+        )
+        if not dpo_buffer:
+            return
+
+        grad_scale = 1.0
+        if scaler is not None:
+            current_scale = float(scaler.get_scale())
+            if math.isfinite(current_scale) and current_scale > 0.0:
+                grad_scale = 1.0 / current_scale
+
+        normal_sq = 0.0
+        dpo_sq = 0.0
+        combined_sq = 0.0
+        dot = 0.0
+        normal_elements = 0
+        dpo_elements = 0
+        normal_tensors = 0
+        dpo_tensors = 0
+
+        # Stream one parameter at a time. This avoids holding a second full
+        # normal-gradient copy: in the ordinary momentum path we reconstruct
+        # normal = combined - captured_DPO, then immediately discard it.
+        for parameter in self.parameters:
+            if not parameter.requires_grad:
+                continue
+
+            dpo_cpu = dpo_buffer.get(parameter)
+            total_grad = parameter.grad
+
+            if dpo_cpu is not None:
+                dpo_vec = dpo_cpu.detach().float().reshape(-1) * grad_scale
+                dpo_sq += float(torch.dot(dpo_vec, dpo_vec).item())
+                dpo_elements += int(dpo_vec.numel())
+                dpo_tensors += 1
+            else:
+                dpo_vec = None
+
+            if total_grad is None:
+                normal_vec = None
+                combined_vec = None
+            else:
+                combined_vec = total_grad.detach().float().reshape(-1).cpu() * grad_scale
+                combined_sq += float(torch.dot(combined_vec, combined_vec).item())
+                if dpo_momentum_bypass or dpo_vec is None:
+                    normal_vec = combined_vec
+                else:
+                    normal_vec = combined_vec - dpo_vec
+
+            if normal_vec is not None:
+                normal_sq += float(torch.dot(normal_vec, normal_vec).item())
+                normal_elements += int(normal_vec.numel())
+                normal_tensors += 1
+                if dpo_vec is not None:
+                    dot += float(torch.dot(normal_vec, dpo_vec).item())
+
+        normal_norm = math.sqrt(max(normal_sq, 0.0))
+        dpo_norm = math.sqrt(max(dpo_sq, 0.0))
+        combined_norm = math.sqrt(max(combined_sq, 0.0))
+        cosine = (
+            dot / (normal_norm * dpo_norm)
+            if normal_norm > 0.0 and dpo_norm > 0.0
+            else 0.0
+        )
+
+        max_norm = self.config.clip_grad_norm
+        if dpo_momentum_bypass:
+            # Normal and DPO are clipped independently because they are applied
+            # by separate optimizer paths.
+            normal_clip_scale = self.__virtual_clip_scale(normal_norm, max_norm)
+            dpo_clip_scale = self.__virtual_clip_scale(dpo_norm, max_norm)
+            dpo_update_weight = float(self._dpo_bypass_update_weight)
+        else:
+            # Ordinary momentum path clips the combined vector once. The same
+            # scalar therefore scales both component vectors.
+            combined_clip_scale = self.__virtual_clip_scale(combined_norm, max_norm)
+            normal_clip_scale = combined_clip_scale
+            dpo_clip_scale = combined_clip_scale
+            dpo_update_weight = 1.0
+
+        normal_effective = normal_norm * normal_clip_scale
+        dpo_effective = dpo_norm * dpo_clip_scale * dpo_update_weight
+
+        row = {
+            "global_step": int(train_progress.global_step),
+            "epoch": int(getattr(train_progress, "epoch", 0)),
+            "epoch_step": int(getattr(train_progress, "epoch_step", 0)),
+            "gradient_accumulation_steps": int(self.config.gradient_accumulation_steps),
+            "self_flow_enabled": int(bool(getattr(self.config, "self_flow_enabled", False))),
+            "no_momentum_dpo": int(bool(dpo_momentum_bypass)),
+            "dpo_gradient_scale": float(getattr(self.config, "rlhf_dpo_gradient_scale", 1.0)),
+            "dpo_update_weight": dpo_update_weight,
+            "normal_grad_l2_preclip": normal_norm,
+            "dpo_grad_l2_preclip": dpo_norm,
+            "combined_grad_l2_preclip": combined_norm,
+            "normal_dpo_cosine": cosine,
+            "normal_clip_scale": normal_clip_scale,
+            "dpo_clip_scale": dpo_clip_scale,
+            "normal_grad_l2_effective": normal_effective,
+            "dpo_grad_l2_effective": dpo_effective,
+            "dpo_to_normal_ratio_preclip": self.__gradient_ratio(dpo_norm, normal_norm),
+            "dpo_to_normal_ratio_effective": self.__gradient_ratio(dpo_effective, normal_effective),
+            "normal_grad_rms_preclip": normal_norm / math.sqrt(normal_elements) if normal_elements else 0.0,
+            "dpo_grad_rms_preclip": dpo_norm / math.sqrt(dpo_elements) if dpo_elements else 0.0,
+            "normal_active_elements": normal_elements,
+            "dpo_active_elements": dpo_elements,
+            "normal_active_tensors": normal_tensors,
+            "dpo_active_tensors": dpo_tensors,
+        }
+
+        output_path = os.path.join(self.config.workspace_dir, "dpo_gradient_strength.csv")
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        write_header = not os.path.isfile(output_path) or os.path.getsize(output_path) == 0
+        with open(output_path, "a", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+
+        # The diagnostic probe is scoped to one optimizer accumulation window.
+        # The bypass buffer is cleared later by its own update path.
+        self._dpo_probe_cpu_grads.clear()
+
     def __dpo_momentum_bypass_enabled(self) -> bool:
         if not self.config.rlhf_enabled or self.model is None:
             return False
@@ -2529,10 +2704,9 @@ class GenericTrainer(BaseTrainer):
                     def backward_dpo_component(component: Tensor):
                         if dpo_momentum_bypass:
                             self.__backward_dpo_without_momentum(component)
-                        elif scaler:
-                            scaler.scale(component).backward()
                         else:
-                            component.backward()
+                            probe_loss = scaler.scale(component) if scaler else component
+                            self.__backward_dpo_with_gradient_probe(probe_loss)
 
                     try:
                         (
@@ -2571,22 +2745,15 @@ class GenericTrainer(BaseTrainer):
                         )
 
                     if not sequential_backward_done:
-                        if dpo_momentum_bypass and dpo_loss is not None:
-                            if normal_loss is not None:
-                                normal_loss.backward()
-                            self.__backward_dpo_without_momentum(dpo_loss)
-                        else:
-                            loss = (
-                                dpo_loss
-                                if normal_loss is None
-                                else normal_loss
-                                if dpo_loss is None
-                                else normal_loss + dpo_loss
-                            )
-                            if scaler:
-                                scaler.scale(loss).backward()
-                            else:
-                                loss.backward()
+                        # Keep normal/Self-Flow and DPO backward calls separate so
+                        # their gradient vectors can be measured independently.
+                        # Both still accumulate into the same parameter.grad when
+                        # No Momentum DPO is disabled, preserving the optimizer
+                        # update as the exact linear sum of both components.
+                        if normal_loss is not None:
+                            backward_normal_component(normal_loss)
+                        if dpo_loss is not None:
+                            backward_dpo_component(dpo_loss)
 
                         self.model_setup.after_backward(
                             self.model,
@@ -2614,6 +2781,12 @@ class GenericTrainer(BaseTrainer):
                             for parameter in self.parameters
                             if parameter.grad is not None
                         }
+
+                        self.__write_dpo_gradient_strength_csv(
+                            train_progress,
+                            scaler,
+                            dpo_momentum_bypass,
+                        )
 
                         optimizer_step_succeeded = True
                         scaler_scale_before = (
@@ -2741,6 +2914,7 @@ class GenericTrainer(BaseTrainer):
         if self._gradient_accumulation_dirty:
             self.model.optimizer.zero_grad(set_to_none=True)
             self.__clear_dpo_bypass_gradients()
+            self._dpo_probe_cpu_grads.clear()
             self._gradient_accumulation_dirty = False
             self._dpo_metric_sums.clear()
             self._dpo_metric_weights.clear()
