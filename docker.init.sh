@@ -1,6 +1,19 @@
 #!/bin/bash
 set -eo pipefail
 
+# Qt 6.5+ requires libxcb-cursor.so.0 for the xcb platform plugin. Minimal
+# Vast/Runpod images often omit it even though the Python/Pixi environment is
+# otherwise complete, which makes the PySide6 UI abort before QApplication can
+# start.
+if command -v apt-get >/dev/null 2>&1; then
+  if ! dpkg-query -W -f='${Status}' libxcb-cursor0 2>/dev/null | grep -q 'install ok installed'; then
+    echo "Installing Qt xcb cursor runtime..."
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libxcb-cursor0
+    rm -rf /var/lib/apt/lists/*
+  fi
+fi
+
 # Export useful ENV variables, including all Runpod specific vars, to /etc/rp_environment
 # This file can then later be sourced in a login shell
 echo "Exporting environment variables..."
