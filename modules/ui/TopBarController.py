@@ -3,6 +3,7 @@ import os
 import traceback
 import webbrowser
 from contextlib import suppress
+from pathlib import Path
 
 from modules.util import path_util
 from modules.util.config.SecretsConfig import SecretsConfig
@@ -10,6 +11,9 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.path_util import write_json_atomic
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 class TopBarController:
@@ -57,20 +61,27 @@ class TopBarController:
         }
         return [(labels[m], m) for m in model_type.supported_training_methods()]
 
-    def load_preset_tree(self, dir: str = "training_presets") -> list[tuple[str, str | list]]:
-        # mirrors whatever directory structure happens to exist under `dir`; a node is either
-        # (display_name, path) for a leaf preset or (display_name, children) for a group.
-        # "#" marks a built-in preset (vs. a user file); "#.json" is the last-session state,
-        # not a preset. Same convention as load_config_from_file's is_built_in_preset check.
+    def load_preset_tree(self, dir: str | os.PathLike[str] = "training_presets") -> list[tuple[str, str | list]]:
+        # Built-in presets belong to the OneTrainer checkout, not to whichever
+        # working directory happened to launch the UI. Resolve relative preset
+        # roots against the repository so external launchers/VNC/Pixi wrappers
+        # cannot silently build an empty or stale menu.
+        directory = Path(dir)
+        if not directory.is_absolute():
+            directory = _REPO_ROOT / directory
+
+        # Mirrors the directory structure under `directory`; a node is either
+        # (display_name, path) for a leaf preset or (display_name, children) for
+        # a group. "#" marks a built-in preset; "#.json" is last-session state.
         nodes = []
-        if os.path.isdir(dir):
-            for entry in sorted(os.scandir(dir), key=lambda e: e.name.lower()):
+        if directory.is_dir():
+            for entry in sorted(os.scandir(directory), key=lambda e: e.name.lower()):
                 if entry.is_dir():
                     children = self.load_preset_tree(entry.path)
                     if children:
                         nodes.append((entry.name, children))
                 elif entry.name.startswith("#") and entry.name != "#.json" and entry.name.endswith(".json"):
-                    nodes.append((os.path.splitext(entry.name)[0], path_util.canonical_join(dir, entry.name)))
+                    nodes.append((os.path.splitext(entry.name)[0], str(Path(entry.path))))
         return nodes
 
     def save_to_file(self, name) -> str:

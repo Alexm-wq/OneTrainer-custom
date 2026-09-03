@@ -1,6 +1,10 @@
 import json
+import os
+import tempfile
 import unittest
 from pathlib import Path
+
+from modules.ui.TopBarController import TopBarController
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +80,24 @@ class MageFlowPresetTests(unittest.TestCase):
         self.assertEqual(data["self_flow_structural_tokens"], 256)
         self.assertAlmostEqual(data["rlhf_dpo_beta"], 100.0)
         self.assertEqual(data["learning_rate_warmup_steps"], 200.0)
+
+    def test_ui_discovers_mage_flow_presets_outside_repo_cwd(self):
+        controller = TopBarController(None)
+        previous_cwd = Path.cwd()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            try:
+                os.chdir(temp_dir)
+                tree = controller.load_preset_tree()
+            finally:
+                os.chdir(previous_cwd)
+
+        top_level = dict(tree)
+        self.assertIn("Mage Flow", top_level)
+        mage_flow = dict(top_level["Mage Flow"])
+        self.assertIn("#mage-flow 5090 Smoke Self-Flow DPO", mage_flow)
+        self.assertIn("#mage-flow 5090 Recommended Self-Flow DPO", mage_flow)
+        self.assertEqual(Path(mage_flow["#mage-flow 5090 Smoke Self-Flow DPO"]), SMOKE)
+        self.assertEqual(Path(mage_flow["#mage-flow 5090 Recommended Self-Flow DPO"]), RECOMMENDED)
 
 
 if __name__ == "__main__":
