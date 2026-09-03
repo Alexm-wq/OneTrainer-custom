@@ -1,21 +1,57 @@
 #!/bin/bash
 set -eo pipefail
 
-# Qt 6.5+ requires libxcb-cursor.so.0 for the xcb platform plugin. Minimal
-# Vast/Runpod images often omit it even though the Python/Pixi environment is
-# otherwise complete, which makes the PySide6 UI abort before QApplication can
-# start.
+# PySide6's Qt xcb platform plugin depends on the native X11/XCB runtime stack.
+# Minimal Vast/Runpod images frequently omit part of that stack, causing Qt to
+# find libqxcb.so successfully but abort while loading one of its shared-library
+# dependencies.
 if command -v apt-get >/dev/null 2>&1; then
-  if ! dpkg-query -W -f='${Status}' libxcb-cursor0 2>/dev/null | grep -q 'install ok installed'; then
-    echo "Installing Qt xcb cursor runtime..."
+  qt_xcb_packages=(
+    libx11-6
+    libx11-xcb1
+    libxcb1
+    libxcb-cursor0
+    libxcb-icccm4
+    libxcb-image0
+    libxcb-keysyms1
+    libxcb-randr0
+    libxcb-render0
+    libxcb-render-util0
+    libxcb-shape0
+    libxcb-shm0
+    libxcb-sync1
+    libxcb-util1
+    libxcb-xfixes0
+    libxcb-xkb1
+    libxkbcommon0
+    libxkbcommon-x11-0
+    libxrender1
+    libxext6
+    libxi6
+    libsm6
+    libice6
+    libfontconfig1
+    libfreetype6
+    libgl1
+  )
+
+  missing_qt_xcb_packages=()
+  for package in "${qt_xcb_packages[@]}"; do
+    if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'install ok installed'; then
+      missing_qt_xcb_packages+=("$package")
+    fi
+  done
+
+  if ((${#missing_qt_xcb_packages[@]})); then
+    echo "Installing Qt X11/xcb runtime dependencies..."
     apt-get update
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends libxcb-cursor0
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      "${missing_qt_xcb_packages[@]}"
     rm -rf /var/lib/apt/lists/*
   fi
 fi
 
 # Export useful ENV variables, including all Runpod specific vars, to /etc/rp_environment
-# This file can then later be sourced in a login shell
 echo "Exporting environment variables..."
 printenv |
   grep -E '^RUNPOD_|^PATH=|^HF_HOME=|^HF_TOKEN=|^HUGGING_FACE_HUB_TOKEN=|^WANDB_API_KEY=|^WANDB_TOKEN=' |
