@@ -97,11 +97,6 @@ class BaseMageFlowSetup(
             if enable is not None:
                 enable()
 
-        scheduler_shift = float(getattr(model.noise_scheduler.config, "shift", 6.0))
-        if float(config.timestep_shift) == 1.0 and scheduler_shift != 1.0:
-            config.timestep_shift = scheduler_shift
-            print(f"[Mage-Flow] timestep_shift defaulted to checkpoint static shift {scheduler_shift:g}")
-
         model.autocast_context, model.train_dtype = create_autocast_context(
             self.train_device, config.train_dtype, config.enable_autocast_cache
         )
