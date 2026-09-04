@@ -56,7 +56,7 @@ dependencies = [
     "pytorch-optimizer==3.6.0",
     "prodigy-plus-schedule-free==2.0.1",
     "adv-optm==2.5.12",
-    "muon-optimizer @ git+https://github.com/KellerJordan/Muon.git@f90a42b28e00b9d2d05865fe90d9f39abcbcbd",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon.git@f90a42b28e00b8d9d2d05865fe90d9f39abcbcbd",
 
     # profiling
     "scalene==2.0.1",
