@@ -171,11 +171,16 @@ function get_platform {
 
 function install_env {
     print_debug "Installing OneTrainer environment, this may take a while..."
-    run_cmd pixi install --locked -e "${OT_PLATFORM}"
+    # Do not force --locked here. Custom preview branches can legitimately
+    # change pyproject.toml before a regenerated pixi.lock is committed. Pixi
+    # will refresh a stale lockfile and continue instead of aborting setup.
+    run_cmd pixi install -e "${OT_PLATFORM}"
 }
 
 function run_in_env {
-    run_cmd pixi run --locked -e "${OT_PLATFORM}" "$@"
+    # Same rationale as install_env(): let Pixi refresh a stale lockfile rather
+    # than refusing to launch OneTrainer. This does not rerun failed commands.
+    run_cmd pixi run -e "${OT_PLATFORM}" "$@"
 }
 
 function get_or_update_pixi {
