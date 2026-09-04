@@ -33,9 +33,10 @@ class MageFlowModelLoader(HFModelLoaderMixin):
             return mage_pipeline
         except ImportError as exc:
             raise RuntimeError(
-                "Mage-Flow is part of OneTrainer's cuda13 Pixi environment. "
-                "From the OneTrainer repository run: pixi install -e cuda13. "
-                "Then launch OneTrainer with: pixi run -e cuda13 ui."
+                "Mage-Flow is not installed in this Python environment. "
+                "From the OneTrainer repository run: "
+                "pixi run -e cuda13 python scripts/install_mage_flow.py. "
+                "The installer preserves OneTrainer's pinned torch/torchvision versions."
             ) from exc
 
     @staticmethod
