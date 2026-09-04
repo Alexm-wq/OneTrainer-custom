@@ -10,7 +10,9 @@ version = "0.1.0"
 dependencies = [
     # base requirements
     "numpy==2.2.6",
-    "opencv-python==4.11.0.86",
+    # OneTrainer never uses OpenCV's native GUI. The headless wheel avoids
+    # importing OpenCV's bundled Qt plugin path into the PySide6 process.
+    "opencv-python-headless==4.11.0.86",
     "pillow==12.2.0",
     "imagesize==1.4.1",
     "tqdm==4.67.1",
@@ -54,7 +56,7 @@ dependencies = [
     "pytorch-optimizer==3.6.0",
     "prodigy-plus-schedule-free==2.0.1",
     "adv-optm==2.5.12",
-    "muon-optimizer @ git+https://github.com/KellerJordan/Muon.git@f90a42b28e00b8d9d2d05865fe90d9f39abcbcbd",
+    "muon-optimizer @ git+https://github.com/KellerJordan/Muon.git@f90a42b28e00b9d2d05865fe90d9f39abcbcbd",
 
     # profiling
     "scalene==2.0.1",
@@ -208,6 +210,11 @@ tk = { version = "*", build = "xft_*" }
 libgl = "*"
 libglib = "*"
 xcb-util-cursor = "*"
+xcb-util-image = "*"
+xcb-util-keysyms = "*"
+xcb-util-renderutil = "*"
+xcb-util-wm = "*"
+libxkbcommon = "*"
 
 [tool.pixi.pypi-options]
 index-strategy = "unsafe-best-match"
