@@ -94,3 +94,7 @@ src/*
 !src/mgds/**
 !src/adv_optm/
 !src/adv_optm/**
+
+# Never track generated Python bytecode, including inside vendored sources
+**/__pycache__/
+**/*.py[cod]
