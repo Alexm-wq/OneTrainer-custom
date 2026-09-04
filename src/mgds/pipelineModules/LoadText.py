@@ -1,4 +1,5 @@
 from mgds.PipelineModule import PipelineModule
+from mgds.crypto import read_source_text
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 
@@ -24,19 +25,17 @@ class LoadText(
         path = self._get_previous_item(variation, self.path_in_name, index)
 
         try:
-            with open(path, encoding='utf-8') as f:
-                text = f.readline().strip()
-                f.close()
+            text = read_source_text(path).splitlines()[0].strip()
         except FileNotFoundError:
+            text = ''
+        except IndexError:
             text = ''
         except UnicodeDecodeError as e:
             raise RuntimeError(
-                f"Failed to load caption file '{path}': The file contains non-UTF-8 characters."
-                "This is a data/workflow issue, not an OT bug. Ensure all your caption files are saved"
-                "with valid UTF-8 encoding. You may need to re-save the file with proper encoding or fix the "
-                "captioning tool that generated it."
+                f"Failed to load caption file '{path}': The decrypted/plain file contains non-UTF-8 characters. "
+                "Ensure the caption is valid UTF-8."
             ) from e
-        except:
+        except Exception:
             print("could not load text, it might be corrupted: " + path)
             raise
 
