@@ -1,21 +1,27 @@
-import concurrent
+from __future__ import annotations
+
+import concurrent.futures
 import hashlib
 import json
 import math
 import os
+import shutil
 from typing import Any, Callable
 
 import torch
 from tqdm import tqdm
 
 from mgds.PipelineModule import PipelineModule
+from mgds.crypto import CACHE_PURPOSE, is_encrypted_file, secure_torch_load, secure_torch_save
 from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import SingleVariationRandomAccessPipelineModule
 
 
-class DiskCache(
-    PipelineModule,
-    SingleVariationRandomAccessPipelineModule,
-):
+class DiskCache(PipelineModule, SingleVariationRandomAccessPipelineModule):
+    """Extended OneTrainer MGDS cache with authenticated cache encryption."""
+
+    FORMAT_VERSION = 3
+    CACHE_KIND = "onetrainer_disk_cache"
+
     def __init__(
             self,
             cache_dir: str,
@@ -27,239 +33,375 @@ class DiskCache(
             variations_group_in_name: str | list[str] | None = None,
             group_enabled_in_name: str | None = None,
             before_cache_fun: Callable[[], None] | None = None,
+            encrypted: bool = False,
+            encryption_context: str = "generic",
+            encrypt_all: bool = True,
+            encryption_source_path_in_name: str | list[str] | None = None,
+            identity_in_names: list[str] | None = None,
+            cache_only: bool = False,
+            cache_only_concepts: list[dict] | None = None,
+            cache_only_layout: dict[str, Any] | None = None,
     ):
-        super(DiskCache, self).__init__()
+        super().__init__()
         self.cache_dir = cache_dir
-
-        self.split_names = [] if split_names is None else split_names
-        self.aggregate_names = [] if aggregate_names is None else aggregate_names
-
+        self.split_names = list(split_names or [])
+        self.aggregate_names = list(aggregate_names or [])
         self.variations_in_name = variations_in_name
         self.balancing_in_name = balancing_in_name
         self.balancing_strategy_in_name = balancing_strategy_in_name
-        self.variations_group_in_names = \
-            [variations_group_in_name] if isinstance(variations_group_in_name, str) else variations_group_in_name
-
+        self.variations_group_in_names = (
+            [variations_group_in_name] if isinstance(variations_group_in_name, str)
+            else list(variations_group_in_name or [])
+        )
         self.group_enabled_in_name = group_enabled_in_name
-
-        self.before_cache_fun = (lambda: None) if before_cache_fun is None else before_cache_fun
-
-        self.group_variations = {}
-        self.group_indices = {}
-        self.group_output_samples = {}
+        self.before_cache_fun = before_cache_fun or (lambda: None)
+        self.encrypted = bool(encrypted)
+        self.encrypt_all = bool(encrypt_all)
+        self.encryption_source_path_in_names = (
+            [encryption_source_path_in_name] if isinstance(encryption_source_path_in_name, str)
+            else list(encryption_source_path_in_name or [])
+        )
+        self.identity_in_names = list(identity_in_names or [])
+        self.encryption_purpose = CACHE_PURPOSE + b"/" + str(encryption_context or "generic").encode()
+        self.cache_only = bool(cache_only)
+        self.cache_only_concepts = list(cache_only_concepts or [])
+        self.cache_only_layout = cache_only_layout
+        self.group_variations: dict[str, int] = {}
+        self.group_indices: dict[str, list[int]] = {}
+        self.group_output_samples: dict[str, int] = {}
+        self.aggregate_cache: dict[str, list[Any]] = {}
+        self._cache_only_records: dict[str, dict[str, Any]] = {}
         self.variations_initialized = False
+
+    @staticmethod
+    def _hash(value: Any) -> str:
+        raw = json.dumps(value, sort_keys=True, ensure_ascii=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(raw.encode()).hexdigest()
 
     def length(self) -> int:
         if not self.variations_initialized:
-            name = self.split_names[0] if len(self.split_names) > 0 else self.aggregate_names[0]
-            return self._get_previous_length(name)
-        else:
-            return sum(x for x in self.group_output_samples.values())
+            if self.cache_only:
+                self._init_cache_only()
+            else:
+                names = self.split_names or self.aggregate_names
+                if not names:
+                    raise RuntimeError("DiskCache requires at least one cached name")
+                return self._get_previous_length(names[0])
+        return sum(self.group_output_samples.values())
 
     def get_inputs(self) -> list[str]:
-        return self.split_names + self.aggregate_names \
-            + [self.variations_in_name] if self.variations_in_name else [] \
-            + [self.balancing_in_name] if self.variations_in_name else [] \
-            + [self.balancing_strategy_in_name] if self.variations_in_name else [] \
-            + self.variations_group_in_names if self.variations_in_name else [] \
-            + [self.group_enabled_in_name] if self.variations_in_name else []
+        if self.cache_only:
+            return []
+        names = self.split_names + self.aggregate_names
+        if self.variations_in_name:
+            names += [self.variations_in_name, self.balancing_in_name,
+                      self.balancing_strategy_in_name, *self.variations_group_in_names]
+            if self.group_enabled_in_name:
+                names.append(self.group_enabled_in_name)
+        names += self.encryption_source_path_in_names + self.identity_in_names
+        return list(dict.fromkeys(x for x in names if x is not None))
 
     def get_outputs(self) -> list[str]:
         return self.split_names + self.aggregate_names
 
-    def __string_key(self, data: list[Any]) -> str:
-        json_data = json.dumps(data, sort_keys=True, ensure_ascii=True, separators=(',', ':'), indent=None)
-        return hashlib.sha256(json_data.encode('utf-8')).hexdigest()
+    def _save(self, value: Any, path: str, encrypted: bool) -> None:
+        secure_torch_save(value, os.path.realpath(path), encrypted=encrypted,
+                          purpose=self.encryption_purpose)
 
-    def __init_variations(self):
-        """
-        Prepares variations before caching starts. Each index is sorted into a group.
+    def _load(self, path: str) -> Any:
+        return secure_torch_load(os.path.realpath(path), purpose=self.encryption_purpose,
+                                 map_location="cpu")
 
-        Data is written into three variables.
-            self.group_variations, mapping group keys to the number of variations of that group
-            self.group_indices, mapping group keys to a list of input indices contained in the group
-            self.group_output_samples, mapping group keys to the number of indices in the cache output for each group
-        """
-        if self.variations_in_name is not None:
-            group_variations = {}
-            group_indices = {}
-            group_balancing = {}
-            group_balancing_strategy = {}
+    def _source_encrypted(self, variation: int, index: int) -> bool:
+        if not self.encrypted:
+            return False
+        if self.encrypt_all:
+            return True
+        for name in self.encryption_source_path_in_names:
+            try:
+                value = self._get_previous_item(variation, name, index)
+            except Exception:
+                continue
+            for path in value if isinstance(value, (list, tuple, set)) else [value]:
+                if isinstance(path, (str, os.PathLike)) and path and is_encrypted_file(path):
+                    return True
+        return False
 
-            for in_index in range(self._get_previous_length(self.variations_in_name)):
-                if self.group_enabled_in_name and not self._get_previous_item(0, self.group_enabled_in_name, in_index):
+    def _identity(self, variation: int, index: int) -> str:
+        values = []
+        for name in self.identity_in_names:
+            try:
+                value = self._get_previous_item(variation, name, index)
+            except Exception:
+                value = None
+            if isinstance(value, torch.Tensor):
+                value = value.detach().cpu().tolist()
+            elif isinstance(value, os.PathLike):
+                value = os.fspath(value)
+            values.append([name, value])
+        return self._hash(values if any(v[1] not in (None, "", False) for v in values)
+                          else [["__index__", index]])
+
+    def _concept(self, variation: int, index: int) -> dict | None:
+        try:
+            value = self._get_previous_item(variation, "concept", index)
+        except Exception:
+            return None
+        if hasattr(value, "to_dict"):
+            value = value.to_dict()
+        return dict(value) if isinstance(value, dict) else None
+
+    @staticmethod
+    def _logical_id(concept: dict | None, group_key: str) -> str:
+        if concept:
+            if concept.get("seed") not in (None, ""):
+                return f"seed:{concept['seed']}"
+            if concept.get("path"):
+                return "path:" + hashlib.sha256(str(concept["path"]).encode()).hexdigest()
+        return f"group:{group_key}"
+
+    def _init_variations(self) -> None:
+        if self.cache_only:
+            self._init_cache_only()
+            return
+        if self.variations_in_name:
+            gv, gi, gb, gs = {}, {}, {}, {}
+            for i in range(self._get_previous_length(self.variations_in_name)):
+                if self.group_enabled_in_name and not self._get_previous_item(0, self.group_enabled_in_name, i):
                     continue
-
-                variations = self._get_previous_item(0, self.variations_in_name, in_index)
-                balancing = self._get_previous_item(0, self.balancing_in_name, in_index)
-                balancing_strategy = self._get_previous_item(0, self.balancing_strategy_in_name, in_index)
-                group_key = self.__string_key(
-                    [self._get_previous_item(0, name, in_index) for name in self.variations_group_in_names]
-                )
-
-                if group_key not in group_variations:
-                    group_variations[group_key] = variations
-
-                if group_key not in group_indices:
-                    group_indices[group_key] = []
-                group_indices[group_key].append(in_index)
-
-                if group_key not in group_balancing:
-                    group_balancing[group_key] = balancing
-
-                if group_key not in group_balancing_strategy:
-                    group_balancing_strategy[group_key] = balancing_strategy
-
-            group_output_samples = {}
-            for group_key, balancing in group_balancing.items():
-                balancing_strategy = group_balancing_strategy[group_key]
-                if balancing_strategy == 'REPEATS':
-                    group_output_samples[group_key] = int(math.floor(len(group_indices[group_key]) * balancing))
-                if balancing_strategy == 'SAMPLES':
-                    group_output_samples[group_key] = int(balancing)
+                key = self._hash([self._get_previous_item(0, n, i) for n in self.variations_group_in_names])
+                gv.setdefault(key, int(self._get_previous_item(0, self.variations_in_name, i)))
+                gi.setdefault(key, []).append(i)
+                gb.setdefault(key, float(self._get_previous_item(0, self.balancing_in_name, i)))
+                gs.setdefault(key, self._get_previous_item(0, self.balancing_strategy_in_name, i))
+            go = {}
+            for key, balancing in gb.items():
+                strategy = getattr(gs[key], "value", gs[key])
+                if strategy == "REPEATS":
+                    go[key] = int(math.floor(len(gi[key]) * balancing))
+                elif strategy == "SAMPLES":
+                    go[key] = int(balancing)
+                else:
+                    raise RuntimeError(f"Unknown balancing strategy: {strategy}")
         else:
-            first_previous_name = self.split_names[0] if len(self.split_names) > 0 else self.aggregate_names[0]
-
-            group_variations = {'': 1}
-            group_indices = {'': [in_index for in_index in range(self._get_previous_length(first_previous_name))]}
-            group_output_samples = {'': len(group_indices[''])}
-
-        self.aggregate_cache = {}
-
-        self.group_variations = group_variations
-        self.group_indices = group_indices
-        self.group_output_samples = group_output_samples
-
+            name = (self.split_names or self.aggregate_names)[0]
+            gv = {"": 1}
+            gi = {"": list(range(self._get_previous_length(name)))}
+            go = {"": len(gi[""])}
+        self.group_variations, self.group_indices, self.group_output_samples = gv, gi, go
         self.variations_initialized = True
 
-    def __get_cache_dir(self, group_key: str, in_variation: int) -> str:
-        variations = self.group_variations[group_key]
-        return os.path.join(self.cache_dir, group_key, "variation-" + str(in_variation % variations))
+    def _cache_dir(self, group: str, variation: int) -> str:
+        return os.path.join(self.cache_dir, group,
+                            f"variation-{variation % self.group_variations[group]}")
 
-    def __is_caching_done(self, group_key: str, in_variation: int):
-        cache_dir = self.__get_cache_dir(group_key, in_variation)
+    def _manifest(self, directory: str) -> dict | None:
+        path = os.path.join(directory, "aggregate.pt")
+        if not os.path.isfile(path):
+            return None
+        try:
+            value = self._load(path)
+        except Exception:
+            return None
+        if not isinstance(value, dict) or value.get("format_version") != self.FORMAT_VERSION:
+            return None
+        if value.get("cache_kind") != self.CACHE_KIND or not isinstance(value.get("items"), list):
+            return None
+        return value
 
-        cache_exists = False
-        caching_done = False
+    @staticmethod
+    def _clone(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.detach().clone().cpu()
+        if isinstance(value, dict):
+            return {k: DiskCache._clone(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [DiskCache._clone(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(DiskCache._clone(v) for v in value)
+        return value
 
-        if os.path.isdir(cache_dir):
-            with os.scandir(cache_dir) as path_iter:
-                cache_exists = any(path_iter)
+    def _to_device(self, value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return value.to(self.pipeline.device, non_blocking=True)
+        if isinstance(value, dict):
+            return {k: self._to_device(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._to_device(v) for v in value]
+        if isinstance(value, tuple):
+            return tuple(self._to_device(v) for v in value)
+        return value
 
-            aggregate_path = os.path.join(cache_dir, 'aggregate.pt')
-            caching_done = os.path.exists(aggregate_path) and os.path.isfile(aggregate_path)
+    def _build(self, group: str, variation: int) -> None:
+        directory = self._cache_dir(group, variation)
+        if os.path.isdir(directory):
+            shutil.rmtree(directory)
+        os.makedirs(directory, exist_ok=True)
+        size = len(self.group_indices[group])
+        aggregate, identities, encrypted_items = [None] * size, [None] * size, [False] * size
+        with tqdm(total=size, smoothing=0.1, desc="caching") as bar:
+            def fn(pos: int, index: int, current_device: int | None):
+                if torch.cuda.is_available() and current_device is not None:
+                    torch.cuda.set_device(current_device)
+                with torch.no_grad():
+                    split = {n: self._clone(self._get_previous_item(variation, n, index)) for n in self.split_names}
+                    agg = {n: self._clone(self._get_previous_item(variation, n, index)) for n in self.aggregate_names}
+                enc = self._source_encrypted(variation, index)
+                self._save(split, os.path.join(directory, f"{pos}.pt"), enc)
+                aggregate[pos], identities[pos], encrypted_items[pos] = agg, self._identity(variation, index), enc
+            device = torch.cuda.current_device() if torch.cuda.is_available() else None
+            futures = [self._state.executor.submit(fn, p, i, device)
+                       for p, i in enumerate(self.group_indices[group])]
+            for n, future in enumerate(concurrent.futures.as_completed(futures)):
+                try:
+                    future.result()
+                except Exception:
+                    self._state.executor.shutdown(wait=True, cancel_futures=True)
+                    raise
+                if n % 250 == 0:
+                    self._torch_gc()
+                bar.update(1)
+        first = self.group_indices[group][0] if size else 0
+        concept = self._concept(variation, first) if size else None
+        manifest = {
+            "format_version": self.FORMAT_VERSION,
+            "cache_kind": self.CACHE_KIND,
+            "items": aggregate,
+            "cache_layout": {
+                "logical_id": self._logical_id(concept, group),
+                "output_samples": int(self.group_output_samples[group]),
+                "sample_identities": [str(x) for x in identities],
+                "concept": concept,
+            },
+        }
+        self._save(manifest, os.path.join(directory, "aggregate.pt"),
+                   bool(self.encrypted and (self.encrypt_all or any(encrypted_items))))
 
-        return cache_exists and caching_done
-
-    def __clone_for_cache(self, x: Any):
-        if isinstance(x, torch.Tensor):
-            return x.clone()
-        return x
-
-    def __refresh_cache(self, out_variation: int):
+    def _refresh(self, out_variation: int) -> None:
         if not self.variations_initialized:
-            self.__init_variations()
-
-        self.aggregate_cache = {}
-        for group_key, variations in self.group_variations.items():
-            self.aggregate_cache[group_key] = [None for _ in range(variations)]
-
-        before_cache_fun_called = False
-        for group_key in self.group_variations.keys():
-            start_index = self.group_output_samples[group_key] * out_variation
-            end_index = self.group_output_samples[group_key] * (out_variation + 1) - 1
-
-            start_variation = start_index // len(self.group_indices[group_key])
-            end_variation = end_index // len(self.group_indices[group_key])
-
-            variations = self.group_variations[group_key]
-            for in_variation in [(x % variations) for x in range(start_variation, end_variation + 1, 1)]:
-                cache_dir = self.__get_cache_dir(group_key, in_variation)
-                if not self.__is_caching_done(group_key, in_variation):
-                    if not before_cache_fun_called and self.before_cache_fun is not None:
-                        before_cache_fun_called = True
-                        self.before_cache_fun()
-
-                    os.makedirs(cache_dir, exist_ok=True)
-
-                    size = len(self.group_indices[group_key])
-                    aggregate_cache = [None]*size
-
-                    with tqdm(total=size, smoothing=0.1, desc='caching') as bar:
-                        def fn(group_index, in_index, in_variation, current_device):
-                            #preserve current device for multi-GPU, which is thread-local in torch:
-                            if torch.cuda.is_available() and current_device is not None:
-                                torch.cuda.set_device(current_device)
-
-                            split_item = {}
-                            aggregate_item = {}
-
-                            with torch.no_grad():
-                                for name in self.split_names:
-                                    split_item[name] = self.__clone_for_cache(self._get_previous_item(in_variation, name, in_index))
-                                for name in self.aggregate_names:
-                                    aggregate_item[name] = self.__clone_for_cache(self._get_previous_item(in_variation, name, in_index))
-
-                            torch.save(split_item, os.path.realpath(os.path.join(cache_dir, str(group_index) + '.pt')))
-                            aggregate_cache[group_index] = aggregate_item
-
-                        current_device = torch.cuda.current_device() if torch.cuda.is_available() else None
-
-                        fs = (self._state.executor.submit(
-                            fn, group_index, in_index, in_variation, current_device)
-                              for (group_index, in_index)
-                              in enumerate(self.group_indices[group_key]))
-                        for i, f in enumerate(concurrent.futures.as_completed(fs)):
-                            try:
-                                f.result()
-                            except:
-                                self._state.executor.shutdown(
-                                    wait=True, cancel_futures=True)
-                                raise
-                            if i % 250 == 0:
-                                self._torch_gc()
-                            bar.update(1)
-
-                    torch.save(aggregate_cache, os.path.realpath(os.path.join(cache_dir, 'aggregate.pt')))
-
-                if self.aggregate_cache[group_key][in_variation] is None:
-                    self.aggregate_cache[group_key][in_variation] = \
-                        torch.load(os.path.realpath(os.path.join(cache_dir, 'aggregate.pt')), weights_only=False, map_location=self.pipeline.device)
-
-    def __get_input_index(self, out_variation: int, out_index: int) -> tuple[str, int, int, int]:
-        offset = 0
-        for group_key, group_output_samples in self.group_output_samples.items():
-            if out_index >= group_output_samples + offset:
-                offset += group_output_samples
+            self._init_variations()
+        if self.cache_only:
+            self._load_cache_only()
+            return
+        self.aggregate_cache = {g: [None] * v for g, v in self.group_variations.items()}
+        prepared = False
+        for group, variations in self.group_variations.items():
+            count = self.group_output_samples[group]
+            if count <= 0:
                 continue
+            size = len(self.group_indices[group])
+            first = (count * out_variation) // size
+            last = (count * (out_variation + 1) - 1) // size
+            for variation in dict.fromkeys(x % variations for x in range(first, last + 1)):
+                directory = self._cache_dir(group, variation)
+                manifest = self._manifest(directory)
+                if manifest is None or len(manifest["items"]) != size:
+                    if not prepared:
+                        prepared = True
+                        self.before_cache_fun()
+                    self._build(group, variation)
+                    manifest = self._manifest(directory)
+                if manifest is None:
+                    raise RuntimeError(f"Invalid cache manifest: {directory}")
+                self.aggregate_cache[group][variation] = manifest["items"]
 
-            variations = self.group_variations[group_key]
-            local_index = (out_index - offset) + (out_variation * self.group_output_samples[group_key])
-            in_variation = (local_index // len(self.group_indices[group_key])) % variations
-            group_index = local_index % len(self.group_indices[group_key])
-            in_index = self.group_indices[group_key][group_index]
+    @staticmethod
+    def _variation_dirs(group_dir: str) -> list[int]:
+        if not os.path.isdir(group_dir):
+            return []
+        out = []
+        for entry in os.scandir(group_dir):
+            if entry.is_dir() and entry.name.startswith("variation-"):
+                try:
+                    out.append(int(entry.name[10:]))
+                except ValueError:
+                    pass
+        return sorted(set(out))
 
-            return group_key, in_variation, group_index, in_index
+    def _init_cache_only(self) -> None:
+        if self.variations_initialized:
+            return
+        records = []
+        if not os.path.isdir(self.cache_dir):
+            raise RuntimeError(f"Use Cache Only: missing cache directory {self.cache_dir}")
+        groups = [""] + sorted(e.name for e in os.scandir(self.cache_dir)
+                               if e.is_dir() and not e.name.startswith("variation-"))
+        for group in groups:
+            group_dir = os.path.join(self.cache_dir, group) if group else self.cache_dir
+            physical = self._variation_dirs(group_dir)
+            if not physical:
+                continue
+            manifest = self._manifest(os.path.join(group_dir, f"variation-{physical[0]}"))
+            if manifest is None or not isinstance(manifest.get("cache_layout"), dict):
+                raise RuntimeError("Use Cache Only requires current strict cache manifests; rebuild from source data.")
+            layout = manifest["cache_layout"]
+            ids = layout.get("sample_identities")
+            if not isinstance(ids, list) or len(ids) != len(manifest["items"]):
+                raise RuntimeError("Use Cache Only: invalid sample identities")
+            records.append({"group_key": group, "variations": physical,
+                            "size": len(ids), "sample_identities": ids,
+                            "logical_id": str(layout.get("logical_id", "")),
+                            "output_samples": int(layout.get("output_samples", len(ids))),
+                            "concept": layout.get("concept")})
+        if not records:
+            raise RuntimeError("Use Cache Only: no complete cache groups found")
+        image_slots = self.cache_only_layout.get("image_slots") if self.cache_only_layout else None
+        if isinstance(image_slots, list):
+            ordered = []
+            for slot in image_slots:
+                matches = [r for r in records if r["logical_id"] == str(slot.get("logical_id", ""))]
+                if len(matches) != 1 or matches[0]["sample_identities"] != slot.get("sample_identities"):
+                    raise RuntimeError("Use Cache Only: image/text cache identity mismatch")
+                matches[0]["output_samples"] = int(slot["output_samples"])
+                ordered.append(matches[0])
+            records = ordered
+        self._cache_only_records = {r["group_key"]: r for r in records}
+        self.group_variations = {r["group_key"]: len(r["variations"]) for r in records}
+        self.group_indices = {r["group_key"]: list(range(r["size"])) for r in records}
+        self.group_output_samples = {r["group_key"]: r["output_samples"] for r in records}
+        self.variations_initialized = True
+        if self.cache_only_layout is not None and image_slots is None:
+            self.cache_only_layout["image_slots"] = records
+            self.cache_only_layout["image_cache"] = self
+
+    def _load_cache_only(self) -> None:
+        self.aggregate_cache = {g: [None] * v for g, v in self.group_variations.items()}
+        for group, count in self.group_variations.items():
+            record = self._cache_only_records[group]
+            group_dir = os.path.join(self.cache_dir, group) if group else self.cache_dir
+            for logical in range(count):
+                physical = record["variations"][logical]
+                manifest = self._manifest(os.path.join(group_dir, f"variation-{physical}"))
+                if manifest is None:
+                    raise RuntimeError("Use Cache Only: invalid cache manifest")
+                self.aggregate_cache[group][logical] = manifest["items"]
+
+    def _index(self, out_variation: int, out_index: int) -> tuple[str, int, int]:
+        offset = 0
+        for group, count in self.group_output_samples.items():
+            if out_index >= offset + count:
+                offset += count
+                continue
+            size = len(self.group_indices[group])
+            local = out_index - offset + out_variation * count
+            return group, (local // size) % self.group_variations[group], local % size
+        raise IndexError(out_index)
 
     def start(self, out_variation: int):
-        self.__refresh_cache(out_variation)
+        self._refresh(out_variation)
 
     def get_item(self, index: int, requested_name: str = None) -> dict:
-        item = {}
-
-        group_key, in_variation, group_index, in_index = self.__get_input_index(self.current_variation, index)
-
-        aggregate_item = self.aggregate_cache[group_key][in_variation][group_index]
-
+        group, variation, pos = self._index(self.current_variation, index)
         if requested_name in self.aggregate_names:
-            for name in self.aggregate_names:
-                item[name] = aggregate_item[name]
-
-        elif requested_name in self.split_names:
-            cache_path = os.path.join(self.__get_cache_dir(group_key, in_variation), str(group_index) + '.pt')
-            split_item = torch.load(os.path.realpath(cache_path), weights_only=False, map_location=self.pipeline.device)
-
-            for name in self.split_names:
-                item[name] = split_item[name]
-
-        return item
+            item = self.aggregate_cache[group][variation][pos]
+            return {n: self._to_device(item[n]) for n in self.aggregate_names if n in item}
+        if requested_name in self.split_names:
+            if self.cache_only:
+                record = self._cache_only_records[group]
+                group_dir = os.path.join(self.cache_dir, group) if group else self.cache_dir
+                directory = os.path.join(group_dir, f"variation-{record['variations'][variation]}")
+            else:
+                directory = self._cache_dir(group, variation)
+            item = self._load(os.path.join(directory, f"{pos}.pt"))
+            return {n: self._to_device(item[n]) for n in self.split_names if n in item}
+        return {}
