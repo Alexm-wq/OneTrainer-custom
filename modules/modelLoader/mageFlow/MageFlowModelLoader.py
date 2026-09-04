@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import importlib
 import os
+from pathlib import Path
+import subprocess
+import sys
 import threading
 from types import MethodType
 
@@ -28,15 +32,29 @@ class MageFlowModelLoader(HFModelLoaderMixin):
 
     @staticmethod
     def _require_mage():
+        # Keep Mage out of Pixi's normal dependency resolution because the
+        # pinned upstream revision declares torch>=2.13/torchvision>=0.28 while
+        # OneTrainer deliberately uses torch 2.12/torchvision 0.27 on CUDA13.
+        # Instead, verify/repair the exact compatible Mage source on first use.
+        repo_root = Path(__file__).resolve().parents[3]
+        installer = repo_root / "scripts" / "install_mage_flow.py"
+        if not installer.is_file():
+            raise RuntimeError(f"Mage-Flow runtime installer is missing: {installer}")
+
         try:
+            subprocess.check_call(
+                [sys.executable, str(installer)],
+                cwd=str(repo_root),
+            )
+            importlib.invalidate_caches()
             import mage_flow.pipeline as mage_pipeline
             return mage_pipeline
-        except ImportError as exc:
+        except Exception as exc:
             raise RuntimeError(
-                "Mage-Flow is not installed in this Python environment. "
-                "From the OneTrainer repository run: "
-                "pixi run -e cuda13 python scripts/install_mage_flow.py. "
-                "The installer preserves OneTrainer's pinned torch/torchvision versions."
+                "Mage-Flow runtime bootstrap failed. OneTrainer automatically "
+                "tried to verify/repair the pinned Mage runtime without changing "
+                "the CUDA13 torch/torchvision versions. See the installer output "
+                "above for the underlying package/network error."
             ) from exc
 
     @staticmethod
