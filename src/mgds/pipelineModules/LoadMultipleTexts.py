@@ -1,15 +1,13 @@
 import os
 
 from mgds.PipelineModule import PipelineModule
+from mgds.crypto import read_source_text
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
 
 
-class LoadMultipleTexts(
-    PipelineModule,
-    RandomAccessPipelineModule,
-):
+class LoadMultipleTexts(PipelineModule, RandomAccessPipelineModule):
     def __init__(self, path_in_name: str, texts_out_name: str):
-        super(LoadMultipleTexts, self).__init__()
+        super().__init__()
         self.path_in_name = path_in_name
         self.texts_out_name = texts_out_name
 
@@ -24,31 +22,20 @@ class LoadMultipleTexts(
 
     def get_item(self, variation: int, index: int, requested_name: str = None) -> dict:
         path = self._get_previous_item(variation, self.path_in_name, index)
-
         texts = []
         if os.path.exists(path):
             try:
-                with open(path, encoding='utf-8') as f:
-                    texts = [line.strip() for line in f]
-                    f.close()
+                texts = [line.strip() for line in read_source_text(path).splitlines()]
             except FileNotFoundError:
                 texts = [""]
-            except UnicodeDecodeError as e:
+            except UnicodeDecodeError as exc:
                 raise RuntimeError(
-                    f"Failed to load caption file '{path}': The file contains non-UTF-8 characters."
-                    "This is a data/workflow issue, not an OT bug. Ensure all your caption files are saved"
-                    "with valid UTF-8 encoding. You may need to re-save the file with proper encoding or fix the "
-                    "captioning tool that generated it."
-                ) from e
-            except:
+                    f"Failed to load caption file '{path}': decrypted/plain data is not valid UTF-8."
+                ) from exc
+            except Exception:
                 print("could not load text, it might be corrupted: " + path)
                 raise
-
-        texts = list(filter(lambda text: text != "", texts))
-
-        if len(texts) == 0:
+        texts = [text for text in texts if text != ""]
+        if not texts:
             texts = [""]
-
-        return {
-            self.texts_out_name: texts
-        }
+        return {self.texts_out_name: texts}
