@@ -114,7 +114,7 @@ rocm = [
 packages = []
 
 [tool.ruff]
-ext-exclude = [
+extend-exclude = [
     # Exclude all third-party dependencies and environments.
     # NOTE: Conda installs mgds+diffusers into "src/" in the project directory.
     ".venv*",
