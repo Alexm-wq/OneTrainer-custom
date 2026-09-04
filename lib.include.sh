@@ -132,6 +132,59 @@ function run_cmd {
     "$@"
 }
 
+# PySide6's Linux xcb platform plugin depends on the host X11/XCB runtime.
+# Do not satisfy these by RTLD_GLOBAL-preloading a second XCB stack from Pixi:
+# mixing host and environment X11 libraries can survive startup but crash when
+# the first keyboard/XKB event is processed. Install the normal host runtime on
+# Debian/Ubuntu containers instead. This is best-effort and never blocks OT on
+# unsupported distros or unprivileged machines.
+function ensure_linux_qt_xcb_runtime {
+    if [[ "${OT_HOST_OS}" != "Linux" ]]; then
+        return 0
+    fi
+
+    # Avoid apt work on every launch once the two Qt 6 essentials are present.
+    if ls /usr/lib/*/libxcb-cursor.so.0 /lib/*/libxcb-cursor.so.0 >/dev/null 2>&1 \
+        && ls /usr/lib/*/libxkbcommon-x11.so.0 /lib/*/libxkbcommon-x11.so.0 >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if ! can_exec apt-get; then
+        print_warning "Qt/XCB runtime is incomplete and apt-get is unavailable. Install libxcb-cursor0 and libxkbcommon-x11-0 for the PySide6 xcb plugin."
+        return 0
+    fi
+
+    local -a apt_prefix=()
+    if [[ "$(id -u)" -ne 0 ]]; then
+        if can_exec sudo && sudo -n true >/dev/null 2>&1; then
+            apt_prefix=(sudo)
+        else
+            print_warning "Qt/XCB runtime is incomplete, but root/passwordless sudo is unavailable. Install libxcb-cursor0 and libxkbcommon-x11-0 manually."
+            return 0
+        fi
+    fi
+
+    print "Installing missing Linux Qt/XCB runtime libraries..."
+    if ! "${apt_prefix[@]}" apt-get update -y; then
+        print_warning "apt-get update failed; continuing without changing the host Qt/XCB runtime."
+        return 0
+    fi
+
+    if ! "${apt_prefix[@]}" apt-get install -y --no-install-recommends \
+        libxcb-cursor0 \
+        libxcb-icccm4 \
+        libxcb-image0 \
+        libxcb-keysyms1 \
+        libxcb-render-util0 \
+        libxcb-xkb1 \
+        libxkbcommon0 \
+        libxkbcommon-x11-0; then
+        print_warning "Qt/XCB runtime installation failed; continuing so the underlying Qt diagnostic remains visible."
+    fi
+
+    return 0
+}
+
 function get_platform {
     # NOTE: The user can override our platform detection via the environment.
     local platform="${OT_PLATFORM}"
@@ -204,6 +257,9 @@ function get_or_update_pixi {
 function prepare_runtime_environment {
     # Ensure that pixi is installed.
     get_or_update_pixi "$@"
+
+    # Ensure PySide6's xcb backend uses a coherent host X11 runtime on Linux.
+    ensure_linux_qt_xcb_runtime
 
     # Get the right platform
     export OT_PLATFORM="$(get_platform)"
