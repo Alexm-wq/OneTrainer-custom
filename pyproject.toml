@@ -63,7 +63,7 @@ dependencies = [
 
     # ui
     "customtkinter==5.2.2",
-    "PySide6==6.11.1",
+    "PySide6==6.11.2",
 
     # cloud
     "runpod==1.7.10",
@@ -114,7 +114,7 @@ rocm = [
 packages = []
 
 [tool.ruff]
-extend-exclude = [
+ext-exclude = [
     # Exclude all third-party dependencies and environments.
     # NOTE: Conda installs mgds+diffusers into "src/" in the project directory.
     ".venv*",
@@ -209,12 +209,6 @@ cxx-compiler = "*"
 tk = { version = "*", build = "xft_*" }
 libgl = "*"
 libglib = "*"
-xcb-util-cursor = "*"
-xcb-util-image = "*"
-xcb-util-keysyms = "*"
-xcb-util-renderutil = "*"
-xcb-util-wm = "*"
-libxkbcommon = "*"
 
 [tool.pixi.pypi-options]
 index-strategy = "unsafe-best-match"
