@@ -90,7 +90,10 @@ def ensure_mage_flow_runtime() -> None:
             "[Mage-Flow] Installing pinned runtime "
             f"{MAGE_REVISION[:12]} without modifying torch/torchvision..."
         )
-        _install_pinned_mage(force=installed_revision is not None)
+        # Always force the pinned VCS source when the revision cannot be
+        # verified. This also repairs an old PyPI/editable install that happens
+        # to expose the same package/version metadata.
+        _install_pinned_mage(force=True)
 
     importlib.invalidate_caches()
     try:
