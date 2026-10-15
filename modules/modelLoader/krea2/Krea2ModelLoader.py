@@ -1,9 +1,12 @@
+import logging
 import os
+import time
 import traceback
 
 from modules.model.Krea2Model import Krea2Model
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.util.config.TrainConfig import QuantizationConfig
+from modules.util.convert_util import convert, reverse_conversion
 from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
@@ -13,10 +16,14 @@ import torch
 from diffusers import (
     AutoencoderKLQwenImage,
     FlowMatchEulerDiscreteScheduler,
-    GGUFQuantizationConfig,
     Krea2Transformer2DModel,
 )
+from diffusers.loaders.single_file_utils import load_single_file_checkpoint
 from transformers import Qwen2Tokenizer, Qwen3VLModel
+
+import accelerate
+
+logger = logging.getLogger(__name__)
 
 
 class Krea2ModelLoader(
@@ -24,6 +31,49 @@ class Krea2ModelLoader(
 ):
     def __init__(self):
         super().__init__()
+
+    def _load_transformer_checkpoint(
+            self,
+            model: Krea2Model,
+            base_model_name: str,
+            transformer_model_name: str,
+            weight_dtypes: ModelWeightDtypes,
+            quantization: QuantizationConfig,
+    ):
+        if weight_dtypes.transformer.is_gguf():
+            raise ValueError("Krea 2 transformer overrides require unquantized safetensors, not GGUF. "
+                             "Select bfloat16, or let OneTrainer quantize the weights after loading.")
+
+        started = time.perf_counter()
+        config = Krea2Transformer2DModel.load_config(base_model_name, subfolder="transformer")
+        # Avoid allocating a second, randomly initialized 12.8B model beside the checkpoint.
+        with accelerate.init_empty_weights():
+            transformer = Krea2Transformer2DModel.from_config(config)
+
+        state_dict = load_single_file_checkpoint(transformer_model_name)
+        # Accept native Krea/Kroma and Diffusers transformer-only exports, including the
+        # common ComfyUI prefixes. Never drop unmatched weights from a mixed checkpoint.
+        for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+            if state_dict and all(key.startswith(prefix) for key in state_dict):
+                state_dict = {key.removeprefix(prefix): value for key, value in state_dict.items()}
+                break
+        if "first.weight" in state_dict:
+            state_dict = convert(state_dict, reverse_conversion(model.checkpoint_diffusers_to_original()))
+
+        # Cast one tensor at a time, releasing the original reference. In particular Kroma
+        # Base ships in FP32; don't retain a complete FP32 copy when training in BF16.
+        dtype = weight_dtypes.transformer.torch_dtype() or torch.bfloat16
+        for key in state_dict:
+            state_dict[key] = state_dict[key].to(dtype=dtype)
+        # Strict assignment checks every name and shape and materializes the meta model.
+        transformer.load_state_dict(state_dict, strict=True, assign=True)
+        del state_dict
+        transformer = self._convert_diffusers_sub_module_to_dtype(
+            transformer, weight_dtypes.transformer, weight_dtypes.train_dtype, quantization,
+        )
+        logger.info("Loaded Krea 2 transformer override %s in %.2fs", transformer_model_name,
+                    time.perf_counter() - started)
+        return transformer
 
     def __load_internal(
             self,
@@ -87,16 +137,8 @@ class Krea2ModelLoader(
             )
 
         if transformer_model_name:
-            transformer = Krea2Transformer2DModel.from_single_file(
-                transformer_model_name,
-                config=base_model_name,
-                subfolder="transformer",
-                #avoid loading the transformer in float32:
-                torch_dtype = torch.bfloat16 if weight_dtypes.transformer.torch_dtype() is None else weight_dtypes.transformer.torch_dtype(),
-                quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16) if weight_dtypes.transformer.is_gguf() else None,
-            )
-            transformer = self._convert_diffusers_sub_module_to_dtype(
-                transformer, weight_dtypes.transformer, weight_dtypes.train_dtype, quantization,
+            transformer = self._load_transformer_checkpoint(
+                model, base_model_name, transformer_model_name, weight_dtypes, quantization,
             )
         else:
             transformer = self._load_diffusers_sub_module(

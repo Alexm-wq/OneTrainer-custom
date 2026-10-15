@@ -155,10 +155,19 @@ class BaseModelTabView(ABC):
             row += 1
 
         if has_transformer:
+            is_krea2 = controller.train_config.model_type.is_krea2()
             if allow_override_transformer:
                 # transformer model
-                self.components.label(frame, row, 0, "Override Transformer / GGUF",
-                                 tooltip="Can be used to override the transformer in the base model. Safetensors and GGUF files are supported, local and on Huggingface. If a GGUF file is used, the DataType must also be set to GGUF")
+                override_tooltip = (
+                    "Krea 2 or Kroma transformer safetensors, as a local file or Hugging Face blob/main URL. "
+                    "Keep a Krea 2 Diffusers repository or directory in Base Model for the text encoder, "
+                    "tokenizer, VAE and scheduler. Use unquantized weights; OneTrainer can quantize them when loading."
+                ) if is_krea2 else (
+                    "Can be used to override the transformer in the base model. Safetensors and GGUF files are supported, "
+                    "local and on Huggingface. If a GGUF file is used, the DataType must also be set to GGUF"
+                )
+                self.components.label(frame, row, 0, "Override Transformer" if is_krea2 else "Override Transformer / GGUF",
+                                      tooltip=override_tooltip)
                 self.components.path_entry(
                     frame, row, 1, ui_state, "transformer.model_name",
                     mode="file", path_modifier=path_util.json_path_modifier
@@ -167,7 +176,7 @@ class BaseModelTabView(ABC):
             # transformer weight dtype
             self.components.label(frame, row, 3, "Transformer Data Type",
                              tooltip="The transformer weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=True, include_a8=True),
+            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=not is_krea2, include_a8=True),
                                   ui_state, "transformer.weight_dtype")
 
             row += 1
