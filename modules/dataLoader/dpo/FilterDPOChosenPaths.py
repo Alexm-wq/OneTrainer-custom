@@ -95,4 +95,3 @@ class FilterDPOChosenPaths(
             self.path_in_name: self._get_previous_item(variation, self.path_in_name, previous_index),
             self.concept_in_name: self._get_previous_item(variation, self.concept_in_name, previous_index),
         }
-

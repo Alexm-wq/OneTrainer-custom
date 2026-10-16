@@ -209,4 +209,3 @@ class BaseKrea2Setup(
 
         model.eval()
         torch_gc()
-

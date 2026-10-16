@@ -345,4 +345,3 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models")
 
         return losses
-

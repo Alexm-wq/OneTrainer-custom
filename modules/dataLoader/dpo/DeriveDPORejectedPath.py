@@ -1,8 +1,8 @@
 import os
-from modules.util.rlhf_util import preference_pair_key
 
 from modules.util.dpo_curation_util import resolve_aspect_ratio
 from modules.util.dpo_pattern_util import build_rejected_index, match_chosen, resolve_rejected, validate_dpo_patterns
+from modules.util.rlhf_util import preference_pair_key
 
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
@@ -149,4 +149,3 @@ class DeriveDPORejectedPath(
             self.dpo_pair_key_out_name: self._pair_keys[index],
             self.dpo_cache_mode_out_name: self._cache_modes[index],
         }
-

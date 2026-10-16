@@ -67,4 +67,3 @@ class DPOBetaController:
         scale = std if std > 1e-12 else max(abs(self.margin_ema), 1e-12)
         beta = self.beta0 * (1.0 + self.alpha * math.tanh((margin - self.margin_ema) / scale))
         return min(self.max_beta, max(self.min_beta, beta))
-

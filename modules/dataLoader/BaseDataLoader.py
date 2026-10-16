@@ -67,4 +67,3 @@ class BaseDataLoader(
             is_validation,
     ):
         pass
-

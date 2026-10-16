@@ -1,12 +1,15 @@
-import os
 import csv
 import json
+import os
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
+import modules.util.multi_gpu_util as multi
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
@@ -14,13 +17,10 @@ from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
-import modules.util.multi_gpu_util as multi
-import torch.nn.functional as F
 
 
 class BaseModelSetup(
@@ -568,9 +568,7 @@ class BaseModelSetup(
             else:
                 if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == chosen_b:
                     batched[key] = torch.cat([value, value], dim=0)
-                elif isinstance(value, list) and len(value) == chosen_b:
-                    batched[key] = value + value
-                elif isinstance(value, tuple) and len(value) == chosen_b:
+                elif isinstance(value, list) and len(value) == chosen_b or isinstance(value, tuple) and len(value) == chosen_b:
                     batched[key] = value + value
                 else:
                     batched[key] = value
@@ -1965,5 +1963,3 @@ class BaseModelSetup(
                 raise NotImplementedError(
                     f"attention mechanism {str(attn)} not implemented"
                 )
-
-

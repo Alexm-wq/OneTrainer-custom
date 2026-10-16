@@ -211,4 +211,3 @@ class BaseFlux2Setup(
         model.text_encoder_to(self.train_device)
         model.eval()
         torch_gc()
-

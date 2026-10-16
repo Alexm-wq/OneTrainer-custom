@@ -372,4 +372,3 @@ class BaseFluxSetup(
 
         model.eval()
         torch_gc()
-

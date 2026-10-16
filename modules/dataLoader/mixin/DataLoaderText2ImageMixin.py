@@ -530,4 +530,3 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     @abstractmethod
     def _debug_modules(self, config: TrainConfig, model: BaseModel):
         pass
-
