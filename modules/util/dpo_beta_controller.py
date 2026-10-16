@@ -37,7 +37,7 @@ class DPOBetaController:
         self._running_m2 = 0.0  # Welford accumulator for the tanh scale
 
     def state_dict(self) -> dict:
-        return {key: value for key, value in vars(self).items()}
+        return dict(vars(self))
 
     def load_state_dict(self, state: dict):
         if float(state.get("beta0", self.beta0)) != self.beta0:

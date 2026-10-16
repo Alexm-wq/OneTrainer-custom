@@ -299,6 +299,24 @@ class MixedRLHFTest(unittest.TestCase):
             metadata = next((Path(directory) / "save").glob("*.metrics.json"))
             self.assertEqual(json.loads(metadata.read_text())["objective_loss"], 0.6)
 
+    def test_validation_due_inside_accumulation_is_deferred_not_lost(self):
+        self.config.validation = True
+        self.trainer._validation_pending = False
+        self.trainer._dpo_early_stop = False
+        self.trainer.commands = TrainCommands()
+        self.trainer._GenericTrainer__needs_validate = lambda progress: progress.global_step % 100 == 0
+        validate = Mock()
+        self.trainer._GenericTrainer__validate = validate
+        for step in range(4):
+            progress = TrainProgress(global_step=step)
+            self.trainer._GenericTrainer__maybe_validate(progress, has_gradient=step < 3)
+            if step < 3:
+                validate.assert_not_called()
+        validate.assert_called_once()
+        self.assertEqual(validate.call_args.args[0].global_step, 3)
+        self.assertTrue(validate.call_args.kwargs["force"])
+        self.assertFalse(self.trainer._validation_pending)
+
     def test_validation_loop_evaluates_pairs_and_reuses_dataset(self):
         self.config.rlhf_dpo_validation = True
         self.config.rlhf_dpo_validation_samples = 2

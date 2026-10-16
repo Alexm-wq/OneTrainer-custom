@@ -840,9 +840,8 @@ class BaseModelSetup(
 
         write_header = not os.path.exists(path) or os.path.getsize(path) == 0
 
-        rows = []
-        for i in range(chosen_b):
-            rows.append({
+        rows = [
+            {
                 "global_step": getattr(train_progress, "global_step", ""),
                 "epoch": getattr(train_progress, "epoch", ""),
                 "pair_index": i,
@@ -929,7 +928,9 @@ class BaseModelSetup(
                     pair_total_loss,
                     i,
                 ),
-            })
+            }
+            for i in range(chosen_b)
+        ]
 
         with open(path, "a", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(
@@ -1716,10 +1717,7 @@ class BaseModelSetup(
             except TypeError:
                 payload = torch.load(snapshot_path, map_location="cpu")
 
-            if isinstance(payload, dict):
-                loaded_groups = payload.get("adapter_parameters")
-            else:
-                loaded_groups = payload
+            loaded_groups = payload.get("adapter_parameters") if isinstance(payload, dict) else payload
 
             if not isinstance(loaded_groups, (list, tuple)):
                 raise RuntimeError(

@@ -108,6 +108,7 @@ class GenericTrainer(BaseTrainer):
         self._dpo_best_validation = None
         self._dpo_validation_bad_steps = 0
         self._dpo_validation_started = False
+        self._validation_pending = False
         self._dpo_early_stop = False
         if config.rlhf_enabled and config.rlhf_dpo_validation:
             config.validation = True
@@ -408,7 +409,7 @@ class GenericTrainer(BaseTrainer):
         if os.path.isdir(self.config.cache_dir):
             for filename in os.listdir(self.config.cache_dir):
                 path = os.path.join(self.config.cache_dir, filename)
-                if os.path.isdir(path) and (filename.startswith('epoch-') or filename in ['image', 'text'] or filename.startswith('image-rlhf-') or filename.startswith('text-rlhf-')):
+                if os.path.isdir(path) and (filename.startswith(('epoch-', 'image-rlhf-', 'text-rlhf-')) or filename in ['image', 'text']):
                     shutil.rmtree(path)
 
     def __prune_backups(self, backups_to_keep: int):
@@ -573,8 +574,24 @@ class GenericTrainer(BaseTrainer):
 
         torch_gc()
 
-    def __validate(self, train_progress: TrainProgress):
-        if not self.__needs_validate(train_progress):
+    def __maybe_validate(self, train_progress: TrainProgress, has_gradient: bool):
+        if not self.config.validation:
+            return
+        if multi.is_master() and self.__needs_validate(train_progress):
+            self._validation_pending = True
+        if has_gradient:
+            return
+        if multi.is_master() and self._validation_pending:
+            self.__validate(train_progress, force=True)
+            self._validation_pending = False
+        stop = torch.tensor(int(self._dpo_early_stop), device=self.train_device)
+        if multi.is_enabled():
+            torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
+        if stop.item():
+            self.commands.stop()
+
+    def __validate(self, train_progress: TrainProgress, *, force: bool = False):
+        if not force and not self.__needs_validate(train_progress):
             return
         paired_validation = self.config.rlhf_enabled and self.config.rlhf_dpo_validation
         if not paired_validation or not self._dpo_validation_started:
@@ -1323,10 +1340,8 @@ class GenericTrainer(BaseTrainer):
                 "sample_step",
             ]:
                 if hasattr(train_progress, name):
-                    try:
+                    with contextlib.suppress(Exception):
                         progress[name] = getattr(train_progress, name)
-                    except Exception:
-                        pass
 
         summary = {
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1379,10 +1394,8 @@ class GenericTrainer(BaseTrainer):
             log_dir = self.__ot_debug_dir()
             step = "unknown"
             if train_progress is not None and hasattr(train_progress, "global_step"):
-                try:
+                with contextlib.suppress(Exception):
                     step = str(getattr(train_progress, "global_step"))
-                except Exception:
-                    pass
 
             stamp = time.strftime("%Y%m%d_%H%M%S")
             base = os.path.join(log_dir, f"crash_{stamp}_step_{step}")
@@ -1654,14 +1667,7 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
-                if self.config.validation and not has_gradient:
-                    if multi.is_master():
-                        self.__validate(train_progress)
-                    stop = torch.tensor(int(self._dpo_early_stop), device=train_device)
-                    if multi.is_enabled():
-                        torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
-                    if stop.item():
-                        self.commands.stop()
+                self.__maybe_validate(train_progress, has_gradient)
 
                 train_progress.next_step(self.config.batch_size)
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
