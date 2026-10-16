@@ -13,8 +13,6 @@ from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
@@ -25,7 +23,6 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
-from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -33,6 +30,9 @@ from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
+from modules.util.enum.RLHFMode import RLHFMode
 
 
 class TrainOptimizerConfig(BaseConfig):
@@ -705,7 +705,6 @@ class TrainConfig(BaseConfig):
                 8: self.__migration_8,
                 9: self.__migration_9,
                 10: self.__migration_10,
-                11: self.__migration_11,
             }
         )
 
@@ -942,16 +941,6 @@ class TrainConfig(BaseConfig):
             elif training_method != "EMBEDDING":
                 migrated_data["output_model_format"] = "LEGACY_SAFETENSORS"
 
-        return migrated_data
-
-    def __migration_11(self, data: dict) -> dict:
-        migrated_data = data.copy()
-        migrated_data.setdefault("rlhf_dpo_label_smoothing", 0.0)
-        migrated_data.setdefault("rlhf_dpo_beta_gradient_decouple", False)
-        migrated_data.setdefault("rlhf_dpo_beta_gradient_reference", None)
-        migrated_data.setdefault("rlhf_normal_weight", 1.0)
-        migrated_data.setdefault("rlhf_dpo_weight", 1.0)
-        migrated_data.setdefault("rlhf_chosen_weight", migrated_data.pop("rlhf_supervised_mix", 0.0))
         return migrated_data
 
     def model_part_configs(self) -> list[TrainModelPartConfig]:
@@ -1434,3 +1423,4 @@ class TrainConfig(BaseConfig):
 
     def effective_dpo_ref_mode(self):
         return getattr(self, "rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER)
+

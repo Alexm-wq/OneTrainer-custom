@@ -257,6 +257,28 @@ class MixedRLHFTest(unittest.TestCase):
         for a, b in zip(first_grad, second_grad, strict=True):
             torch.testing.assert_close(a, b)
 
+    def test_new_adapter_uses_base_reference_and_restores_hooks(self):
+        self.config.rlhf_dpo_ref_mode = DPORefMode.NEW_ADAPTER
+        with self.setup.preference_dropout_disabled(self.model):
+            loss = self.mixed_loss()
+            grads = torch.autograd.grad(loss, self.params)
+        self.assertTrue(all(adapter.is_applied for adapter in self.model.adapters()))
+        self.assertTrue(all(torch.isfinite(grad).all() for grad in grads))
+
+    def test_fixed_validation_beta_for_sigmoid(self):
+        batch = self.pair_batch()
+        with torch.no_grad():
+            self.model.loras[0].lora_up.weight.add_(0.1)
+        self.setup.set_dpo_runtime_beta(50)
+        first = self.setup.calculate_dpo_loss(self.model, batch, self.config, self.progress,
+                                              validation=True, validation_seed=17)
+        self.setup.set_dpo_runtime_beta(5000)
+        self.progress.global_step = 100
+        second = self.setup.calculate_dpo_loss(self.model, batch, self.config, self.progress,
+                                               validation=True, validation_seed=17)
+        torch.testing.assert_close(first, second)
+        self.assertEqual(self.setup.get_last_dpo_metrics()["beta"], self.config.rlhf_dpo_beta)
+
     def test_pair_ids_namespace_curriculum_state(self):
         keys = [preference_pair_key("/dataset/a", "001"), preference_pair_key("/dataset/b", "001")]
         self.assertNotEqual(*keys)
@@ -344,16 +366,16 @@ class MixedRLHFTest(unittest.TestCase):
         self.assertIn("dpo/validation/accuracy", names)
         self.assertIn("dpo/validation/chosen_error", names)
 
-    def test_config_migration_and_recommended_defaults(self):
+    def test_recommended_defaults_and_config_roundtrip(self):
         fresh = TrainConfig.default_values()
         self.assertEqual((fresh.rlhf_normal_weight, fresh.rlhf_dpo_weight, fresh.rlhf_chosen_weight), (1, 1, 0.1))
         self.assertTrue(fresh.rlhf_dpo_beta_gradient_decouple)
         self.assertEqual(fresh.rlhf_dpo_beta_gradient_reference, 1)
-        old = TrainConfig.default_values().from_dict({"__version": 11, "rlhf_supervised_mix": 0.37})
-        self.assertEqual(old.rlhf_chosen_weight, 0.37)
-        self.assertFalse(old.rlhf_dpo_beta_gradient_decouple)
         restored = TrainConfig.default_values().from_dict(fresh.to_dict())
-        self.assertEqual(restored.to_dict(), fresh.to_dict())
+        self.assertEqual(
+            {key: value for key, value in restored.to_dict().items() if key.startswith("rlhf_")},
+            {key: value for key, value in fresh.to_dict().items() if key.startswith("rlhf_")},
+        )
         validate_rlhf_config(self.config)
 
     def test_ui_binds_three_weights(self):

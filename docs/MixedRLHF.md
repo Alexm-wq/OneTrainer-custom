@@ -21,8 +21,9 @@ balancing for that. An all-normal batch still respects Normal Training Weight.
 Zero disables that component's contribution. With RLHF disabled, normal training
 retains its existing behavior.
 
-The former Supervised Mix value migrates to Chosen Training Weight. Old configs
-retain their saved beta, smoothing and gradient-decoupling settings.
+Set the three new weights explicitly or use the new preset. The removed
+Supervised Mix field is not imported. Start a fresh RLHF run when updating from
+the previous implementation; old RLHF state formats are not supported.
 
 ## Starting settings
 
@@ -73,8 +74,7 @@ training with RLHF off keeps its configured dropout.
 
 Pair IDs include their concept root. Curriculum weights only reduce rejection
 pressure; chosen protection and pair-order corrections retain full weight.
-Legacy curriculum histories reset once because their IDs and scaled reward units
-cannot be recovered unambiguously.
+Curriculum state uses version 3 with the new pair IDs and score units.
 
 The holdout is selected by a stable hash before augmentation, caching, balancing
 or resolution expansion. All variants of a pair stay in one split. The percentage
@@ -106,6 +106,6 @@ GitHub Actions runs CPU autograd tests with real hooked LoRA layers, including
 mixed batches, existing-adapter references, checkpointed backward, dropout,
 independent weights, all preference objectives, native Krea/Flux scores,
 deterministic validation, holdout selection, adaptive beta, best-checkpoint
-selection, patience and config/UI compatibility. It also runs the existing
+selection, patience, config serialization and UI bindings. It also runs the existing
 Krea checkpoint and multi-resolution cache tests. This does not replace a
 full Kroma training run on a GPU.

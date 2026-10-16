@@ -1,15 +1,13 @@
+import os
 import csv
 import json
-import os
+import copy
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
 
-import modules.util.multi_gpu_util as multi
 from modules.model.BaseModel import BaseModel
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
@@ -17,10 +15,13 @@ from modules.util.TimedActionMixin import TimedActionMixin
 from modules.util.TrainProgress import TrainProgress
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.tensorboard import SummaryWriter
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
+import modules.util.multi_gpu_util as multi
+import torch.nn.functional as F
 
 
 class BaseModelSetup(
@@ -392,24 +393,15 @@ class BaseModelSetup(
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         state_version = int(payload.get("version", -1))
-        if state_version not in (1, 2, 3):
+        if state_version != 3:
             raise RuntimeError(
                 "Unsupported Hard-Pair Curriculum state version: "
                 f"{payload.get('version')}"
             )
 
-        if state_version < 3:
-            print("[OT-DPO-CURRICULUM] Resetting legacy EMA state: old pair IDs and scaled scores are not comparable.")
-            return
-
         expected = self._dpo_curriculum_settings(config)
         saved = payload.get("settings", {})
-        settings_to_check = (
-            ("ema_decay", "minimum_weight", "full_margin")
-            if state_version == 1
-            else tuple(expected.keys())
-        )
-        for name in settings_to_check:
+        for name in expected:
             expected_value = expected[name]
             if name not in saved or abs(float(saved[name]) - expected_value) > 1e-12:
                 raise RuntimeError(
@@ -417,13 +409,6 @@ class BaseModelSetup(
                     f"{name}: backup={saved.get(name)!r}, current={expected_value!r}. "
                     "Exact resume requires identical curriculum settings."
                 )
-        if state_version == 1:
-            print(
-                "[OT-DPO-CURRICULUM] Loading legacy v1 EMA state. Pairwise "
-                "margin penalties use the current configuration; backups "
-                "created after this point will use strict v2 settings."
-            )
-
         pairs = payload.get("pairs", {})
         if not isinstance(pairs, dict):
             raise RuntimeError("Hard-Pair Curriculum state has an invalid pairs map")
@@ -568,7 +553,9 @@ class BaseModelSetup(
             else:
                 if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == chosen_b:
                     batched[key] = torch.cat([value, value], dim=0)
-                elif isinstance(value, list) and len(value) == chosen_b or isinstance(value, tuple) and len(value) == chosen_b:
+                elif isinstance(value, list) and len(value) == chosen_b:
+                    batched[key] = value + value
+                elif isinstance(value, tuple) and len(value) == chosen_b:
                     batched[key] = value + value
                 else:
                     batched[key] = value
@@ -1239,6 +1226,10 @@ class BaseModelSetup(
         try:
             with self.preference_dropout_disabled(model), torch.set_grad_enabled(
                     torch.is_grad_enabled() and not validation):
+                if validation:
+                    # Model setups using progress-based seeds also get fixed draws.
+                    train_progress = copy.copy(train_progress)
+                    train_progress.global_step = validation_seed
                 return self._calculate_dpo_loss(model, batch, config, train_progress)
         finally:
             self._dpo_validation_seed = previous_seed
@@ -1963,3 +1954,5 @@ class BaseModelSetup(
                 raise NotImplementedError(
                     f"attention mechanism {str(attn)} not implemented"
                 )
+
+
