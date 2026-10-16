@@ -4,6 +4,9 @@ from abc import ABCMeta, abstractmethod
 from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
+from modules.dataLoader.cache.AspectBucketing import AspectBucketing
+from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
+from modules.dataLoader.cache.SingleAspectCalculation import SingleAspectCalculation
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -15,7 +18,6 @@ from modules.util.TrainProgress import TrainProgress
 
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
-from mgds.pipelineModules.AspectBucketing import AspectBucketing
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CapitalizeTags import CapitalizeTags
 from mgds.pipelineModules.CollectPaths import CollectPaths
@@ -47,7 +49,6 @@ from mgds.pipelineModules.SelectFirstInput import SelectFirstInput
 from mgds.pipelineModules.SelectInput import SelectInput
 from mgds.pipelineModules.SelectRandomText import SelectRandomText
 from mgds.pipelineModules.ShuffleTags import ShuffleTags
-from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
 
 import torch
@@ -182,7 +183,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             frame_dim_enabled=frame_dim_enabled,
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            resolution_variants_out_name='resolution_variants',
         )
 
         single_aspect_calculation = SingleAspectCalculation(
@@ -192,7 +194,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             target_resolutions_override_in_name='concept.image.resolution_override',
             scale_resolution_out_name='scale_resolution',
             crop_resolution_out_name='crop_resolution',
-            possible_resolutions_out_name='possible_resolutions'
+            possible_resolutions_out_name='possible_resolutions',
+            resolution_variants_out_name='resolution_variants',
         )
 
         modules = [calc_aspect]
@@ -411,9 +414,22 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 if _dpo_name not in sort_names:
                     sort_names = sort_names + [_dpo_name]
 
-        image_disk_cache = DiskCache(cache_dir=image_cache_dir, split_names=image_split_names, aggregate_names=image_aggregate_names, variations_in_name='concept.image_variations',
-                                     balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy', variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'],
-                                     group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_image_fun)
+        image_disk_cache = MultiResolutionDiskCache(
+            cache_dir=image_cache_dir,
+            split_names=image_split_names,
+            aggregate_names=image_aggregate_names,
+            resolution_variants_in_name='resolution_variants',
+            selection_key_in_names=['dpo_pair_key', 'image_path'],
+            variations_in_name='concept.image_variations',
+            balancing_in_name='concept.balancing',
+            balancing_strategy_in_name='concept.balancing_strategy',
+            variations_group_in_name=[
+                'concept.path', 'concept.seed', 'concept.include_subdirectories',
+                'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern',
+            ],
+            group_enabled_in_name='concept.enabled',
+            before_cache_fun=before_cache_image_fun,
+        )
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
                                     variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
