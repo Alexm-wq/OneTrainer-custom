@@ -10,7 +10,7 @@
     "transformer": {
         "train": true,
         "weight_dtype": "INT_W8A8",
-        "model_name": "https://huggingface.co/lodestones/Kroma/blob/main/kroma-v0.3-base.safetensors"
+        "model_name": "https://huggingface.co/lodestones/Kroma/blob/main/kroma-sensei-booru-e6-teacher-velocity-v0.3.safetensors"
     },
     "text_encoder": {
         "train": false,

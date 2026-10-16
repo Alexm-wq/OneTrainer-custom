@@ -28,8 +28,12 @@ the previous implementation; old RLHF state formats are not supported.
 ## Starting settings
 
 Select **Krea 2 > kroma Mixed DPO LoRA** for a new run. It uses the native Kroma
-v0.3 Base transformer override and Krea 2's supporting components. Loading the
-preset itself does not download weights; starting the trainer can download the
+v0.3 Sensei Teacher Velocity transformer override
+(`kroma-sensei-booru-e6-teacher-velocity-v0.3.safetensors`) and Krea 2's
+supporting components. The [Kroma model card](https://huggingface.co/lodestones/Kroma#lora-training)
+documents both teacher and base as suitable LoRA training checkpoints, with the
+resulting LoRAs also usable on v0.3.1 Turbo OPD. This preset defaults to the teacher.
+Loading the preset itself does not download weights; starting the trainer can download the
 configured models on the machine running OneTrainer.
 
 | Setting | Starting value |
