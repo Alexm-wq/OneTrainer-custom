@@ -10,6 +10,7 @@ from modules.dataLoader.Krea2BaseDataLoader import Krea2BaseDataLoader
 from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.TrainingMethod import TrainingMethod
 
 from mgds.MGDS import MGDS
 from mgds.OutputPipelineModule import OutputPipelineModule
@@ -26,6 +27,8 @@ class KreaMultiResolutionIntegrationTest(unittest.TestCase):
             with self.subTest(bucketed=bucketed), tempfile.TemporaryDirectory() as directory:
                 config = TrainConfig.default_values()
                 config.model_type = ModelType.KREA_2
+                config.training_method = TrainingMethod.LORA
+                config.text_encoder.train = False
                 config.resolution = "64,128"
                 config.cache_dir = directory
                 config.aspect_ratio_bucketing = bucketed

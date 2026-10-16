@@ -245,7 +245,7 @@ class MultiResolutionCacheTest(unittest.TestCase):
                          for epoch in range(count * 8)]
                 for start in range(0, len(order), count):
                     self.assertEqual(set(order[start:start + count]), set(range(count)))
-                self.assertTrue(all(a != b for a, b in zip(order, order[1:])))
+                self.assertTrue(all(a != b for a, b in zip(order, order[1:], strict=False)))
 
     def test_resolution_selection_preserves_augmentation_seed(self):
         for base in (0, 1, 100):

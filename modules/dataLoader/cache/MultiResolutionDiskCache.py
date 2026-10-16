@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import suppress
 import hashlib
 import json
 import math
@@ -447,10 +448,8 @@ class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipeli
         result = []
         for entry in os.scandir(group_dir):
             if entry.is_dir() and entry.name.startswith("variation-"):
-                try:
+                with suppress(ValueError):
                     result.append(int(entry.name[10:]))
-                except ValueError:
-                    pass
         return sorted(set(result))
 
     def _init_cache_only(self) -> None:
