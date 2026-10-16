@@ -13,6 +13,8 @@ from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.AudioFormat import AudioFormat
 from modules.util.enum.ConfigPart import ConfigPart
 from modules.util.enum.DataType import DataType
+from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.GradientReducePrecision import GradientReducePrecision
 from modules.util.enum.ImageFormat import ImageFormat
@@ -23,6 +25,7 @@ from modules.util.enum.LossWeight import LossWeight
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.Optimizer import Optimizer
+from modules.util.enum.RLHFMode import RLHFMode
 from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
@@ -30,9 +33,6 @@ from modules.util.enum.VideoFormat import VideoFormat
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
-from modules.util.enum.DPOObjective import DPOObjective
-from modules.util.enum.DPORefMode import DPORefMode
-from modules.util.enum.RLHFMode import RLHFMode
 
 
 class TrainOptimizerConfig(BaseConfig):
@@ -1423,4 +1423,3 @@ class TrainConfig(BaseConfig):
 
     def effective_dpo_ref_mode(self):
         return getattr(self, "rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER)
-

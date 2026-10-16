@@ -1,10 +1,10 @@
-import time
 import contextlib
 import copy
 import json
 import math
 import os
 import shutil
+import time
 import traceback
 from collections.abc import Callable
 from pathlib import Path
@@ -24,11 +24,10 @@ from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
-from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.dpo_beta_controller import DPOBetaController
-from modules.util.rlhf_util import preference_seed, validate_rlhf_config
-from modules.util.enum.DPOObjective import DPOObjective
+from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
 from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelFormat import ModelFormat
@@ -36,6 +35,7 @@ from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.PrefetchIterator import PrefetchIterator
 from modules.util.profiling_util import TorchMemoryRecorder, TorchProfiler
+from modules.util.rlhf_util import preference_seed, validate_rlhf_config
 from modules.util.time_util import get_string_timestamp
 from modules.util.torch_util import torch_gc
 from modules.util.TrainProgress import TrainProgress
@@ -47,8 +47,6 @@ from torch.utils.hooks import RemovableHandle
 from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
-import huggingface_hub
-from requests.exceptions import ConnectionError
 from tqdm import tqdm
 
 
@@ -1347,7 +1345,7 @@ class GenericTrainer(BaseTrainer):
             "time": time.strftime("%Y-%m-%d %H:%M:%S"),
             "progress": progress,
             "batch_type": type(batch).__name__,
-            "batch_keys": sorted([str(k) for k in batch.keys()]) if isinstance(batch, dict) else [],
+            "batch_keys": sorted([str(k) for k in batch]) if isinstance(batch, dict) else [],
             "important": {},
             "all": {},
         }
@@ -1395,7 +1393,7 @@ class GenericTrainer(BaseTrainer):
             step = "unknown"
             if train_progress is not None and hasattr(train_progress, "global_step"):
                 with contextlib.suppress(Exception):
-                    step = str(getattr(train_progress, "global_step"))
+                    step = str(train_progress.global_step)
 
             stamp = time.strftime("%Y%m%d_%H%M%S")
             base = os.path.join(log_dir, f"crash_{stamp}_step_{step}")
@@ -1743,4 +1741,3 @@ class GenericTrainer(BaseTrainer):
 
         for handle in self.grad_hook_handles:
             handle.remove()
-
