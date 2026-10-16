@@ -17,11 +17,30 @@ The number of training samples per epoch is unchanged. DPO chosen/rejected
 latents and masks share the selected resolution. Text caching retains the
 existing separate cache.
 
-Use a new cache directory or enable **Clear Cache Before Training** for the
-first run after updating, and whenever source data, resolution settings, or
-augmentation settings change. Afterwards disable that option to reuse the
-completed cache between runs. Disk use and initial VAE encoding work grow
-with the number of distinct resolutions.
+On each trainer start, the cache rebuilds its row mapping from the currently
+enumerated dataset. An old `cache_layout.pt` can no longer fix the epoch size
+at a previous image count. The log reports source rows and balanced epoch samples.
+
+Image and text caches use ordered, per-concept source fingerprints. Adding,
+removing or renaming an image rebuilds both caches for the affected concept.
+Changing an image, rejected DPO image, mask or conditioning image rebuilds its
+image cache; changing a caption rebuilds the text cache. Other concepts keep
+their valid cache. Global resolution/frame settings also identify the image
+cache. Balancing is recalculated without reencoding unchanged sources.
+
+Fingerprints use file paths, sizes and nanosecond modification/change timestamps.
+**Clear Cache Before Training** remains useful when switching the VAE/text encoder
+or deliberately restoring files while preserving their metadata. Existing old
+cache groups are not deleted automatically; the first run after this update
+builds groups with the new source identities.
+
+Files added during an active run are picked up after restarting the trainer.
+The saved resume position is retained, so the first resumed epoch can have fewer
+remaining batches than its full epoch size. With batch size 1, repeats 1 and no
+filtering, 923 discovered normal images give 923 samples per full epoch.
+Larger batches, fixed SAMPLES balancing, holdout and aspect buckets can change
+the displayed batch count. Disk use and initial VAE encoding work grow with the
+number of distinct resolutions.
 
 ## Implementation provenance
 
@@ -43,4 +62,5 @@ Aspect calculation derives from Nerogar/MGDS, licensed under Apache-2.0; see
 ```sh
 python -m unittest discover -s tests -p 'test_multi_resolution_cache.py' -v
 python -m unittest discover -s tests -p 'test_krea2_checkpoint.py' -v
+python -m unittest discover -s tests -p 'test_krea2_multires_integration.py' -v
 ```

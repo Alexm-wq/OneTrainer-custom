@@ -32,8 +32,6 @@ class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipeli
 
     FORMAT_VERSION = 2
     CACHE_KIND = "onetrainer_multi_resolution"
-    LAYOUT_VERSION = 2
-    LAYOUT_FILENAME = "cache_layout.pt"
 
     def __init__(
             self,
@@ -115,7 +113,7 @@ class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipeli
         if not self.variations_initialized:
             if self.cache_only:
                 self._init_cache_only()
-            elif not self._load_layout():
+            else:
                 names = self.split_names or self.aggregate_names
                 if not names:
                     raise RuntimeError("MultiResolutionDiskCache requires cached names")
@@ -245,61 +243,12 @@ class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipeli
             parts.append(f"index={index}")
         return "|".join(map(str, parts))
 
-    def _layout_config(self) -> dict[str, Any]:
-        return {
-            "split_names": self.split_names,
-            "aggregate_names": self.aggregate_names,
-            "resolution_variants_in_name": self.resolution_variants_in_name,
-            "selection_key_in_names": self.selection_key_in_names,
-            "variations_in_name": self.variations_in_name,
-            "balancing_in_name": self.balancing_in_name,
-            "balancing_strategy_in_name": self.balancing_strategy_in_name,
-            "variations_group_in_names": self.variations_group_in_names,
-            "group_enabled_in_name": self.group_enabled_in_name,
-        }
-
-    def _layout_path(self) -> str:
-        return os.path.join(self.cache_dir, self.LAYOUT_FILENAME)
-
-    def _load_layout(self) -> bool:
-        path = self._layout_path()
-        if not os.path.isfile(path):
-            return False
-        try:
-            layout = self._load(path)
-        except Exception:
-            return False
-        if not isinstance(layout, dict) or layout.get("layout_version") != self.LAYOUT_VERSION:
-            return False
-        if layout.get("cache_kind") != self.CACHE_KIND or layout.get("config") != self._layout_config():
-            return False
-        gv, gi, go = layout.get("group_variations"), layout.get("group_indices"), layout.get("group_output_samples")
-        if not all(isinstance(x, dict) for x in (gv, gi, go)):
-            return False
-        self.group_variations = {str(k): int(v) for k, v in gv.items()}
-        self.group_indices = {str(k): list(v) for k, v in gi.items()}
-        self.group_output_samples = {str(k): int(v) for k, v in go.items()}
-        self.variations_initialized = True
-        print("[OT-MULTIRES-CACHE] Loaded persisted cache layout; skipping upstream dataset traversal.")
-        return True
-
-    def _write_layout(self) -> None:
-        os.makedirs(self.cache_dir, exist_ok=True)
-        self._save({
-            "layout_version": self.LAYOUT_VERSION,
-            "cache_kind": self.CACHE_KIND,
-            "config": self._layout_config(),
-            "group_variations": self.group_variations,
-            "group_indices": self.group_indices,
-            "group_output_samples": self.group_output_samples,
-        }, self._layout_path(), self.encrypted)
-
     def _init_variations(self) -> None:
         if self.cache_only:
             self._init_cache_only()
             return
-        if self._load_layout():
-            return
+        # Always rebuild the inexpensive row mapping from the current inventory.
+        # Disk payloads are still reused when their source/config identity matches.
         if self.variations_in_name:
             gv, gi, gb, gs = {}, {}, {}, {}
             for i in range(self._get_previous_length(self.variations_in_name)):
@@ -326,7 +275,10 @@ class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipeli
             go = {"": len(gi[""])}
         self.group_variations, self.group_indices, self.group_output_samples = gv, gi, go
         self.variations_initialized = True
-        self._write_layout()
+        print(
+            f"[OT-MULTIRES-CACHE] Dataset layout: source_rows={sum(map(len, gi.values()))}, "
+            f"epoch_samples={sum(go.values())}, groups={len(gi)}"
+        )
 
     def _cache_dir(self, group: str, variation: int) -> str:
         return os.path.join(self.cache_dir, group,

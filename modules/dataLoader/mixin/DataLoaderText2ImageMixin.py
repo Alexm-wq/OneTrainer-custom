@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import modules.util.multi_gpu_util as multi
 from modules.dataLoader.cache.AspectBucketing import AspectBucketing
+from modules.dataLoader.cache.DatasetCacheIdentity import DatasetCacheIdentity
 from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
 from modules.dataLoader.cache.SingleAspectCalculation import SingleAspectCalculation
 from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
@@ -92,6 +93,15 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             modules.append(mask_path)
         if config.custom_conditioning_image:
             modules.append(cond_path)
+
+        image_paths = ["image_path"]
+        if config.rlhf_enabled:
+            image_paths.append("image_path_rejected")
+        if config.masked_training:
+            image_paths.append("mask_path")
+        if config.custom_conditioning_image:
+            image_paths.append("cond_path")
+        modules.append(DatasetCacheIdentity(image_paths))
 
         return modules
 
@@ -427,13 +437,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 'concept.path', 'concept.seed', 'concept.include_subdirectories',
                 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern',
                 'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed',
+                'concept._image_cache_fingerprint', 'settings.target_resolution', 'settings.target_frames',
             ],
             group_enabled_in_name='concept.enabled',
             before_cache_fun=before_cache_image_fun,
         )
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed', 'concept._text_cache_fingerprint'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
