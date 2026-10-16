@@ -29,7 +29,7 @@ class KreaMultiResolutionIntegrationTest(unittest.TestCase):
                 config.model_type = ModelType.KREA_2
                 config.training_method = TrainingMethod.LORA
                 config.text_encoder.train = False
-                config.resolution = "64,128"
+                config.resolution = "128,256"
                 config.cache_dir = directory
                 config.aspect_ratio_bucketing = bucketed
                 config.image_caching = True
@@ -60,7 +60,7 @@ class KreaMultiResolutionIntegrationTest(unittest.TestCase):
                         seen.add(rows[0]["crop_resolution"][-1])
                         self.assertEqual(rows[0]["latent_image"].shape[1], 1)
                         torch.testing.assert_close(rows[0]["tokens"], torch.tensor([10, 20]))
-                    self.assertEqual(seen, {64, 128})
+                    self.assertEqual(seen, {128, 256})
                     self.assertEqual(len(probe.calls), 2)
                     self.assertTrue(list(Path(directory).glob("image/*/variation-0/0.pt")))
                     setup.prepare_text_caching.assert_called_once()

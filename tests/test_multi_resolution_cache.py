@@ -22,7 +22,7 @@ import torch
 class ImageSource(PipelineModule, RandomAccessPipelineModule):
     """Small source rows; all cache, bucketing and epoch logic remains real."""
 
-    def __init__(self, concepts, resolution=(1, 192, 192)):
+    def __init__(self, concepts, resolution=(1, 384, 384)):
         super().__init__()
         self.concepts = concepts
         self.resolution = resolution
@@ -94,7 +94,7 @@ def concept(seed=17, override=None, variations=1):
         "balancing": 1.0,
         "balancing_strategy": "REPEATS",
         "image": {"enable_resolution_override": override is not None,
-                  "resolution_override": override or "64", "enable_crop_jitter": False},
+                  "resolution_override": override or "128", "enable_crop_jitter": False},
         "text": {},
         "include_subdirectories": False,
         "dpo_chosen_pattern": "",
@@ -108,7 +108,7 @@ class MultiResolutionCacheTest(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
 
-    def make_pipeline(self, resolutions="64,128,192", *, concepts=None, bucketed=True,
+    def make_pipeline(self, resolutions="128,256,384", *, concepts=None, bucketed=True,
                       initial_epoch=0, initial_index=0, directory="cache", bad_pair=False):
         concepts = concepts or [concept(), concept()]
         state = PipelineState(2)
@@ -175,14 +175,14 @@ class MultiResolutionCacheTest(unittest.TestCase):
                 self.assertEqual(row["latent_mask"].shape[1:], row["latent_image"].shape[1:])
                 index = int(row["image_path"].split("-")[1].split(".")[0])
                 torch.testing.assert_close(row["tokens"], torch.tensor([index + 10, index + 20]))
-        self.assertEqual(list(seen.values()), [{64, 128, 192}, {64, 128, 192}])
+        self.assertEqual(list(seen.values()), [{128, 256, 384}, {128, 256, 384}])
         self.assertEqual(len(probe.calls), 6)
         prepared.assert_called_once()
         payloads = list(Path(cache.cache_dir).glob("*/variation-0/[0-9]*.pt"))
         self.assertEqual(len(payloads), 2)
         for path in payloads:
             payload = torch.load(path, weights_only=False)
-            self.assertEqual(payload["resolution_variants"], [64, 128, 192])
+            self.assertEqual(payload["resolution_variants"], [128, 256, 384])
             self.assertEqual(len(payload["variants"]), 3)
             self.assertEqual(len({v["augmentation"] for v in payload["variants"]}), 1)
 
@@ -200,25 +200,25 @@ class MultiResolutionCacheTest(unittest.TestCase):
         prepared.assert_not_called()
 
     def test_concept_overrides_have_independent_resolution_sets(self):
-        ds, _, probe, _ = self.make_pipeline(concepts=[concept(11, "64,128"), concept(22, "192")])
+        ds, _, probe, _ = self.make_pipeline(concepts=[concept(11, "128,256"), concept(22, "384")])
         choices = {"image-0.png": set(), "image-1.png": set()}
         for _ in range(2):
             for row in self.epoch(ds):
                 choices[row["image_path"]].add(row["crop_resolution"][-1])
-        self.assertEqual(choices, {"image-0.png": {64, 128}, "image-1.png": {192}})
+        self.assertEqual(choices, {"image-0.png": {128, 256}, "image-1.png": {384}})
         self.assertEqual(len(probe.calls), 3)
 
     def test_duplicate_resolutions_do_not_skip_a_distinct_resolution(self):
-        ds, cache, probe, _ = self.make_pipeline("64,64,128", concepts=[concept()])
+        ds, cache, probe, _ = self.make_pipeline("128,128,256", concepts=[concept()])
         seen = {self.epoch(ds)[0]["crop_resolution"][-1] for _ in range(2)}
-        self.assertEqual(seen, {64, 128})
+        self.assertEqual(seen, {128, 256})
         self.assertEqual(len(probe.calls), 2)
         item = next(Path(cache.cache_dir).glob("*/variation-0/0.pt"))
         payload = torch.load(item, weights_only=False)
-        self.assertEqual(payload["resolution_variants"], [64, 128])
+        self.assertEqual(payload["resolution_variants"], [128, 256])
 
     def test_non_bucketed_krea_frame_dimension_is_preserved(self):
-        ds, _, probe, _ = self.make_pipeline("64,128", bucketed=False, concepts=[concept()])
+        ds, _, probe, _ = self.make_pipeline("128,256", bucketed=False, concepts=[concept()])
         for _ in range(2):
             row = self.epoch(ds)[0]
             self.assertEqual(row["crop_resolution"][0], 1)
@@ -227,9 +227,9 @@ class MultiResolutionCacheTest(unittest.TestCase):
         self.assertEqual(len(probe.calls), 2)
 
     def test_single_resolution_still_caches_once(self):
-        ds, _, probe, _ = self.make_pipeline("128", concepts=[concept()])
+        ds, _, probe, _ = self.make_pipeline("256", concepts=[concept()])
         for _ in range(3):
-            self.assertEqual(self.epoch(ds)[0]["crop_resolution"], (1, 128, 128))
+            self.assertEqual(self.epoch(ds)[0]["crop_resolution"], (1, 256, 256))
         self.assertEqual(len(probe.calls), 1)
 
     def test_dpo_shape_mismatch_cannot_publish_complete_cache(self):
