@@ -42,6 +42,8 @@ class BaseModelSetup(
         self._last_dpo_metrics = None
         self._dpo_paired_half = None
         self._dpo_runtime_beta = None
+        self._dpo_validation_seed = None
+        self._dpo_is_validation = False
         # Previous per-pair rewards are kept only for the current process so the
         # separate bad-pair CSV can detect sudden wrong-direction jumps.
         self._dpo_bad_pair_previous_rewards: dict[str, tuple[float, float, int]] = {}
@@ -360,7 +362,7 @@ class BaseModelSetup(
             )
 
         payload = {
-            "version": 2,
+            "version": 3,
             "settings": self._dpo_curriculum_settings(config),
             "pairs": {
                 key: {
@@ -390,11 +392,15 @@ class BaseModelSetup(
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
         state_version = int(payload.get("version", -1))
-        if state_version not in (1, 2):
+        if state_version not in (1, 2, 3):
             raise RuntimeError(
                 "Unsupported Hard-Pair Curriculum state version: "
                 f"{payload.get('version')}"
             )
+
+        if state_version < 3:
+            print("[OT-DPO-CURRICULUM] Resetting legacy EMA state: old pair IDs and scaled scores are not comparable.")
+            return
 
         expected = self._dpo_curriculum_settings(config)
         saved = payload.get("settings", {})
@@ -1207,7 +1213,39 @@ class BaseModelSetup(
             writer.writerows(rows)
 
 
+    @contextmanager
+    def preference_dropout_disabled(self, model: BaseModel):
+        """Keep this scope open through backward when checkpointing is enabled."""
+        saved = {}
+        for adapter in model.adapters():
+            for module in adapter.modules():
+                dropout = getattr(module, "dropout", None)
+                if dropout is not None and hasattr(dropout, "p") and dropout not in saved:
+                    saved[dropout] = dropout.p
+                    dropout.p = 0.0
+        try:
+            yield
+        finally:
+            for dropout, probability in saved.items():
+                dropout.p = probability
+
     def calculate_dpo_loss(
+            self, model, batch, config, train_progress, *,
+            validation: bool = False, validation_seed: int = 0,
+    ) -> Tensor:
+        previous_seed = self._dpo_validation_seed
+        previous_validation = self._dpo_is_validation
+        self._dpo_validation_seed = validation_seed if validation else None
+        self._dpo_is_validation = validation
+        try:
+            with self.preference_dropout_disabled(model), torch.set_grad_enabled(
+                    torch.is_grad_enabled() and not validation):
+                return self._calculate_dpo_loss(model, batch, config, train_progress)
+        finally:
+            self._dpo_validation_seed = previous_seed
+            self._dpo_is_validation = previous_validation
+
+    def _calculate_dpo_loss(
         self,
         model: BaseModel,
         batch: dict,
@@ -1219,7 +1257,9 @@ class BaseModelSetup(
                 "RLHF DPO requires paired chosen/rejected batches, but the dataloader did not provide rejected samples."
             )
 
-        beta = config.rlhf_dpo_beta if self._dpo_runtime_beta is None else self._dpo_runtime_beta
+        # Validation uses fixed beta and no curriculum/outer weights, so scores
+        # remain comparable as the controller and training mixture evolve.
+        beta = config.rlhf_dpo_beta if self._dpo_is_validation or self._dpo_runtime_beta is None else self._dpo_runtime_beta
         supervised_loss = None
 
         # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
@@ -1248,7 +1288,7 @@ class BaseModelSetup(
         policy_logp = self._validate_rlhf_logp_per_sample(policy_logp, chosen_b, "policy")
         policy_chosen_logp = policy_logp[:chosen_b]
         policy_rejected_logp = policy_logp[chosen_b:]
-        if config.rlhf_supervised_mix > 0:
+        if config.rlhf_chosen_weight > 0 and not self._dpo_is_validation:
             chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
             supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
             del chosen_output
@@ -1257,6 +1297,15 @@ class BaseModelSetup(
         chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
         rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()
         margin = chosen_ratio - rejected_ratio
+        pair_weights = torch.as_tensor(batch["loss_weight"], device=margin.device, dtype=torch.float32)
+        pair_weights = pair_weights.expand_as(margin)
+        if self._dpo_is_validation:
+            pair_weights = torch.ones_like(margin)
+        if not torch.isfinite(pair_weights).all() or (pair_weights < 0).any():
+            raise ValueError("Preference concept weights must be finite and non-negative")
+
+        def reduce_pairs(values):
+            return (values * pair_weights).mean()
 
         # Default for logging and non-decoupled / IPO paths.
         dpo_beta_scale = 1.0
@@ -1356,7 +1405,7 @@ class BaseModelSetup(
                 + wrong_order_penalty_loss
             )
 
-            if self._dpo_hard_pair_curriculum_enabled(config):
+            if self._dpo_hard_pair_curriculum_enabled(config) and not self._dpo_is_validation:
                 (
                     curriculum_weight,
                     curriculum_margin_ema,
@@ -1370,28 +1419,33 @@ class BaseModelSetup(
                 # a per-pair EMA. There is no gradient path through confidence,
                 # so the model cannot reduce its loss by intentionally keeping
                 # confidence low.
+                # Curriculum attenuates rejection pressure only. Chosen
+                # protection and pair-order corrections must remain learnable.
                 pair_total_loss = (
-                    raw_pair_total_loss * curriculum_weight.detach()
+                    chosen_pair_loss
+                    + rejected_pair_loss * curriculum_weight.detach()
+                    + margin_penalty_loss
+                    + wrong_order_penalty_loss
                 )
             else:
                 pair_total_loss = raw_pair_total_loss
 
-            dpo_loss = pair_total_loss.mean()
+            dpo_loss = reduce_pairs(pair_total_loss)
             loss = dpo_loss
 
         elif config.rlhf_dpo_objective == DPOObjective.IPO:
-            dpo_loss = (margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2).mean()
+            dpo_loss = reduce_pairs((margin - 1.0 / (2.0 * config.rlhf_dpo_ipo_tau)).pow(2))
             loss = dpo_loss
         else:
             logits = beta * margin
-            dpo_loss = -F.logsigmoid(logits).mean()
+            dpo_loss = reduce_pairs(-F.logsigmoid(logits))
             preference_loss = dpo_loss
 
             if config.rlhf_dpo_label_smoothing > 0:
                 label_smoothing = config.rlhf_dpo_label_smoothing
                 preference_loss = (
                     (1.0 - label_smoothing) * preference_loss
-                    + label_smoothing * (-F.logsigmoid(-logits).mean())
+                    + label_smoothing * reduce_pairs(-F.logsigmoid(-logits))
                 )
 
             if getattr(config, "rlhf_dpo_beta_gradient_decouple", False):
@@ -1429,14 +1483,14 @@ class BaseModelSetup(
                     1e-6,
                 )
 
-                chosen_reward_push_loss = F.softplus(
+                chosen_reward_push_loss = reduce_pairs(F.softplus(
                     (chosen_reward_target - chosen_ratio) * chosen_reward_sharpness
-                ).mean() / chosen_reward_sharpness
+                )) / chosen_reward_sharpness
 
                 chosen_reward_floor_violation = F.relu(chosen_reward_floor_value - chosen_ratio)
                 chosen_reward_floor_loss = (
-                    chosen_reward_floor_violation.mean()
-                    + chosen_reward_sharpness * chosen_reward_floor_violation.pow(2).mean()
+                    reduce_pairs(chosen_reward_floor_violation)
+                    + chosen_reward_sharpness * reduce_pairs(chosen_reward_floor_violation.pow(2))
                 )
 
                 chosen_reward_aux_loss = chosen_anchor_weight * (
@@ -1445,13 +1499,15 @@ class BaseModelSetup(
                 )
                 loss = loss + chosen_reward_aux_loss
 
-        # DPO-side logged loss includes beta-grad scaling and chosen-anchor aux loss,
-        # but does not include supervised_mix.
         dpo_logged_loss = loss
-
-        if supervised_loss is not None:
-            loss = loss + config.rlhf_supervised_mix * supervised_loss
-            del supervised_loss
+        chosen_logged_loss = supervised_loss.detach().item() if supervised_loss is not None else 0.0
+        if not self._dpo_is_validation:
+            loss = loss * config.rlhf_dpo_weight * config.loss_scaler.get_scale(
+                config.batch_size, config.gradient_accumulation_steps
+            )
+            if supervised_loss is not None:
+                loss = loss + config.rlhf_chosen_weight * supervised_loss
+        del supervised_loss
 
         try:
             if config.rlhf_dpo_objective == DPOObjective.ANCHORED_REJECT:
@@ -1482,52 +1538,57 @@ class BaseModelSetup(
         if raw_pair_total_loss is None:
             raw_pair_total_loss = pair_total_loss
 
-        try:
-            self._write_dpo_pair_csv_log(
-                batch=batch,
-                config=config,
-                train_progress=train_progress,
-                chosen_b=chosen_b,
-                policy_timestep=policy_timestep,
-                pair_total_loss=pair_total_loss,
-                chosen_ratio=chosen_ratio,
-                rejected_ratio=rejected_ratio,
-                margin=margin,
-                raw_pair_total_loss=raw_pair_total_loss,
-                curriculum_weight=curriculum_weight,
-                curriculum_margin_ema=curriculum_margin_ema,
-                curriculum_observations=curriculum_observations,
-                margin_penalty_loss=margin_penalty_loss,
-                wrong_order_penalty_loss=wrong_order_penalty_loss,
-                margin_target_violation=margin_target_violation,
-                wrong_order_violation=wrong_order_violation,
-            )
-        except Exception as e:
-            print(
-                "[OT-DPO-PAIR-CSV] failed to write row: "
-                f"{type(e).__name__}: {e}"
-            )
+        if not self._dpo_is_validation:
+            try:
+                self._write_dpo_pair_csv_log(
+                    batch=batch,
+                    config=config,
+                    train_progress=train_progress,
+                    chosen_b=chosen_b,
+                    policy_timestep=policy_timestep,
+                    pair_total_loss=pair_total_loss,
+                    chosen_ratio=chosen_ratio,
+                    rejected_ratio=rejected_ratio,
+                    margin=margin,
+                    raw_pair_total_loss=raw_pair_total_loss,
+                    curriculum_weight=curriculum_weight,
+                    curriculum_margin_ema=curriculum_margin_ema,
+                    curriculum_observations=curriculum_observations,
+                    margin_penalty_loss=margin_penalty_loss,
+                    wrong_order_penalty_loss=wrong_order_penalty_loss,
+                    margin_target_violation=margin_target_violation,
+                    wrong_order_violation=wrong_order_violation,
+                )
+            except Exception as e:
+                print(
+                    "[OT-DPO-PAIR-CSV] failed to write row: "
+                    f"{type(e).__name__}: {e}"
+                )
 
-        try:
-            self._write_dpo_bad_pair_csv_log(
-                batch=batch,
-                config=config,
-                train_progress=train_progress,
-                chosen_b=chosen_b,
-                policy_timestep=policy_timestep,
-                pair_total_loss=pair_total_loss,
-                chosen_ratio=chosen_ratio,
-                rejected_ratio=rejected_ratio,
-                margin=margin,
-            )
-        except Exception as e:
-            print(
-                "[OT-DPO-BAD-PAIR-CSV] failed to write row: "
-                f"{type(e).__name__}: {e}"
-            )
+            try:
+                self._write_dpo_bad_pair_csv_log(
+                    batch=batch,
+                    config=config,
+                    train_progress=train_progress,
+                    chosen_b=chosen_b,
+                    policy_timestep=policy_timestep,
+                    pair_total_loss=pair_total_loss,
+                    chosen_ratio=chosen_ratio,
+                    rejected_ratio=rejected_ratio,
+                    margin=margin,
+                )
+            except Exception as e:
+                print(
+                    "[OT-DPO-BAD-PAIR-CSV] failed to write row: "
+                    f"{type(e).__name__}: {e}"
+                )
 
         self._last_dpo_metrics = {
             "objective_loss": dpo_logged_loss.detach().item(),
+            "chosen_training_loss": chosen_logged_loss,
+            "chosen_error": -policy_chosen_logp.detach().mean().item(),
+            "rejected_error": -policy_rejected_logp.detach().mean().item(),
+            "beta": float(beta),
             "chosen_reward": chosen_ratio.detach().mean().item(),
             "rejected_reward": rejected_ratio.detach().mean().item(),
             "reward_margin": margin.detach().mean().item(),
@@ -1560,6 +1621,16 @@ class BaseModelSetup(
                 else 0.0
             ),
         }
+
+        if config.rlhf_dpo_timestep_margin_logging and policy_timestep is not None:
+            # Keep counts so absent bins are not treated as zero observations.
+            timesteps = torch.as_tensor(policy_timestep, device=margin.device).reshape(-1)[:chosen_b]
+            bins = (timesteps.float() / model.noise_scheduler.config["num_train_timesteps"] * 10).long().clamp(0, 9)
+            for bucket in range(10):
+                selected = bins == bucket
+                if selected.any():
+                    self._last_dpo_metrics[f"timestep/{bucket}/sum"] = margin.detach()[selected].sum().item()
+                    self._last_dpo_metrics[f"timestep/{bucket}/count"] = selected.sum().item()
 
         return loss
 
@@ -1896,4 +1967,5 @@ class BaseModelSetup(
                 raise NotImplementedError(
                     f"attention mechanism {str(attn)} not implemented"
                 )
+
 

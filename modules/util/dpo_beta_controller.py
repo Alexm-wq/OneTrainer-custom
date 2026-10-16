@@ -36,7 +36,19 @@ class DPOBetaController:
         self._running_mean = 0.0
         self._running_m2 = 0.0  # Welford accumulator for the tanh scale
 
+    def state_dict(self) -> dict:
+        return {key: value for key, value in vars(self).items()}
+
+    def load_state_dict(self, state: dict):
+        if float(state.get("beta0", self.beta0)) != self.beta0:
+            raise ValueError("Adaptive beta base changed across resume")
+        for key in ("margin_ema", "_steps", "_running_mean", "_running_m2"):
+            if key in state:
+                setattr(self, key, state[key])
+
     def update(self, margin: float) -> float:
+        if not math.isfinite(margin):
+            raise ValueError("Adaptive beta requires a finite reward margin")
         self._steps += 1
 
         delta = margin - self._running_mean
@@ -55,3 +67,4 @@ class DPOBetaController:
         scale = std if std > 1e-12 else max(abs(self.margin_ema), 1e-12)
         beta = self.beta0 * (1.0 + self.alpha * math.tanh((margin - self.margin_ema) / scale))
         return min(self.max_beta, max(self.min_beta, beta))
+

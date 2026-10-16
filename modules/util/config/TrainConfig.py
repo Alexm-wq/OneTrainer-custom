@@ -639,7 +639,11 @@ class TrainConfig(BaseConfig):
     rlhf_mode: RLHFMode
     rlhf_dpo_beta: float
     rlhf_dpo_label_smoothing: float
-    rlhf_supervised_mix: float
+    rlhf_normal_weight: float
+    rlhf_dpo_weight: float
+    rlhf_chosen_weight: float
+    rlhf_dpo_validation_seed: int
+    rlhf_dpo_validation_samples: int
     rlhf_dpo_objective: DPOObjective
     rlhf_dpo_ipo_tau: float
     rlhf_dpo_ref_mode: DPORefMode
@@ -688,7 +692,7 @@ class TrainConfig(BaseConfig):
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
             data,
-            config_version=11,
+            config_version=12,
             config_migrations={
                 0: self.__migration_0,
                 1: self.__migration_1,
@@ -701,6 +705,7 @@ class TrainConfig(BaseConfig):
                 8: self.__migration_8,
                 9: self.__migration_9,
                 10: self.__migration_10,
+                11: self.__migration_11,
             }
         )
 
@@ -937,6 +942,16 @@ class TrainConfig(BaseConfig):
             elif training_method != "EMBEDDING":
                 migrated_data["output_model_format"] = "LEGACY_SAFETENSORS"
 
+        return migrated_data
+
+    def __migration_11(self, data: dict) -> dict:
+        migrated_data = data.copy()
+        migrated_data.setdefault("rlhf_dpo_label_smoothing", 0.0)
+        migrated_data.setdefault("rlhf_dpo_beta_gradient_decouple", False)
+        migrated_data.setdefault("rlhf_dpo_beta_gradient_reference", None)
+        migrated_data.setdefault("rlhf_normal_weight", 1.0)
+        migrated_data.setdefault("rlhf_dpo_weight", 1.0)
+        migrated_data.setdefault("rlhf_chosen_weight", migrated_data.pop("rlhf_supervised_mix", 0.0))
         return migrated_data
 
     def model_part_configs(self) -> list[TrainModelPartConfig]:
@@ -1364,8 +1379,12 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_enabled", False, bool, False))
         data.append(("rlhf_mode", RLHFMode.DPO, RLHFMode, False))
         data.append(("rlhf_dpo_beta", 300.0, float, False))
-        data.append(("rlhf_dpo_label_smoothing", 0.0, float, False))
-        data.append(("rlhf_supervised_mix", 0.0, float, False))
+        data.append(("rlhf_dpo_label_smoothing", 0.05, float, False))
+        data.append(("rlhf_normal_weight", 1.0, float, False))
+        data.append(("rlhf_dpo_weight", 1.0, float, False))
+        data.append(("rlhf_chosen_weight", 0.1, float, False))
+        data.append(("rlhf_dpo_validation_seed", 0, int, False))
+        data.append(("rlhf_dpo_validation_samples", 4, int, False))
         data.append(("rlhf_dpo_objective", DPOObjective.SIGMOID, DPOObjective, False))
         data.append(("rlhf_dpo_ipo_tau", 1000.0, float, False))
         data.append(("rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER, DPORefMode, False))
@@ -1376,8 +1395,8 @@ class TrainConfig(BaseConfig):
         data.append(("rlhf_dpo_patience_value", 5, int, False))
         data.append(("rlhf_dpo_save_best", False, bool, False))
         data.append(("rlhf_dpo_timestep_margin_logging", False, bool, False))
-        data.append(("rlhf_dpo_beta_gradient_decouple", False, bool, False))
-        data.append(("rlhf_dpo_beta_gradient_reference", None, float, True))
+        data.append(("rlhf_dpo_beta_gradient_decouple", True, bool, False))
+        data.append(("rlhf_dpo_beta_gradient_reference", 1.0, float, True))
         data.append(("rlhf_dpo_chosen_reward_anchor", False, bool, False))
         data.append(("rlhf_dpo_chosen_reward_anchor_weight", 0.0, float, False))
         data.append(("rlhf_dpo_chosen_reward_target", 0.05, float, False))
@@ -1415,3 +1434,4 @@ class TrainConfig(BaseConfig):
 
     def effective_dpo_ref_mode(self):
         return getattr(self, "rlhf_dpo_ref_mode", DPORefMode.NEW_ADAPTER)
+

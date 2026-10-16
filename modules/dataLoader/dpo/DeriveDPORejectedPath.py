@@ -1,4 +1,5 @@
 import os
+from modules.util.rlhf_util import preference_pair_key
 
 from modules.util.dpo_curation_util import resolve_aspect_ratio
 from modules.util.dpo_pattern_util import build_rejected_index, match_chosen, resolve_rejected, validate_dpo_patterns
@@ -85,6 +86,7 @@ class DeriveDPORejectedPath(
 
             concept_path = concept['path']
             stem = match_chosen(chosen_pattern, concept_path, image_path)
+            pair_key = preference_pair_key(concept_path, stem) if stem is not None else ''
 
             if stem is None:
                 missing.append(
@@ -110,13 +112,13 @@ class DeriveDPORejectedPath(
                 missing.append(str(e))
                 self._rejected_paths.append(image_path)
                 self._is_paired.append(False)
-                self._pair_keys.append(stem)
+                self._pair_keys.append(pair_key)
                 self._cache_modes.append('missing')
                 continue
 
             self._rejected_paths.append(rejected_path)
             self._is_paired.append(True)
-            self._pair_keys.append(stem)
+            self._pair_keys.append(pair_key)
             self._cache_modes.append('dpo')
             dpo_count += 1
 
@@ -147,3 +149,4 @@ class DeriveDPORejectedPath(
             self.dpo_pair_key_out_name: self._pair_keys[index],
             self.dpo_cache_mode_out_name: self._cache_modes[index],
         }
+

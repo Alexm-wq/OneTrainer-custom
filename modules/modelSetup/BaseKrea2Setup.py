@@ -77,6 +77,8 @@ class BaseKrea2Setup(
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if self._dpo_validation_seed is not None:
+                batch_seed = self._dpo_validation_seed
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -174,22 +176,15 @@ class BaseKrea2Setup(
             data: dict,
             config: TrainConfig,
     ) -> Tensor:
-        # Krea-native DPO likelihood proxy.
-        #
-        # Normal Krea training uses _flow_matching_losses(...).mean().
-        # DPO needs the same native loss path before the batch mean, so the
-        # preference objective uses one negative per-sample loss as its logp
-        # proxy.
-        #
-        # This keeps DPO in Krea's own units: MSE/MAE/log-cosh/Huber stack,
-        # loss_scaler, per-sample loss_weight, mask handling, and sigma
-        # timestep weighting all match normal Krea training.
+        # FP32 native error proxy with configured masks and timestep weighting.
+        # Concept weights and batch/GA scaling belong outside the objective.
         return -self._flow_matching_losses(
             batch=batch,
             data=data,
             config=config,
             train_device=self.train_device,
             sigmas=model.noise_scheduler.sigmas,
+            apply_sample_scaling=False,
         )
     def calculate_loss(
             self,
@@ -214,3 +209,4 @@ class BaseKrea2Setup(
 
         model.eval()
         torch_gc()
+

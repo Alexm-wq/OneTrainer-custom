@@ -25,6 +25,9 @@ from modules.util.compile_util import init_compile
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dtype_util import create_grad_scaler, enable_grad_scaling
+from modules.util.dpo_beta_controller import DPOBetaController
+from modules.util.rlhf_util import preference_seed, validate_rlhf_config
+from modules.util.enum.DPOObjective import DPOObjective
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.EMAMode import EMAMode
 from modules.util.enum.FileType import FileType
@@ -97,8 +100,20 @@ class GenericTrainer(BaseTrainer):
         self._gradient_accumulation_dirty = False
         self._dpo_metric_sums: dict[str, float] = {}
         self._dpo_metric_weight = 0.0
+        self._dpo_timestep_sums = {}
+        self._dpo_beta_controller = DPOBetaController(config.rlhf_dpo_beta) if (
+            config.rlhf_enabled and config.rlhf_dpo_adaptive_beta
+            and config.rlhf_dpo_objective == DPOObjective.SIGMOID
+        ) else None
+        self._dpo_best_validation = None
+        self._dpo_validation_bad_steps = 0
+        self._dpo_validation_started = False
+        self._dpo_early_stop = False
+        if config.rlhf_enabled and config.rlhf_dpo_validation:
+            config.validation = True
 
     def start(self):
+        validate_rlhf_config(self.config)
         if multi.is_master():
             self.__save_config_to_workspace()
 
@@ -169,6 +184,7 @@ class GenericTrainer(BaseTrainer):
                 last_backup_path,
                 "onetrainer_dpo_reference.pt",
             )
+            self.__load_rlhf_state(last_backup_path)
             self.model_setup.load_dpo_curriculum_state(
                 os.path.join(
                     last_backup_path,
@@ -353,6 +369,30 @@ class GenericTrainer(BaseTrainer):
             json.dump(payload, handle, indent=2)
             handle.write("\n")
 
+    def __save_rlhf_state(self, backup_path):
+        if not self.config.rlhf_enabled:
+            return
+        payload = {
+            "beta_controller": self._dpo_beta_controller.state_dict() if self._dpo_beta_controller else None,
+            "runtime_beta": self.model_setup._dpo_runtime_beta,
+            "best_validation": self._dpo_best_validation,
+            "validation_bad_steps": self._dpo_validation_bad_steps,
+        }
+        with open(os.path.join(backup_path, "onetrainer_rlhf_state.json"), "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, allow_nan=False)
+
+    def __load_rlhf_state(self, backup_path):
+        path = os.path.join(backup_path, "onetrainer_rlhf_state.json")
+        if not os.path.isfile(path):
+            return  # Older backups did not have functional adaptive beta/holdout.
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        if self._dpo_beta_controller and payload.get("beta_controller"):
+            self._dpo_beta_controller.load_state_dict(payload["beta_controller"])
+            self.model_setup.set_dpo_runtime_beta(payload["runtime_beta"])
+        self._dpo_best_validation = payload.get("best_validation")
+        self._dpo_validation_bad_steps = int(payload.get("validation_bad_steps", 0))
+
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")
         os.makedirs(Path(path).absolute(), exist_ok=True)
@@ -534,76 +574,103 @@ class GenericTrainer(BaseTrainer):
         torch_gc()
 
     def __validate(self, train_progress: TrainProgress):
-        if self.__needs_validate(train_progress):
+        if not self.__needs_validate(train_progress):
+            return
+        paired_validation = self.config.rlhf_enabled and self.config.rlhf_dpo_validation
+        if not paired_validation or not self._dpo_validation_started:
             self.validation_data_loader.get_data_set().start_next_epoch()
-            current_epoch_length_validation = self.validation_data_loader.get_data_set().approximate_length()
+            self._dpo_validation_started = True
+        length = self.validation_data_loader.get_data_set().approximate_length()
+        if length == 0:
+            if paired_validation:
+                print("[OT-DPO] No validation images. Increase the holdout percentage or add validation concepts.")
+            return
 
-            if current_epoch_length_validation == 0:
-                return
-
-            self.callbacks.on_update_status("Calculating validation loss")
-            self.model_setup.setup_train_device(self.model, self.config)
-
-            torch_gc()
-
-            step_tqdm_validation = tqdm(
-                self.validation_data_loader.get_data_loader(),
-                desc="validation_step",
-                total=current_epoch_length_validation)
-
-            accumulated_loss_per_concept = {}
-            concept_counts = {}
-            mapping_seed_to_label = {}
-            mapping_label_to_seed = {}
-
-            for validation_batch in step_tqdm_validation:
+        self.callbacks.on_update_status("Calculating validation loss")
+        self.model_setup.setup_train_device(self.model, self.config)
+        self.model.eval()
+        schedule_free = self.config.optimizer.optimizer.is_schedule_free
+        if schedule_free:
+            torch.clear_autocast_cache()
+            self.model.optimizer.eval()
+        torch_gc()
+        normal_sums, normal_counts = {}, {}
+        pair_sums, pair_count = {}, 0
+        previous_metrics = self.model_setup.get_last_dpo_metrics()
+        try:
+            for batch in tqdm(self.validation_data_loader.get_data_loader(), desc="validation_step", total=length):
                 if self.__needs_gc(train_progress):
                     torch_gc()
-
+                if paired_validation and self.__rlhf_dpo_indices(batch):
+                    pair_key = self.model_setup._dpo_curriculum_pair_key(batch, 0)
+                    for draw in range(self.config.rlhf_dpo_validation_samples):
+                        self.model_setup.calculate_dpo_loss(
+                            self.model, batch, self.config, train_progress,
+                            validation=True,
+                            validation_seed=preference_seed(pair_key, self.config.rlhf_dpo_validation_seed, draw),
+                        )
+                        for name, value in self.model_setup.get_last_dpo_metrics().items():
+                            if name in ("objective_loss", "reward_margin", "accuracy", "chosen_reward",
+                                        "rejected_reward", "chosen_error", "rejected_error"):
+                                pair_sums[name] = pair_sums.get(name, 0.0) + value
+                        pair_count += 1
+                    continue
                 with torch.no_grad():
-                    model_output_data = self.model_setup.predict(
-                        self.model, validation_batch, self.config, train_progress, deterministic=True)
-                    loss_validation = self.model_setup.calculate_loss(
-                        self.model, validation_batch, model_output_data, self.config)
+                    output = self.model_setup.predict(self.model, batch, self.config, train_progress, deterministic=True)
+                    loss = self.model_setup.calculate_loss(self.model, batch, output, self.config).item()
+                # Include the concept seed to avoid merging equal display names.
+                name = batch["concept_name"][0] or os.path.basename(batch["concept_path"][0])
+                key = f"{name}-{batch['concept_seed'][0]}"
+                normal_sums[key] = normal_sums.get(key, 0.0) + loss
+                normal_counts[key] = normal_counts.get(key, 0) + 1
 
-                # since validation batch size = 1
-                concept_name = validation_batch["concept_name"][0]
-                concept_path = validation_batch["concept_path"][0]
-                concept_seed = validation_batch["concept_seed"].item()
-                loss = loss_validation.item()
-
-                label = concept_name if concept_name else os.path.basename(concept_path)
-                # check and fix collision to display both graphs in tensorboard
-                if label in mapping_label_to_seed and mapping_label_to_seed[label] != concept_seed:
-                    suffix = 1
-                    new_label = f"{label}({suffix})"
-                    while new_label in mapping_label_to_seed and mapping_label_to_seed[new_label] != concept_seed:
-                        suffix += 1
-                        new_label = f"{label}({suffix})"
-                    label = new_label
-
-                if concept_seed not in mapping_seed_to_label:
-                    mapping_seed_to_label[concept_seed] = label
-                    mapping_label_to_seed[label] = concept_seed
-
-                accumulated_loss_per_concept[concept_seed] = accumulated_loss_per_concept.get(concept_seed, 0) + loss
-                concept_counts[concept_seed] = concept_counts.get(concept_seed, 0) + 1
-
-            for concept_seed, total_loss in accumulated_loss_per_concept.items():
-                average_loss = total_loss / concept_counts[concept_seed]
-
-                self.tensorboard.add_scalar(f"loss/validation_step/{mapping_seed_to_label[concept_seed]}",
-                                            average_loss,
-                                            train_progress.global_step)
-
-            if len(concept_counts) > 1:
-                total_loss = sum(accumulated_loss_per_concept[key] for key in concept_counts)
-                total_count = sum(concept_counts[key] for key in concept_counts)
-                total_average_loss = total_loss / total_count
-
+            for key, total in normal_sums.items():
+                self.tensorboard.add_scalar(f"loss/validation_step/{key}", total / normal_counts[key], train_progress.global_step)
+            if normal_counts:
                 self.tensorboard.add_scalar("loss/validation_step/total_average",
-                                            total_average_loss,
-                                            train_progress.global_step)
+                                            sum(normal_sums.values()) / sum(normal_counts.values()), train_progress.global_step)
+            if pair_count:
+                metrics = {key: total / pair_count for key, total in pair_sums.items()}
+                for key, value in metrics.items():
+                    self.tensorboard.add_scalar(f"dpo/validation/{key}", value, train_progress.global_step)
+                self.__record_dpo_validation(metrics, train_progress)
+            elif paired_validation:
+                print("[OT-DPO] No held-out preference pairs; DPO Save Best and patience have no observations.")
+        finally:
+            self.model_setup._last_dpo_metrics = previous_metrics
+            if schedule_free:
+                torch.clear_autocast_cache()
+                self.model.optimizer.train()
+            self.model_setup.setup_train_device(self.model, self.config)
+
+    def __record_dpo_validation(self, metrics, train_progress):
+        score = metrics["objective_loss"]
+        if not math.isfinite(score):
+            raise RuntimeError("DPO validation produced a non-finite objective")
+        if self._dpo_best_validation is None or score < self._dpo_best_validation:
+            if self.config.rlhf_dpo_save_best:
+                # Save exactly the weights just evaluated, without substituting EMA.
+                save_path = os.path.join(
+                    self.config.workspace_dir, "save",
+                    f"{self.config.save_filename_prefix}best-dpo{self.config.output_model_format.file_extension()}",
+                )
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                self.model_saver.save(
+                    model=self.model, model_type=self.config.model_type,
+                    output_model_format=self.config.output_model_format,
+                    output_model_destination=save_path, dtype=self.config.output_dtype.torch_dtype(),
+                )
+                with open(save_path + ".metrics.json", "w", encoding="utf-8") as handle:
+                    json.dump({"global_step": train_progress.global_step, **metrics}, handle, indent=2, allow_nan=False)
+                print(f"[OT-DPO] Saved best validation checkpoint: {save_path}")
+            self._dpo_best_validation = score
+            self._dpo_validation_bad_steps = 0
+        else:
+            self._dpo_validation_bad_steps += 1
+        if (self.config.rlhf_dpo_patience_enabled
+                and self._dpo_validation_bad_steps >= self.config.rlhf_dpo_patience_value):
+            print("[OT-DPO] Validation patience reached; stopping after the completed optimizer step.")
+            self._dpo_early_stop = True
 
     def __save_backup_config(self, backup_path):
         config_path = os.path.join(backup_path, "onetrainer_config")
@@ -662,6 +729,7 @@ class GenericTrainer(BaseTrainer):
             self.model_setup.save_dpo_reference(
                 os.path.join(backup_path, "onetrainer_dpo_reference.pt")
             )
+            self.__save_rlhf_state(backup_path)
             self.__write_resume_integrity(
                 backup_path,
                 train_progress,
@@ -823,6 +891,8 @@ class GenericTrainer(BaseTrainer):
     def __dpo_tensorboard_metric_names(self) -> set[str]:
         return {
             "objective_loss",
+            "chosen_training_loss",
+            "beta",
             "chosen_reward",
             "rejected_reward",
             "reward_margin",
@@ -860,9 +930,24 @@ class GenericTrainer(BaseTrainer):
                     self._dpo_metric_sums.get(name, 0.0)
                     + float(value) * weight
                 )
+        for name, value in metrics.items():
+            if name.startswith("timestep/"):
+                self._dpo_timestep_sums[name] = self._dpo_timestep_sums.get(name, 0.0) + value
         self._dpo_metric_weight += weight
 
     def __flush_dpo_tensorboard_metrics(self, global_step: int):
+        # Every rank participates, including ranks whose local batch has no pairs.
+        if self._dpo_beta_controller:
+            totals = torch.tensor([
+                self._dpo_metric_sums.get("reward_margin", 0.0), self._dpo_metric_weight,
+            ], device=self.train_device, dtype=torch.float64)
+            if multi.is_enabled():
+                torch.distributed.all_reduce(totals)
+            if totals[1].item() > 0:
+                beta = self._dpo_beta_controller.update((totals[0] / totals[1]).item())
+                self.model_setup.set_dpo_runtime_beta(beta)
+                if hasattr(self, "tensorboard"):
+                    self.tensorboard.add_scalar("dpo/next_beta", beta, global_step)
         if self._dpo_metric_weight <= 0:
             return
 
@@ -874,6 +959,15 @@ class GenericTrainer(BaseTrainer):
                     global_step,
                 )
 
+        if hasattr(self, "tensorboard"):
+            for bucket in range(10):
+                count = self._dpo_timestep_sums.get(f"timestep/{bucket}/count", 0)
+                if count:
+                    self.tensorboard.add_scalar(
+                        f"dpo/timestep_margin/{bucket}",
+                        self._dpo_timestep_sums[f"timestep/{bucket}/sum"] / count, global_step,
+                    )
+        self._dpo_timestep_sums.clear()
         self._dpo_metric_sums.clear()
         self._dpo_metric_weight = 0.0
 
@@ -1028,7 +1122,7 @@ class GenericTrainer(BaseTrainer):
 
         dpo_indices = self.__rlhf_dpo_indices(batch)
         if not dpo_indices:
-            return self.__calculate_standard_only_training_loss(batch, train_progress)
+            return self.config.rlhf_normal_weight * self.__calculate_standard_only_training_loss(batch, train_progress)
 
         normal_indices = self.__normal_indices(batch)
 
@@ -1042,17 +1136,7 @@ class GenericTrainer(BaseTrainer):
             weighted = loss * (count / max(total_items, 1))
             loss_sum = weighted if loss_sum is None else loss_sum + weighted
 
-        if normal_indices:
-            normal_batch = self.__subbatch(batch, normal_indices)
-            normal_loss = self.__calculate_standard_only_training_loss(normal_batch, train_progress)
-            add_loss(normal_loss, len(normal_indices))
-            if hasattr(self, "tensorboard"):
-                self.tensorboard.add_scalar(
-                    "rlhf/normal_loss",
-                    float(normal_loss.detach().item()),
-                    train_progress.global_step,
-                )
-
+        # Reference weight swapping must finish before any policy graph exists.
         if dpo_indices:
             dpo_batch = self.__subbatch(batch, dpo_indices)
             self.__assert_dpo_resolution_homogeneous(dpo_batch)
@@ -1070,8 +1154,19 @@ class GenericTrainer(BaseTrainer):
                 len(dpo_indices),
             )
 
+        if normal_indices:
+            normal_batch = self.__subbatch(batch, normal_indices)
+            normal_loss = self.__calculate_standard_only_training_loss(normal_batch, train_progress)
+            add_loss(self.config.rlhf_normal_weight * normal_loss, len(normal_indices))
+            if hasattr(self, "tensorboard"):
+                self.tensorboard.add_scalar(
+                    "rlhf/normal_loss",
+                    float(normal_loss.detach().item()),
+                    train_progress.global_step,
+                )
+
         if loss_sum is None:
-            return self.__calculate_standard_only_training_loss(batch, train_progress)
+            return self.config.rlhf_normal_weight * self.__calculate_standard_only_training_loss(batch, train_progress)
 
         return loss_sum
 
@@ -1466,25 +1561,26 @@ class GenericTrainer(BaseTrainer):
                     step_seed = train_progress.global_step
                     bf16_stochastic_rounding_set_seed(step_seed, train_device)
 
-                    # Normal behavior: use the batch exactly as emitted by the dataloader.
-                    # Do not split/requeue/replay batches inside GenericTrainer.
-                    #
-                    # RLHF/DPO math is still handled by __calculate_mixed_rlhf_training_loss().
-                    # This intentionally does not touch calculate_dpo_loss, native Krea DPO
-                    # logp, chosen-reward anchor/floor logic, or any RL loss code.
-                    self.__ot_write_batch_breadcrumb(batch, train_progress)
-                    try:
-                        loss = self.__calculate_mixed_rlhf_training_loss(batch, train_progress)
-                    except Exception as e:
-                        self.__ot_write_crash_dump(e, batch, train_progress)
-                        raise
+                    # Keep adapter dropout disabled until checkpointed backward
+                    # has finished. Normal-only training retains its configured dropout.
+                    dropout_context = (
+                        self.model_setup.preference_dropout_disabled(self.model)
+                        if self.config.rlhf_enabled else contextlib.nullcontext()
+                    )
+                    with dropout_context:
+                        self.__ot_write_batch_breadcrumb(batch, train_progress)
+                        try:
+                            loss = self.__calculate_mixed_rlhf_training_loss(batch, train_progress)
+                        except Exception as e:
+                            self.__ot_write_crash_dump(e, batch, train_progress)
+                            raise
 
-                    loss = loss / self.config.gradient_accumulation_steps
-                    self._gradient_accumulation_dirty = True
-                    if scaler:
-                        scaler.scale(loss).backward()
-                    else:
-                        loss.backward()
+                        loss = loss / self.config.gradient_accumulation_steps
+                        self._gradient_accumulation_dirty = True
+                        if scaler:
+                            scaler.scale(loss).backward()
+                        else:
+                            loss.backward()
 
                     has_gradient = True
                     detached_loss = loss.detach()
@@ -1558,8 +1654,14 @@ class GenericTrainer(BaseTrainer):
 
                         self.one_step_trained = True
 
-                if self.config.validation and multi.is_master():
-                    self.__validate(train_progress)
+                if self.config.validation and not has_gradient:
+                    if multi.is_master():
+                        self.__validate(train_progress)
+                    stop = torch.tensor(int(self._dpo_early_stop), device=train_device)
+                    if multi.is_enabled():
+                        torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
+                    if stop.item():
+                        self.commands.stop()
 
                 train_progress.next_step(self.config.batch_size)
                 self.callbacks.on_update_train_progress(train_progress, current_epoch_length, self.config.epochs)
@@ -1635,3 +1737,4 @@ class GenericTrainer(BaseTrainer):
 
         for handle in self.grad_hook_handles:
             handle.remove()
+

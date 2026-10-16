@@ -38,7 +38,7 @@ class BaseRLHFTabView:
                 "DPO / Sigmoid is the standard two-sided preference objective. "
                 "IPO targets a fixed reward margin. Anchored Reject independently "
                 "pushes chosen reward above its target and rejected reward below "
-                "its target, without a margin loss."
+                "its target, with target-margin and wrong-order correction terms."
             ),
         )
         self.components.options_kv(
@@ -119,10 +119,17 @@ class BaseRLHFTabView:
             core,
             8,
             0,
-            "Supervised Mix",
-            tooltip="Adds chosen-image supervised loss to the preference loss.",
+            "Chosen Training Weight",
+            tooltip="Independent weight of normal training on chosen images. Zero disables this term.",
         )
-        self.components.entry(core, 8, 1, ui_state, "rlhf_supervised_mix")
+        self.components.entry(core, 8, 1, ui_state, "rlhf_chosen_weight")
+
+        self.components.label(core, 11, 0, "Normal Training Weight",
+                              tooltip="Weight of unpaired normal training images. Does not change the sampling ratio.")
+        self.components.entry(core, 11, 1, ui_state, "rlhf_normal_weight")
+        self.components.label(core, 12, 0, "DPO Weight",
+                              tooltip="Independent weight of the preference objective, including its anchors. Does not multiply Chosen Training Weight.")
+        self.components.entry(core, 12, 1, ui_state, "rlhf_dpo_weight")
 
         self.components.label(core, 9, 0, "IPO Tau")
         self.components.entry(core, 9, 1, ui_state, "rlhf_dpo_ipo_tau")
@@ -132,7 +139,7 @@ class BaseRLHFTabView:
             10,
             0,
             "Adaptive Beta",
-            tooltip="Adjust beta dynamically from observed DPO saturation.",
+            tooltip="Adapt sigmoid beta once per optimizer step using the globally averaged raw reward margin.",
         )
         self.components.switch(
             core,
@@ -151,7 +158,7 @@ class BaseRLHFTabView:
             "Anchored Reject",
             tooltip=(
                 "Independent one-sided chosen/rejected targets using Smooth-L1. "
-                "No explicit reward-margin loss is used."
+                "Target-margin and wrong-order penalties protect the pair ordering."
             ),
         )
 
@@ -233,8 +240,8 @@ class BaseRLHFTabView:
             0,
             "Margin Weight",
             tooltip=(
-                "Weight of the positive target-margin penalty. With the hard-"
-                "pair curriculum enabled, this term is confidence-scaled."
+                "Weight of the positive target-margin penalty. This correction "
+                "is not reduced by the curriculum."
             ),
         )
         self.components.entry(
@@ -252,7 +259,7 @@ class BaseRLHFTabView:
             "Wrong-Order Weight",
             tooltip=(
                 "Additional rescue penalty while rejected_reward is greater "
-                "than chosen_reward. It is also confidence-scaled."
+                "than chosen_reward. This correction is not reduced by the curriculum."
             ),
         )
         self.components.entry(
@@ -269,9 +276,9 @@ class BaseRLHFTabView:
             0,
             "Hard-Pair Curriculum",
             tooltip=(
-                "Reduce the entire Anchored Reject gradient for close or "
-                "incorrectly ranked pairs. Per-pair EMA state is saved in "
-                "backups and restored exactly."
+                "Reduce rejection pressure for close or incorrectly ranked pairs. "
+                "Chosen protection and order corrections retain full weight. "
+                "Per-pair EMA state is saved in backups."
             ),
         )
         self.components.switch(
@@ -426,7 +433,7 @@ class BaseRLHFTabView:
             0,
             0,
             "DPO Validation",
-            tooltip="Reserve configured DPO pairs for validation.",
+            tooltip="Evaluate held-out pairs against the fixed reference. Percentage reserves pairs from training concepts; explicit validation concepts are also supported.",
         )
         self.components.switch(
             validation,
@@ -435,6 +442,12 @@ class BaseRLHFTabView:
             ui_state,
             "rlhf_dpo_validation",
         )
+
+        self.components.label(validation, 7, 0, "Validation Seed")
+        self.components.entry(validation, 7, 1, ui_state, "rlhf_dpo_validation_seed")
+        self.components.label(validation, 8, 0, "Validation Noise Samples",
+                              tooltip="Fixed noise/timestep draws per pair, reused at every validation.")
+        self.components.entry(validation, 8, 1, ui_state, "rlhf_dpo_validation_samples")
 
         self.components.label(validation, 1, 0, "Validation Percentage")
         self.components.entry(
@@ -548,3 +561,4 @@ class BaseRLHFTabView:
                 "needed for clean batch multiples."
             ),
         )
+

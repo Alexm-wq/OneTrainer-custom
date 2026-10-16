@@ -1,4 +1,5 @@
 from modules.util.dpo_pattern_util import match_chosen, validate_dpo_patterns
+from modules.util.rlhf_util import is_validation_pair, preference_pair_key
 
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
@@ -60,9 +61,21 @@ class FilterDPOChosenPaths(
             kept_per_dpo_concept.setdefault(concept_path, 0)
             image_path = self._get_previous_item(variation, self.path_in_name, index)
 
-            if match_chosen(chosen_pattern, concept_path, image_path) is not None:
-                self._kept.append(index)
+            stem = match_chosen(chosen_pattern, concept_path, image_path)
+            if stem is not None:
+                # Validate that the pattern matches before applying the split;
+                # a small concept can legitimately have no held-out rows.
                 kept_per_dpo_concept[concept_path] += 1
+                split = concept.get("_dpo_split", "")
+                if split:
+                    held_out = is_validation_pair(
+                        preference_pair_key(concept_path, stem),
+                        concept["_dpo_validation_percentage"],
+                        concept["_dpo_validation_seed"],
+                    )
+                    if held_out != (split == "validation"):
+                        continue
+                self._kept.append(index)
                 dpo_count += 1
 
         empty = [path for path, count in kept_per_dpo_concept.items() if count == 0]
@@ -82,3 +95,4 @@ class FilterDPOChosenPaths(
             self.path_in_name: self._get_previous_item(variation, self.path_in_name, previous_index),
             self.concept_in_name: self._get_previous_item(variation, self.concept_in_name, previous_index),
         }
+

@@ -78,6 +78,8 @@ class BaseFlux2Setup(
     ) -> dict:
         with model.autocast_context:
             batch_seed = 0 if deterministic else train_progress.global_step * multi.world_size() + multi.rank()
+            if self._dpo_validation_seed is not None:
+                batch_seed = self._dpo_validation_seed
             generator = torch.Generator(device=config.train_device)
             generator.manual_seed(batch_seed)
             rand = Random(batch_seed)
@@ -178,22 +180,15 @@ class BaseFlux2Setup(
             data: dict,
             config: TrainConfig,
     ) -> Tensor:
-        # Flux2 / Flux Klein native DPO likelihood proxy.
-        #
-        # Normal Flux2 training uses _flow_matching_losses(...).mean().
-        # DPO needs the same native loss path before the batch mean, so the
-        # preference objective uses one negative per-sample loss as its logp
-        # proxy instead of BaseModelSetup's raw-MSE fallback.
-        #
-        # This keeps DPO in Flux2's own units: configured MSE/MAE/log-cosh/
-        # Huber stack, mask handling, loss_scaler, per-sample loss_weight, and
-        # sigma/timestep weighting all match normal Flux2 training.
+        # FP32 native error proxy with configured masks and timestep weighting.
+        # Concept weights and batch/GA scaling belong outside the objective.
         return -self._flow_matching_losses(
             batch=batch,
             data=data,
             config=config,
             train_device=self.train_device,
             sigmas=model.noise_scheduler.sigmas,
+            apply_sample_scaling=False,
         )
 
     def calculate_loss(
@@ -216,3 +211,4 @@ class BaseFlux2Setup(
         model.text_encoder_to(self.train_device)
         model.eval()
         torch_gc()
+

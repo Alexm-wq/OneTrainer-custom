@@ -26,11 +26,30 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
             with open(config.concept_file_name, 'r') as f:
                 concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
 
-        # choose all validation concepts, or none of them, depending on is_validation
-        concepts = [concept for concept in concepts if (ConceptType(concept.type) == ConceptType.VALIDATION) == is_validation]
-
-        # convert before passing to MGDS
-        concepts = [c.to_dict() for c in concepts]
+        # Select the split before augmentation, resolution expansion and caching.
+        selected = []
+        holdout = config.rlhf_enabled and config.rlhf_dpo_validation and config.rlhf_dpo_validation_percentage > 0
+        for concept in concepts:
+            explicit_validation = ConceptType(concept.type) == ConceptType.VALIDATION
+            paired = bool(concept.dpo_chosen_pattern and concept.dpo_rejected_pattern)
+            auto_split = holdout and paired and not explicit_validation
+            if explicit_validation != is_validation and not (is_validation and auto_split):
+                continue
+            item = concept.to_dict()
+            item["_dpo_split"] = ("validation" if is_validation else "train") if auto_split else ""
+            item["_dpo_validation_percentage"] = config.rlhf_dpo_validation_percentage if auto_split else 0.0
+            item["_dpo_validation_seed"] = config.rlhf_dpo_validation_seed if auto_split else 0
+            if is_validation and config.rlhf_enabled:
+                item["image_variations"] = item["text_variations"] = 1
+                item["balancing"] = 1.0
+                item["balancing_strategy"] = "REPEATS"
+                for key in item["image"]:
+                    if key == "enable_crop_jitter" or key.startswith("enable_random_"):
+                        item["image"][key] = False
+                for key in ("enable_tag_shuffling", "tag_dropout_enable", "caps_randomize_enable"):
+                    item["text"][key] = False
+            selected.append(item)
+        concepts = selected
 
         settings = {
             "target_resolution": config.resolution,
@@ -50,3 +69,4 @@ class DataLoaderMgdsMixin(metaclass=ABCMeta):
         )
 
         return ds
+

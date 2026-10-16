@@ -384,8 +384,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
         text_cache_dir = os.path.join(config.cache_dir, "text")
 
         if config.rlhf_enabled:
-            image_cache_dir = os.path.join(config.cache_dir, "image-rlhf-mixed-working")
-            text_cache_dir = os.path.join(config.cache_dir, "text-rlhf-mixed-working")
+            image_cache_dir = os.path.join(config.cache_dir, "image-rlhf-mixed-v2")
+            text_cache_dir = os.path.join(config.cache_dir, "text-rlhf-mixed-v2")
 
         if before_cache_image_fun is None:
             def prepare_vae():
@@ -426,13 +426,14 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             variations_group_in_name=[
                 'concept.path', 'concept.seed', 'concept.include_subdirectories',
                 'concept.image', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern',
+                'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed',
             ],
             group_enabled_in_name='concept.enabled',
             before_cache_fun=before_cache_image_fun,
         )
 
         text_disk_cache = DiskCache(cache_dir=text_cache_dir, split_names=text_split_names, aggregate_names=[], variations_in_name='concept.text_variations', balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
+                                    variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed'], group_enabled_in_name='concept.enabled', before_cache_fun=before_cache_text_fun)
 
         modules = []
 
@@ -448,7 +449,7 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
 
         if len(sort_names) > 0:
             variation_sorting = VariationSorting(names=sort_names, balancing_in_name='concept.balancing', balancing_strategy_in_name='concept.balancing_strategy',
-                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern'], group_enabled_in_name='concept.enabled')
+                                                 variations_group_in_name=['concept.path', 'concept.seed', 'concept.include_subdirectories', 'concept.text', 'concept.dpo_chosen_pattern', 'concept.dpo_rejected_pattern', 'concept._dpo_split', 'concept._dpo_validation_percentage', 'concept._dpo_validation_seed'], group_enabled_in_name='concept.enabled')
 
             modules.append(variation_sorting)
 
@@ -529,3 +530,4 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
     @abstractmethod
     def _debug_modules(self, config: TrainConfig, model: BaseModel):
         pass
+

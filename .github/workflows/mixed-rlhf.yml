@@ -1,0 +1,64 @@
+name: Mixed RLHF regression tests
+
+on:
+  push:
+    branches: [main, codex/mixed-rlhf-fixes]
+    paths:
+      - "modules/modelSetup/**"
+      - "modules/trainer/GenericTrainer.py"
+      - "modules/dataLoader/**"
+      - "modules/util/config/TrainConfig.py"
+      - "modules/util/rlhf_util.py"
+      - "modules/util/dpo_beta_controller.py"
+      - "modules/ui/BaseRLHFTabView.py"
+      - "training_presets/Krea 2/**"
+      - "tests/test_mixed_rlhf.py"
+      - ".github/workflows/mixed-rlhf.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  cpu-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install . pre-commit
+      - name: Check changed Python syntax
+        run: python -m compileall -q modules tests
+      - name: Normalize and lint changed files
+        run: |
+          files=(modules/modelSetup/{BaseModelSetup,BaseKrea2Setup,BaseFluxSetup,BaseFlux2Setup}.py modules/modelSetup/mixin/ModelSetupDiffusionLossMixin.py modules/trainer/GenericTrainer.py modules/dataLoader/{BaseDataLoader,dpo/DeriveDPORejectedPath,dpo/FilterDPOChosenPaths,mixin/DataLoaderMgdsMixin,mixin/DataLoaderText2ImageMixin}.py modules/util/{config/TrainConfig,dpo_beta_controller,rlhf_util}.py modules/ui/BaseRLHFTabView.py tests/test_mixed_rlhf.py docs/MixedRLHF.md .github/workflows/mixed-rlhf.yml)
+          pre-commit run --files "${files[@]}" || pre-commit run --files "${files[@]}"
+          if ! git diff --quiet; then
+            if [ "$GITHUB_REF" != "refs/heads/codex/mixed-rlhf-fixes" ]; then
+              git diff --exit-code
+            fi
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- "${files[@]}"
+            git commit -m "Normalize mixed RLHF changes"
+            git push origin HEAD:codex/mixed-rlhf-fixes
+          fi
+      - name: Test mixed RLHF and existing Krea/cache integration
+        run: |
+          python -m unittest discover -s tests -p test_mixed_rlhf.py -v
+          python -m unittest discover -s tests -p test_multi_resolution_cache.py -v
+          python -m unittest discover -s tests -p test_krea2_multires_integration.py -v
+          python -m unittest discover -s tests -p test_krea2_checkpoint.py -v
+      - name: Record tested commit
+        if: always()
+        run: git rev-parse HEAD

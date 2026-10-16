@@ -311,6 +311,8 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             config: TrainConfig,
             train_device: torch.device,
             sigmas: Tensor | None = None,
+            *,
+            apply_sample_scaling: bool = True,
     ) -> Tensor:
         loss_weight = batch['loss_weight']
         if self.__sigmas is None and sigmas is not None:
@@ -326,9 +328,11 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
             else:
                 losses = self.__unmasked_losses(batch, data, config)
 
-        # Scale Losses by Batch and/or GA (if enabled)
-        losses = losses * config.loss_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)
-        losses *= loss_weight
+        # Preference scores stay in native error units. Sample weights and
+        # optimization scaling are applied to the completed preference loss.
+        if apply_sample_scaling:
+            losses = losses * config.loss_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)
+            losses *= loss_weight
 
         # Apply timestep based loss weighting.
         if 'timestep' in data:
@@ -341,3 +345,4 @@ class ModelSetupDiffusionLossMixin(metaclass=ABCMeta):
                     raise NotImplementedError(f"Loss weight function {config.loss_weight_fn} not implemented for flow matching models")
 
         return losses
+
