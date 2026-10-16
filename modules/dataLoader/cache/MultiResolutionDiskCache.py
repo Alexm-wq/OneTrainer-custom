@@ -2,22 +2,25 @@
 from __future__ import annotations
 
 import concurrent.futures
-from contextlib import suppress
 import hashlib
 import json
 import math
 import os
 import random
 import shutil
-from typing import Any, Callable
+from collections.abc import Callable
+from contextlib import suppress
+from typing import Any
 
-import torch
-from tqdm import tqdm
+from modules.dataLoader.cache.crypto import CACHE_PURPOSE, is_encrypted_file, secure_torch_load, secure_torch_save
+from modules.dataLoader.cache.MultiResolutionVariation import encode_multi_resolution_variation
 
 from mgds.PipelineModule import PipelineModule
-from modules.dataLoader.cache.crypto import CACHE_PURPOSE, is_encrypted_file, secure_torch_load, secure_torch_save
 from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import SingleVariationRandomAccessPipelineModule
-from modules.dataLoader.cache.MultiResolutionVariation import encode_multi_resolution_variation
+
+import torch
+
+from tqdm import tqdm
 
 
 class MultiResolutionDiskCache(PipelineModule, SingleVariationRandomAccessPipelineModule):

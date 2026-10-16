@@ -10,10 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
-
 
 MAGIC = b"OTENC001"
 LEGACY_MAGIC = b"OTENCV1\x00"

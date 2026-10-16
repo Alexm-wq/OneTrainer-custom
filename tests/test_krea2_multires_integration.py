@@ -6,8 +6,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from modules.dataLoader.Krea2BaseDataLoader import Krea2BaseDataLoader
 from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
+from modules.dataLoader.Krea2BaseDataLoader import Krea2BaseDataLoader
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod

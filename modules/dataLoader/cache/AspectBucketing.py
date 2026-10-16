@@ -3,11 +3,12 @@ import itertools
 import math
 from typing import Any
 
-import numpy as np
+from modules.dataLoader.cache.MultiResolutionVariation import decode_multi_resolution_variation
 
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
-from modules.dataLoader.cache.MultiResolutionVariation import decode_multi_resolution_variation
+
+import numpy as np
 
 
 class AspectBucketing(

@@ -7,6 +7,10 @@ import modules.util.multi_gpu_util as multi
 from modules.dataLoader.cache.AspectBucketing import AspectBucketing
 from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
 from modules.dataLoader.cache.SingleAspectCalculation import SingleAspectCalculation
+from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
+from modules.dataLoader.dpo.EncodeDPORejectedOrDummyLatent import EncodeDPORejectedOrDummyLatent
+from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
+from modules.dataLoader.dpo.LoadDPORejectedImageOrDummy import LoadDPORejectedImageOrDummy
 from modules.model.BaseModel import BaseModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.mixin.ModelSetupText2ImageMixin import ModelSetupText2ImageMixin
@@ -54,10 +58,6 @@ from mgds.pipelineModules.VariationSorting import VariationSorting
 import torch
 
 from diffusers import AutoencoderKL
-from modules.dataLoader.dpo.DeriveDPORejectedPath import DeriveDPORejectedPath
-from modules.dataLoader.dpo.FilterDPOChosenPaths import FilterDPOChosenPaths
-from modules.dataLoader.dpo.LoadDPORejectedImageOrDummy import LoadDPORejectedImageOrDummy
-from modules.dataLoader.dpo.EncodeDPORejectedOrDummyLatent import EncodeDPORejectedOrDummyLatent
 
 
 class DataLoaderText2ImageMixin(metaclass=ABCMeta):

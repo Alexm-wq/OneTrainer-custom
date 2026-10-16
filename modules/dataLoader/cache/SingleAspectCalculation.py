@@ -1,9 +1,10 @@
 # Ported from OneTrainer-custom preview 7e1899241d; imports adapted for main.
 from typing import Any
 
+from modules.dataLoader.cache.MultiResolutionVariation import decode_multi_resolution_variation
+
 from mgds.PipelineModule import PipelineModule
 from mgds.pipelineModuleTypes.RandomAccessPipelineModule import RandomAccessPipelineModule
-from modules.dataLoader.cache.MultiResolutionVariation import decode_multi_resolution_variation
 
 
 class SingleAspectCalculation(
