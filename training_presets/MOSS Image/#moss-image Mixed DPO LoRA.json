@@ -31,7 +31,7 @@
     "layer_filter": "layers.",
     "layer_filter_preset": "attn-mlp",
     "quantization": {
-        "layer_filter": "attn,ff",
+        "layer_filter": "layers.",
         "layer_filter_preset": "attn-mlp"
     },
     "__version": 12,

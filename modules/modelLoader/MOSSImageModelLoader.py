@@ -12,9 +12,8 @@ from modules.util.enum.ModelType import ModelType
 import torch
 
 from diffusers import AutoencoderKLFlux2
-from transformers import Qwen2Tokenizer, Qwen3_5Model
-
 from safetensors.torch import load_file
+from transformers import Qwen2Tokenizer, Qwen3_5Model
 
 
 class MOSSImageModelLoader(HFModelLoaderMixin):
@@ -38,6 +37,9 @@ class MOSSImageModelLoader(HFModelLoaderMixin):
                 override or base, subfolder=None if override else "transformer",
                 torch_dtype=weight_dtypes.transformer.torch_dtype(),
             )
+        # Accelerate's direct tensor placement can bypass the upstream RoPE load
+        # hook. Rebuild the derived frequencies in fp32 immediately after loading.
+        transformer.rope.float()
         model.transformer = transformer
         model.tokenizer = Qwen2Tokenizer.from_pretrained(base, subfolder="tokenizer")
         model.text_encoder = Qwen3_5Model.from_pretrained(
