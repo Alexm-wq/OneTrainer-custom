@@ -48,7 +48,7 @@ jobs:
           CONDA_OVERRIDE_CUDA: "13.0"
         run: |
           pixi lock
-          pixi install --locked -e cuda13 --only fla-core
+          pixi install --locked -vv -e cuda13 --only fla-core
       - name: Save generated lock and formatting on the work branch
         run: |
           if ! git diff --quiet; then
