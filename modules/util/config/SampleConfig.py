@@ -72,6 +72,11 @@ def _get_model_defaults(model_type) -> dict:
                 "aberrations and artifacts. The image is overly saturated with excessive bloom."
             ),
         })
+    elif model_type.is_flux_3():
+        defaults.update({
+            "width": 1024, "height": 1024, "diffusion_steps": 50,
+            "cfg_scale": 4.0, "noise_scheduler": NoiseScheduler.EULER,
+        })
     elif model_type.is_flux_2():
         defaults.update({
             "width": 1024,
@@ -189,6 +194,7 @@ class SampleConfig(BaseConfig):
     force_last_timestep: bool
 
     moss_uncond_skip_layers: str
+    flux3_timestep_shift: float
 
     sample_inpainting: bool
     base_image_path: str
@@ -235,6 +241,7 @@ class SampleConfig(BaseConfig):
         data.append(("force_last_timestep", False, bool, False))
 
         data.append(("moss_uncond_skip_layers", "22", str, False))
+        data.append(("flux3_timestep_shift", 16.0, float, False))
 
         data.append(("sample_inpainting", False, bool, False))
         data.append(("base_image_path", "", str, False))

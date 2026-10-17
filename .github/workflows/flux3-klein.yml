@@ -1,0 +1,53 @@
+name: FLUX.3 Klein integration
+on:
+  push:
+    branches: [codex/flux3-klein]
+    paths:
+      - ".github/workflows/flux3-klein.yml"
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  focused:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: "1"
+      QT_QPA_PLATFORM: offscreen
+      FLUX3_REFERENCE_DIT: /tmp/flux3-reference-dit.py
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install test dependencies on hosted runner
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libegl1 libopengl0 libxkbcommon0 xvfb xauth
+          python -m pip install --upgrade pip
+          python -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install . ruff==0.15.20 bitsandbytes==0.49.2
+          curl -fLsS https://raw.githubusercontent.com/black-forest-labs/flux-3-image-klein/bfc8889a4497f846416f253a3972a1941ac698b9/src/flux3/dit.py -o "$FLUX3_REFERENCE_DIT"
+      - name: Normalize only FLUX.3 additions
+        run: |
+          files=(modules/model/Flux3Model.py modules/modelLoader/Flux3ModelLoader.py modules/modelSetup/*Flux3*.py modules/modelSampler/Flux3Sampler.py modules/modelSaver/*Flux3*.py modules/modelSaver/flux3/*.py modules/dataLoader/Flux3BaseDataLoader.py modules/dataLoader/flux3/*.py tests/test_flux3*.py)
+          ruff check --fix "${files[@]}"
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- "${files[@]}"
+            git commit -m "Normalize FLUX.3 integration imports [skip ci]"
+            git push origin HEAD:codex/flux3-klein
+          fi
+      - name: Focused FLUX.3 training and reference tests
+        run: |
+          PYTHONPATH=tests:. python -m unittest -v test_flux3 test_flux3_reference
+      - name: Both FLUX.3 training UIs
+        run: |
+          PYTHONPATH=tests:. xvfb-run -a python -m unittest -v test_flux3_ui
+      - name: Tested commit
+        run: git rev-parse HEAD

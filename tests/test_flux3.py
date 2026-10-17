@@ -1,0 +1,336 @@
+"""Focused FLUX.3 integration tests with tiny random weights; no model downloads."""
+import copy
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import nullcontext
+from pathlib import Path
+from random import Random
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from modules.dataLoader.Flux3BaseDataLoader import Flux3BaseDataLoader
+from modules.model.Flux3Model import Flux3Model
+from modules.modelLoader.Flux3ModelLoader import Flux3LoRALoader, Flux3ModelLoader
+from modules.modelSampler.Flux3Sampler import Flux3Sampler, sampling_sigmas
+from modules.modelSaver.flux3.Flux3LoRASaver import Flux3LoRASaver
+from modules.modelSaver.flux3.Flux3ModelSaver import Flux3ModelSaver
+from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.trainer.GenericTrainer import GenericTrainer
+from modules.util.enum.DPORefMode import DPORefMode
+from modules.util import create
+from modules.util.config.SampleConfig import SampleConfig
+from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
+from modules.util.convert_util import convert
+from modules.util.enum.ConceptType import ConceptType
+from modules.util.enum.DataType import DataType
+from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import ModelType, PeftType
+from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.ModelNames import ModelNames
+from modules.util.ModelWeightDtypes import ModelWeightDtypes
+from modules.util.optimizer.muon_util import build_muon_adam_key_fn
+from modules.util.quantization_util import replace_linear_with_quantized_layers
+from modules.util.TrainProgress import TrainProgress
+
+import torch
+from torch import nn
+
+from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux3Transformer2DModel
+from diffusers.loaders.single_file_utils import convert_flux3_transformer_checkpoint_to_diffusers
+from transformers import (
+    Qwen2Tokenizer,
+    Qwen2VLImageProcessor,
+    Qwen3VLConfig,
+    Qwen3VLModel,
+    Qwen3VLProcessor,
+    Qwen3VLVideoProcessor,
+)
+
+from safetensors.torch import load_file, save_file
+
+
+def tiny_transformer(flow_map=False):
+    return Flux3Transformer2DModel(
+        in_channels=8, cond_in_channels=8, num_layers=1, num_single_layers=2,
+        num_attention_heads=2, attention_head_dim=8, joint_attention_dim=64,
+        timestep_channels=256, axes_dims_rope=(2, 2, 2, 2), flow_map=flow_map,
+    )
+
+
+class FakeEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embedding = nn.Embedding(32, 8)
+        self.calls = []
+
+    @property
+    def device(self):
+        return self.embedding.weight.device
+
+    def forward(self, input_ids, attention_mask, position_ids, **kwargs):
+        self.calls.append((input_ids.clone(), attention_mask.clone(), position_ids.clone()))
+        hidden = self.embedding(input_ids) + position_ids[0, :, :, None]
+        return SimpleNamespace(hidden_states=tuple(hidden + i for i in range(33)))
+
+
+class TinyVAE(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bn = nn.BatchNorm2d(8, affine=False)
+        self.anchor = nn.Parameter(torch.ones(1))
+        self.config = SimpleNamespace(batch_norm_eps=1e-4)
+        self.decoded = None
+
+    def decode(self, latent, return_dict=False):
+        self.decoded = latent.clone()
+        rgb = torch.cat((latent, latent[:, :1]), dim=1)
+        return (torch.nn.functional.interpolate(rgb, scale_factor=8).tanh(),)
+
+
+def tiny_model():
+    model = Flux3Model(ModelType.FLUX_3_KLEIN)
+    model.transformer = tiny_transformer()
+    model.text_encoder = FakeEncoder()
+    model.vae = TinyVAE().eval()
+    model.noise_scheduler = FlowMatchEulerDiscreteScheduler(shift=1)
+    return model
+
+
+def train_config():
+    config = TrainConfig.default_values()
+    config.model_type = ModelType.FLUX_3_KLEIN
+    config.training_method = TrainingMethod.LORA
+    config.train_device = config.temp_device = "cpu"
+    config.train_dtype = config.lora_weight_dtype = config.fallback_train_dtype = DataType.FLOAT_32
+    config.text_encoder.train = False
+    config.text_encoder.dropout_probability = 0
+    config.text_encoder.offload_fraction = config.transformer.offload_fraction = 0
+    config.text_encoder.activation_offloading = config.transformer.activation_offloading = False
+    config.transformer.gradient_checkpointing = True
+    config.compile = False
+    config.layer_filter = "mode_blocks.image.,txt_mode_blocks.,single_transformer_blocks."
+    config.lora_rank = config.lora_alpha = 2
+    config.text_encoder_sequence_length = 96
+    return config
+
+
+class Flux3Test(unittest.TestCase):
+    def setUp(self):
+        torch.manual_seed(17)
+        torch.set_num_threads(1)
+        self.model, self.config = tiny_model(), train_config()
+        self.setup = create.create_model_setup(
+            ModelType.FLUX_3_KLEIN, torch.device("cpu"), torch.device("cpu"), TrainingMethod.LORA,
+        )
+
+    def batch(self):
+        return {
+            "latent_image": torch.randn(2, 2, 4, 4),
+            "latent_image_rejected": torch.randn(2, 2, 4, 4),
+            "tokens": torch.ones(2, 96, dtype=torch.long),
+            "tokens_mask": torch.arange(96)[None] < torch.tensor([[5], [81]]),
+            "text_encoder_hidden_state": torch.randn(2, 96, 64),
+            "loss_weight": torch.ones(2),
+            "concept_type": [ConceptType.STANDARD] * 2,
+            "dpo_is_paired": torch.tensor([False, True]),
+            "dpo_pair_key": ["", "flux3/pair"],
+        }
+
+    def attach_lora(self):
+        self.model.transformer.requires_grad_(False)
+        self.model.transformer_lora = LoRAModuleWrapper(
+            self.model.transformer, "transformer", self.config, self.config.layer_filter.split(","),
+        )
+        self.model.transformer_lora.hook_to_module()
+        return list(self.model.transformer_lora.parameters())
+
+    def test_text_layers_padding_positions_cache_and_dropout(self):
+        batch = self.batch()
+        live, mask = self.model.encode_text("cpu", tokens=batch["tokens"], tokens_mask=batch["tokens_mask"])
+        self.assertEqual([x[0].shape[-1] for x in self.model.text_encoder.calls], [80, 96])
+        self.assertEqual(live.shape, (2, 96, 64))
+        self.assertTrue((live[0, 80:] == 0).all())
+        self.assertFalse((live[0, 5:80] == 0).all())
+        for ids, valid, positions in self.model.text_encoder.calls:
+            self.assertEqual(positions.shape, (4, 1, ids.shape[1]))
+            self.assertTrue((positions[:, ~valid] == 1).all())
+        torch.testing.assert_close(live[0, 0, 8:16] - live[0, 0, :8], torch.full((8,), 4.0))
+        cached, cached_mask = self.model.encode_text("cpu", tokens_mask=mask, text_encoder_output=live)
+        torch.testing.assert_close(live, cached)
+        torch.testing.assert_close(mask, cached_mask)
+        before = live.clone()
+        self.model.empty_text[96] = (live[:1].clone(), mask[:1].clone())
+        dropped, dm = self.model.encode_text(
+            "cpu", tokens_mask=mask, text_encoder_output=live,
+            text_encoder_dropout_probability=1, rand=Random(42),
+        )
+        torch.testing.assert_close(dropped[1], live[0])
+        torch.testing.assert_close(dm[1], mask[0])
+        torch.testing.assert_close(live, before)
+
+    def test_variable_window_forward_and_gradients_match_individual_calls(self):
+        batch = self.batch()
+        x, t = torch.randn(2, 8, 2, 2), torch.tensor([.2, .7])
+        text, mask = batch["text_encoder_hidden_state"], batch["tokens_mask"]
+        actual = self.model.predict_velocity(x, t, text, mask)
+        expected = torch.cat([
+            self.model.unpack_latents(self.model.transformer(
+                hidden_states=self.model.pack_latents(x[i:i+1]),
+                encoder_hidden_states=text[i:i+1, :length], timestep=t[i:i+1],
+                img_ids=self.model.image_ids(2, 2, "cpu"), txt_ids=self.model.text_ids(length, "cpu"),
+            ).sample, 2, 2) for i, length in enumerate((80, 96))
+        ])
+        torch.testing.assert_close(actual, expected)
+        params = tuple(self.model.transformer.parameters())
+        ga = torch.autograd.grad(actual.square().mean(), params, allow_unused=True)
+        ge = torch.autograd.grad(expected.square().mean(), params, allow_unused=True)
+        for a, e in zip(ga, ge, strict=True):
+            if a is not None:
+                torch.testing.assert_close(a, e)
+        self.assertTrue(any(a is not None for a in ga))
+
+    def test_training_sigma_targets_masked_loss_and_paired_rng(self):
+        self.setup.setup_optimizations(self.model, self.config)
+        params = self.attach_lora()
+        batch = self.batch()
+        self.config.masked_training = True
+        batch["latent_mask"] = torch.ones(2, 1, 4, 4)
+        with patch.object(self.model, "predict_velocity", wraps=self.model.predict_velocity) as forward:
+            result = self.setup.predict(self.model, batch, self.config, TrainProgress())
+        torch.testing.assert_close(forward.call_args.args[1], (result["timestep"].float()+1)/1000)
+        loss = self.setup.calculate_loss(self.model, batch, result, self.config)
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in params))
+        self.setup._dpo_paired_half = 1
+        batch["latent_image"][1] = batch["latent_image"][0]
+        paired = self.setup.predict(self.model, batch, self.config, TrainProgress())
+        torch.testing.assert_close(paired["target"][0], paired["target"][1])
+        self.assertEqual(paired["timestep"][0], paired["timestep"][1])
+        score = self.setup.rlhf_logp_per_sample(self.model, batch, paired, self.config)
+        self.assertEqual(score.shape, (2,))
+
+    def test_quantized_peft_backward_and_attention_filter(self):
+        for dtype, peft in (
+            (DataType.INT_8, PeftType.LORA), (DataType.NFLOAT_4, PeftType.LORA),
+            (DataType.FLOAT_8, PeftType.LORA), (DataType.INT_W8A8, PeftType.LORA),
+            (DataType.FLOAT_W8A8, PeftType.LORA), (DataType.INT_8, PeftType.LOHA),
+            (DataType.INT_8, PeftType.LOKR), (DataType.INT_8, PeftType.OFT_2),
+        ):
+            with self.subTest(dtype=dtype, peft=peft):
+                self.setUp()
+                self.config.peft_type, self.config.oft_block_size = peft, 8
+                replace_linear_with_quantized_layers(self.model.transformer, dtype, copy_parameters=True)
+                self.setup.setup_optimizations(self.model, self.config)
+                params = self.attach_lora()
+                optimizer = torch.optim.AdamW(params, lr=.001)
+                before = [p.detach().clone() for p in params]
+                out = self.setup.predict(self.model, self.batch(), self.config, TrainProgress())
+                out["predicted"].square().mean().backward()
+                self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in params))
+                optimizer.step()
+                self.assertTrue(any(not torch.equal(p, b) for p, b in zip(params, before, strict=True)))
+
+    def test_compile_executes_forward_and_backward(self):
+        self.config.compile = True
+        original = nn.Module.compile
+        def compile_eager(module, **kwargs):
+            return original(module, backend="eager", **kwargs)
+        with patch.object(nn.Module, "compile", compile_eager):
+            self.setup.setup_optimizations(self.model, self.config)
+        params = self.attach_lora()
+        result = self.setup.predict(self.model, self.batch(), self.config, TrainProgress())
+        result["predicted"].square().mean().backward()
+        self.assertTrue(all(p.grad is not None for p in params))
+
+    def test_mixed_rlhf_three_weights_have_independent_gradients(self):
+        parameters = self.attach_lora()
+        self.setup.setup_optimizations(self.model, self.config)
+        self.config.rlhf_enabled = True
+        self.config.rlhf_dpo_ref_mode = DPORefMode.NEW_ADAPTER
+        self.setup.initialize_dpo_reference(self.model, self.config)
+        batch = self.batch()
+        trainer = object.__new__(GenericTrainer)
+        trainer.model, trainer.model_setup, trainer.config = self.model, self.setup, self.config
+        trainer.train_device = torch.device("cpu")
+        trainer._dpo_metric_sums, trainer._dpo_timestep_sums = {}, {}
+        trainer._dpo_metric_weight = 0.0
+        self.setup._write_dpo_pair_csv_log = Mock()
+        self.setup._write_dpo_bad_pair_csv_log = Mock()
+
+        def gradient(weights):
+            self.config.rlhf_normal_weight, self.config.rlhf_dpo_weight, self.config.rlhf_chosen_weight = weights
+            with self.setup.preference_dropout_disabled(self.model):
+                loss = trainer._GenericTrainer__calculate_mixed_rlhf_training_loss(batch, TrainProgress())
+                grads = torch.autograd.grad(loss, parameters)
+            return loss.detach(), torch.cat([g.flatten() for g in grads])
+
+        parts = [gradient(w) for w in ((1, 0, 0), (0, 1, 0), (0, 0, 1))]
+        value, grad = gradient((2, 3, 4))
+        self.assertTrue(torch.isfinite(grad).all())
+        torch.testing.assert_close(value, sum(w * p[0] for w, p in zip((2, 3, 4), parts, strict=True)))
+        torch.testing.assert_close(grad, sum(w * p[1] for w, p in zip((2, 3, 4), parts, strict=True)), atol=1e-6, rtol=1e-4)
+
+    def test_native_checkpoint_and_lora_formats_roundtrip(self):
+        original = self.model.transformer.state_dict()
+        native = convert(original, self.model.checkpoint_diffusers_to_original())
+        restored = convert_flux3_transformer_checkpoint_to_diffusers(dict(native))
+        self.assertEqual(set(original), set(restored))
+        for key in original:
+            torch.testing.assert_close(original[key], restored[key], atol=0, rtol=0)
+        self.attach_lora()
+        state = self.model.transformer_lora.state_dict()
+        for fmt in ModelType.FLUX_3_KLEIN.supported_lora_formats():
+            with self.subTest(format=fmt), tempfile.TemporaryDirectory() as root:
+                dest = str(Path(root)/"lora.safetensors")
+                Flux3LoRASaver().save(self.model, fmt, dest, torch.float32)
+                restored = Flux3LoRALoader()._to_canonical(self.model, load_file(dest))
+                self.assertEqual(set(state), set(restored))
+                for key in state:
+                    torch.testing.assert_close(state[key].float(), restored[key], atol=0, rtol=0)
+
+    def test_registration_presets_sampling_grid_and_muon_groups(self):
+        from modules.ui.TopBarController import TopBarController
+        self.assertIn(("FLUX.3 Image Klein", ModelType.FLUX_3_KLEIN), TopBarController(self.config).get_model_types())
+        for method in ModelType.FLUX_3_KLEIN.supported_training_methods():
+            self.assertIsNotNone(create.create_model_loader(ModelType.FLUX_3_KLEIN, method))
+            self.assertIsNotNone(create.create_model_saver(ModelType.FLUX_3_KLEIN, method))
+            self.assertIsNotNone(create.get_model_setup_class(ModelType.FLUX_3_KLEIN, method))
+        for path in Path("training_presets/FLUX.3 Klein").glob("*.json"):
+            config = TrainConfig.default_values().from_dict(json.loads(path.read_text()), migrate=False)
+            self.assertEqual(config.model_type, ModelType.FLUX_3_KLEIN)
+            self.assertFalse(config.text_encoder.train)
+            self.assertEqual(config.timestep_shift, 6.93)
+        sample = SampleConfig.default_values(ModelType.FLUX_3_KLEIN)
+        self.assertEqual((sample.diffusion_steps, sample.cfg_scale, sample.flux3_timestep_shift), (50, 4, 16))
+        torch.testing.assert_close(sampling_sigmas(2), torch.tensor([1, 16/17, 0]))
+        groups = build_muon_adam_key_fn(self.model, self.config)
+        self.assertEqual(groups[id(self.model.transformer.mode_blocks["image"][0].attn.to_q.weight)], "muon")
+        self.assertEqual(groups[id(self.model.transformer.context_embedder.weight)], "adam")
+
+    def test_dataloader_mean_vae_and_multires_cache(self):
+        loader = object.__new__(Flux3BaseDataLoader)
+        loader.train_device = torch.device("cpu")
+        self.model.tokenizer = Mock()
+        preparation = loader._preparation_modules(self.config, self.model)
+        encoder = next(m for m in preparation if type(m).__name__ == "EncodeVAE")
+        self.assertEqual(encoder.dtype, torch.float32)
+        self.assertEqual(next(m for m in preparation if type(m).__name__ == "SampleVAEDistribution").mode, "mean")
+        with patch.object(loader, "_cache_modules_from_names", return_value=[]) as cache:
+            loader._cache_modules(self.config, self.model, self.setup)
+        kwargs = cache.call_args.kwargs
+        self.assertIn("text_encoder_hidden_state", kwargs["text_split_names"])
+        self.assertIn("flux3-", kwargs["config"].cache_dir)
+
+    def test_distilled_training_guard(self):
+        self.model.transformer = tiny_transformer(flow_map=True)
+        with self.assertRaisesRegex(ValueError, "flow-map"):
+            self.setup.setup_optimizations(self.model, self.config)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -30,7 +30,7 @@ dependencies = [
     "tensorboard==2.20.0",
 
     # diffusion models
-    "diffusers @ git+https://github.com/huggingface/diffusers.git@1ffa4236a48af8d1d2eaeed6c84027af19acfc39",
+    "diffusers @ git+https://github.com/huggingface/diffusers.git@b800f828f3951c4d206e154411bcbfa693cd322e",
     "gguf==0.17.1",
     "transformers==5.5.4",
     "sentencepiece==0.2.1",  # transitive dependency of transformers for tokenizer loading
