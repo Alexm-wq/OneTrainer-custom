@@ -481,7 +481,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             supports_inpainting: bool=True, #TODO many models probably don't support inpainting, but this has been enabled in most dataloaders before refactoring, too
     ):
         enumerate_input = self._enumerate_input_modules(config, allow_videos=allow_video_files)
-        load_input = self._load_input_modules(config, model.train_dtype, vae_frame_dim=vae_frame_dim)
+        vae_dtype = getattr(model, 'vae_train_dtype', model.train_dtype)
+        vae_context = getattr(model, 'vae_autocast_context', model.autocast_context)
+        load_input = self._load_input_modules(config, vae_dtype, vae_frame_dim=vae_frame_dim)
         mask_augmentation = self._mask_augmentation_modules(config)
         aspect_bucketing_in = self._aspect_bucketing_in(config, aspect_bucketing_quantization, frame_dim_enabled)
         crop_modules = self._crop_modules(config)
@@ -496,8 +498,8 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
                 is_paired_in_name='dpo_is_paired',
                 latent_out_name='latent_image_rejected',
                 vae=model.vae,
-                autocast_contexts=[model.autocast_context],
-                dtype=model.train_dtype.torch_dtype(),
+                autocast_contexts=[vae_context],
+                dtype=vae_dtype.torch_dtype(),
                 dummy_mode='zeros',
             )]
         cache_modules = self._cache_modules(config, model, model_setup)

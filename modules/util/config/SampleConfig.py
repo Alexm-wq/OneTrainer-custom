@@ -101,6 +101,14 @@ def _get_model_defaults(model_type) -> dict:
             "diffusion_steps": 28,
             "cfg_scale": 3.5,
         })
+    elif model_type.is_moss_image():
+        defaults.update({
+            "width": 1024,
+            "height": 1024,
+            "diffusion_steps": 50,
+            "cfg_scale": 3.0,
+            "noise_scheduler": NoiseScheduler.EULER,
+        })
     elif model_type.is_z_image():
         defaults.update({
             "width": 1024,
@@ -180,6 +188,8 @@ class SampleConfig(BaseConfig):
     transformer_attention_mask: bool
     force_last_timestep: bool
 
+    moss_uncond_skip_layers: str
+
     sample_inpainting: bool
     base_image_path: str
     mask_image_path: str
@@ -223,6 +233,8 @@ class SampleConfig(BaseConfig):
         data.append(("text_encoder_4_layer_skip", 0, int, False))
         data.append(("transformer_attention_mask", False, bool, False))
         data.append(("force_last_timestep", False, bool, False))
+
+        data.append(("moss_uncond_skip_layers", "22", str, False))
 
         data.append(("sample_inpainting", False, bool, False))
         data.append(("base_image_path", "", str, False))

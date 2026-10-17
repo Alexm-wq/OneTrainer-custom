@@ -1,0 +1,6 @@
+{
+    "modelspec.sai_model_spec": "1.0.0",
+    "modelspec.architecture": "MOSS-Image",
+    "modelspec.implementation": "https://github.com/OpenMOSS/MOSS-Image",
+    "modelspec.title": "MOSS Image"
+}

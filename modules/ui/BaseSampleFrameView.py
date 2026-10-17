@@ -71,6 +71,13 @@ class BaseSampleFrameView:
             self.components.label(bottom_frame, 4, 0, "steps:")
             self.components.entry(bottom_frame, 4, 1, ui_state, "diffusion_steps")
 
+            if controller.model_type.is_moss_image():
+                self.components.label(
+                    bottom_frame, 5, 0, "negative skip layers:",
+                    tooltip="MOSS main DiT block indices (zero-based). Default: 22. Empty disables skipping.",
+                )
+                self.components.entry(bottom_frame, 5, 1, ui_state, "moss_uncond_skip_layers")
+
             # inpainting
             if is_inpainting_model:
                 self.components.label(bottom_frame, 5, 0, "inpainting:",
