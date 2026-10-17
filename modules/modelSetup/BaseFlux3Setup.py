@@ -4,9 +4,9 @@ import modules.util.multi_gpu_util as multi
 from modules.model.Flux3Model import TRAINING_SHIFT
 from modules.modelSetup.BaseFlux2Setup import BaseFlux2Setup
 from modules.module.flux3_window_attention import enable_flux3_window_attention
-from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.checkpointing_util import enable_checkpointing, enable_checkpointing_for_qwen3vl_encoder_layers
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.DataType import DataType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.quantization_util import quantize_layers
