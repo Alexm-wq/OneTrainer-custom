@@ -1,6 +1,6 @@
 from modules.model.MOSSImageModel import MOSSImageModel
-from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
+from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType

@@ -24,8 +24,8 @@ from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DataType import DataType
 from modules.util.enum.DPORefMode import DPORefMode
-from modules.util.enum.ModelType import ModelType
 from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
