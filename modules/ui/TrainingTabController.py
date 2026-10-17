@@ -1,10 +1,10 @@
-
 from modules.ui.OptimizerParamsWindowController import OptimizerParamsWindowController
 from modules.ui.SchedulerParamsWindowController import SchedulerParamsWindowController
 from modules.ui.TimestepDistributionWindowController import TimestepDistributionWindowController
 from modules.util import create
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
+from modules.util.enum.DataType import DataType
 from modules.util.optimizer_util import change_optimizer
 
 
@@ -17,10 +17,22 @@ class TrainingTabController:
         ui_state.get_var("optimizer").update(optimizer_config)
 
     def get_attention_mechanisms(self) -> list[tuple[str, AttentionMechanism]]:
+        if self.config.model_type.is_moss_image():
+            return [("torch SDPA", AttentionMechanism.SDP)]
         return [
             ("torch SDPA", AttentionMechanism.SDP),
             ("flash-attn", AttentionMechanism.FLASH),
             ("torch cuDNN", AttentionMechanism.CUDNN),
+        ]
+
+    def get_train_dtypes(self) -> list[tuple[str, DataType]]:
+        if self.config.model_type.is_moss_image():
+            return [("float32", DataType.FLOAT_32), ("bfloat16", DataType.BFLOAT_16)]
+        return [
+            ("float32", DataType.FLOAT_32),
+            ("float16", DataType.FLOAT_16),
+            ("bfloat16", DataType.BFLOAT_16),
+            ("tfloat32", DataType.TFLOAT_32),
         ]
 
     def get_layer_presets(self) -> dict:

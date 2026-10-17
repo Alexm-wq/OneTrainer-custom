@@ -6,6 +6,7 @@ on:
     paths:
       - "modules/**"
       - "tests/test_moss_image.py"
+      - "tests/test_moss_training_ui.py"
       - "training_presets/MOSS Image/**"
       - ".github/workflows/moss-image.yml"
   workflow_dispatch:
@@ -35,7 +36,7 @@ jobs:
           python -m pip install . ruff==0.15.20
       - name: Lint integration
         run: |
-          files=('modules/model/MOSSImageModel.py' 'modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/modelSetup/MOSSImageLoRASetup.py' 'modules/modelSetup/MOSSImageFineTuneSetup.py' 'modules/dataLoader/moss/EncodeMOSSImageText.py' 'modules/dataLoader/moss/__init__.py' 'modules/dataLoader/MOSSImageBaseDataLoader.py' 'modules/dataLoader/mixin/DataLoaderText2ImageMixin.py' 'modules/modelSampler/MOSSImageSampler.py' 'modules/modelSaver/MOSSImageLoRAModelSaver.py' 'modules/modelSaver/moss/MOSSImageLoRASaver.py' 'modules/modelSaver/MOSSImageFineTuneModelSaver.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/modelSaver/moss/__init__.py' 'modules/util/enum/ModelType.py' 'modules/ui/TopBarController.py' 'modules/ui/ModelTabController.py' 'modules/util/config/SampleConfig.py' 'modules/ui/BaseSampleFrameView.py' 'tests/test_moss_image.py')
+          files=('modules/model/MOSSImageModel.py' 'modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/modelSetup/MOSSImageLoRASetup.py' 'modules/modelSetup/MOSSImageFineTuneSetup.py' 'modules/dataLoader/moss/EncodeMOSSImageText.py' 'modules/dataLoader/moss/__init__.py' 'modules/dataLoader/MOSSImageBaseDataLoader.py' 'modules/dataLoader/mixin/DataLoaderText2ImageMixin.py' 'modules/modelSampler/MOSSImageSampler.py' 'modules/modelSaver/MOSSImageLoRAModelSaver.py' 'modules/modelSaver/moss/MOSSImageLoRASaver.py' 'modules/modelSaver/MOSSImageFineTuneModelSaver.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/modelSaver/moss/__init__.py' 'modules/util/enum/ModelType.py' 'modules/ui/TopBarController.py' 'modules/ui/ModelTabController.py' 'modules/util/config/SampleConfig.py' 'modules/ui/BaseSampleFrameView.py' 'tests/test_moss_image.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'tests/test_moss_training_ui.py')
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             if [ "$GITHUB_REF" != "refs/heads/codex/moss-image-base" ]; then
@@ -54,5 +55,9 @@ jobs:
           python -m unittest discover -s tests -p test_krea2_multires_integration.py -v
           python -m unittest discover -s tests -p test_krea2_checkpoint.py -v
           python -m unittest discover -s tests -p test_mixed_rlhf.py -v
+      - name: Build both training UIs and verify editable controls
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: xvfb-run -a python -m unittest discover -s tests -p test_moss_training_ui.py -v
       - name: Record tested commit
         run: git rev-parse HEAD

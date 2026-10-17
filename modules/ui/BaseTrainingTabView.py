@@ -54,6 +54,8 @@ class BaseTrainingTabView(ABC):
             self.__setup_anima_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_krea2():
             self.__setup_krea2_ui(column_0, column_1, column_2, controller, ui_state)
+        elif model_type.is_moss_image():
+            self.__setup_moss_image_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_sana():
             self.__setup_sana_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_hunyuan_video():
@@ -194,6 +196,24 @@ class BaseTrainingTabView(ABC):
         self.__create_base2_frame(column_1, 0, controller, ui_state)
         self.__create_transformer_frame(column_1, 1, ui_state, supports_guidance_scale=False, supports_force_attention_mask=False)
         self.__create_noise_frame(column_1, 2, ui_state, supports_dynamic_timestep_shifting=True)
+
+        self.__create_masked_frame(column_2, 1, ui_state)
+        self.__create_loss_frame(column_2, 2, controller, ui_state)
+        self.__create_layer_frame(column_2, 3, controller, ui_state)
+
+    def __setup_moss_image_ui(self, column_0, column_1, column_2, controller, ui_state):
+        self.__create_base_frame(column_0, 0, controller, ui_state)
+        self.__create_text_encoder_frame(
+            column_0, 1, ui_state, supports_clip_skip=False, supports_training=False,
+            supports_sequence_length=True, supports_layer_offloading=False,
+        )
+
+        self.__create_base2_frame(column_1, 0, controller, ui_state)
+        self.__create_transformer_frame(
+            column_1, 1, ui_state, supports_force_attention_mask=False,
+            supports_layer_offloading=False, supports_activation_offloading=False,
+        )
+        self.__create_noise_frame(column_1, 2, ui_state)
 
         self.__create_masked_frame(column_2, 1, ui_state)
         self.__create_loss_frame(column_2, 2, controller, ui_state)
@@ -399,12 +419,7 @@ class BaseTrainingTabView(ABC):
         # train dtype
         self.components.label(frame, row, 0, "Train Data Type",
                               tooltip="The mixed precision data type used for training. This can increase training speed, but reduces precision")
-        self.components.options_kv(frame, row, 1, [
-            ("float32", DataType.FLOAT_32),
-            ("float16", DataType.FLOAT_16),
-            ("bfloat16", DataType.BFLOAT_16),
-            ("tfloat32", DataType.TFLOAT_32),
-        ], ui_state, "train_dtype")
+        self.components.options_kv(frame, row, 1, controller.get_train_dtypes(), ui_state, "train_dtype")
         row += 1
 
         # fallback train dtype
@@ -659,7 +674,9 @@ class BaseTrainingTabView(ABC):
         row += 1
 
     def __create_transformer_frame(self, master, row, ui_state, supports_guidance_scale: bool = False,
-                                   supports_force_attention_mask: bool = True):
+                                   supports_force_attention_mask: bool = True,
+                                   supports_layer_offloading: bool = True,
+                                   supports_activation_offloading: bool = True):
         frame = self.components.section_frame(master, row)
         row = 0
 
@@ -669,7 +686,11 @@ class BaseTrainingTabView(ABC):
         self.components.switch(frame, row, 1, ui_state, "transformer.train")
         row += 1
 
-        row = self.__create_offloading_widgets(frame, row, ui_state, "transformer", supports_activation_offloading=True)
+        row = self.__create_offloading_widgets(
+            frame, row, ui_state, "transformer",
+            supports_layer_offloading=supports_layer_offloading,
+            supports_activation_offloading=supports_activation_offloading,
+        )
 
         # train transformer epochs
         self.components.label(frame, row, 0, "Stop Training After",
