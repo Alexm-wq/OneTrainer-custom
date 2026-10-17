@@ -279,7 +279,7 @@ def enable_checkpointing(
         else:
             t = type_or_list
             for child_module in model.modules():
-                if isinstance(child_module, nn.ModuleList) and isinstance(child_module[0], t):
+                if isinstance(child_module, nn.ModuleList) and len(child_module) and isinstance(child_module[0], t):
                     module_list = child_module
                     assert all(isinstance(m, t) for m in child_module)
                     layer_index = _create_checkpoints_for_module_list(

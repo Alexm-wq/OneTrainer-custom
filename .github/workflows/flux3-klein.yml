@@ -34,7 +34,7 @@ jobs:
           curl -fLsS https://raw.githubusercontent.com/black-forest-labs/flux-3-image-klein/bfc8889a4497f846416f253a3972a1941ac698b9/src/flux3/dit.py -o "$FLUX3_REFERENCE_DIT"
       - name: Normalize only FLUX.3 additions
         run: |
-          files=(modules/model/Flux3Model.py modules/modelLoader/Flux3ModelLoader.py modules/modelSetup/*Flux3*.py modules/modelSampler/Flux3Sampler.py modules/modelSaver/*Flux3*.py modules/modelSaver/flux3/*.py modules/dataLoader/Flux3BaseDataLoader.py modules/dataLoader/flux3/*.py tests/test_flux3*.py)
+          files=(modules/module/flux3_window_attention.py modules/model/Flux3Model.py modules/modelLoader/Flux3ModelLoader.py modules/modelSetup/*Flux3*.py modules/modelSampler/Flux3Sampler.py modules/modelSaver/*Flux3*.py modules/modelSaver/flux3/*.py modules/dataLoader/Flux3BaseDataLoader.py modules/dataLoader/flux3/*.py tests/test_flux3*.py)
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             git config user.name "github-actions[bot]"
@@ -52,4 +52,4 @@ jobs:
       - name: Tested commit
         run: git rev-parse HEAD
 
-# Focused integration validation with compatible Hub dependency; no model weights.
+# Validate window masking, encoder quantization, and native reference parity.

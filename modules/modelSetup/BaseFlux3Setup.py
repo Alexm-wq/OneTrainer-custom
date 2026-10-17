@@ -3,6 +3,8 @@ from random import Random
 import modules.util.multi_gpu_util as multi
 from modules.model.Flux3Model import TRAINING_SHIFT
 from modules.modelSetup.BaseFlux2Setup import BaseFlux2Setup
+from modules.module.flux3_window_attention import enable_flux3_window_attention
+from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.checkpointing_util import enable_checkpointing, enable_checkpointing_for_qwen3vl_encoder_layers
 from modules.util.dtype_util import create_autocast_context, disable_fp16_autocast_context
 from modules.util.enum.DataType import DataType
@@ -32,6 +34,15 @@ class BaseFlux3Setup(BaseFlux2Setup):
             raise ValueError("Choose a floating-point training dtype; quantization applies to model weights.")
         if config.training_method == TrainingMethod.FINE_TUNE and config.transformer.weight_dtype.is_quantized():
             raise ValueError("Quantized FLUX.3 base weights require LoRA/PEFT training. Use floating weights for full fine-tuning.")
+        if config.rlhf_enabled and (
+            config.optimizer.fused_back_pass
+            or (config.multi_gpu and config.fused_gradient_reduce)
+        ):
+            raise ValueError(
+                "Disable Fused Back Pass and Fused Gradient Reduce for mixed FLUX.3 RLHF: "
+                "normal and preference forwards share parameters and must finish accumulating before updates."
+            )
+        enable_flux3_window_attention(model.transformer)
         model.transformer_offload_conductor = enable_checkpointing(
             model.transformer, config, config.transformer, config.compile,
             [(model.transformer.txt_mode_blocks, ["hidden_states"]),
@@ -57,7 +68,10 @@ class BaseFlux3Setup(BaseFlux2Setup):
         model.vae_autocast_context = torch.autocast(self.train_device.type, enabled=False)
         quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)
         quantize_layers(model.transformer, self.train_device, model.train_dtype, config)
-        self._set_attention_backend(model.transformer, config.attention_mechanism, mask=False)
+        if config.attention_mechanism == AttentionMechanism.FLASH:
+            model.transformer.set_attention_backend("flash_varlen")
+        else:
+            self._set_attention_backend(model.transformer, config.attention_mechanism, mask=True)
 
     def prepare_text_caching(self, model, config):
         super().prepare_text_caching(model, config)

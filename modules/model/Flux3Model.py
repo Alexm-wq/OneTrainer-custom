@@ -2,6 +2,7 @@ from random import Random
 from types import SimpleNamespace
 
 from modules.model.Flux2Model import Flux2Model
+from modules.module.flux3_window_attention import enable_flux3_window_attention
 from modules.util.convert_util import chunk_swap
 from modules.util.enum.DataType import DataType
 
@@ -155,42 +156,38 @@ class Flux3Model(Flux2Model):
         return ids
 
     def predict_velocity(self, latents, timestep, hidden, mask, *, target_timestep=None, reference=None):
-        """Keep each prompt's trained window, including pads, for heterogeneous batches."""
-        outputs = []
+        """Preserve trained padding while batching different prompt windows."""
+        enable_flux3_window_attention(self.transformer)
         packed = self.pack_latents(latents)
+        lengths = self.window_lengths(mask)
+        length = int(lengths.max())
+        visible = torch.arange(length, device=hidden.device)[None] < lengths[:, None]
+        window_mask = visible[:, None, None, :] if not bool(visible.all()) else None
         image_ids = self.image_ids(*latents.shape[-2:], latents.device)
-        lengths = self.window_lengths(mask).tolist()
-        # One shared-length batch remains a single forward. Different windows cannot
-        # be padded together: Flux3 attention intentionally has no text padding mask.
-        groups = [list(range(len(lengths)))] if len(set(lengths)) == 1 else [[i] for i in range(len(lengths))]
-        def forward(dummy, inputs, context, times, image_ids, text_ids, target, cond, cond_ids):
+        target = target_timestep.expand(latents.shape[0]) if target_timestep is not None else None
+        cond = self.pack_latents(reference).to(packed.dtype) if reference is not None else None
+        cond_ids = self.image_ids(*reference.shape[-2:], latents.device, reference_index=0) if reference is not None else None
+
+        def forward(dummy, inputs, context, times, image_ids, text_ids, target, cond, cond_ids, window):
             return self.transformer(
                 hidden_states=inputs, timestep=times, encoder_hidden_states=context,
                 img_ids=image_ids, txt_ids=text_ids, target_timestep=target,
                 image_cond_hidden_states=cond, image_cond_ids=cond_ids,
+                text_window_mask=window,
             ).sample
 
-        for indices in groups:
-            length = lengths[indices[0]]
-            target = target_timestep.expand(len(lengths))[indices] if target_timestep is not None else None
-            cond = self.pack_latents(reference[indices]).to(packed.dtype) if reference is not None else None
-            cond_ids = self.image_ids(*reference.shape[-2:], latents.device, reference_index=0) if reference is not None else None
-            args = (
-                packed.new_zeros((), requires_grad=True),
-                packed[indices], hidden[indices, :length].to(packed.dtype),
-                timestep.expand(len(lengths))[indices], image_ids,
-                self.text_ids(length, latents.device), target, cond, cond_ids,
-            )
-            if torch.is_grad_enabled() and self.transformer_offload_conductor is not None:
-                # Each conductor owns one live activation arena. Defer its saved
-                # activations to this outer checkpoint's recompute, immediately
-                # followed by that window's backward. This also keeps separate
-                # normal/chosen/rejected forwards from overwriting each other.
-                output = torch.utils.checkpoint.checkpoint(forward, *args, use_reentrant=True)
-            else:
-                output = forward(*args)
-            outputs.append(output)
-        return self.unpack_latents(torch.cat(outputs), *latents.shape[-2:])
+        args = (
+            packed.new_zeros((), requires_grad=True), packed, hidden[:, :length].to(packed.dtype),
+            timestep.expand(latents.shape[0]), image_ids, self.text_ids(length, latents.device),
+            target, cond, cond_ids, window_mask,
+        )
+        if torch.is_grad_enabled() and self.transformer_offload_conductor is not None:
+            # The conductor owns one activation arena. Save activations only in
+            # recompute immediately followed by backward, including mixed RLHF.
+            output = torch.utils.checkpoint.checkpoint(forward, *args, use_reentrant=True)
+        else:
+            output = forward(*args)
+        return self.unpack_latents(output, *latents.shape[-2:])
 
     def calculate_timestep_shift(self, latent_height, latent_width):
         return TRAINING_SHIFT

@@ -27,8 +27,8 @@ Qwen3-VL-4B hidden layers 4/8/12/16/20/24/28/32 are concatenated. Each prompt is
 right-padded to a multiple of 80, capped at the configured sequence length
 (default 512 in presets; maximum 4096). Padding positions use position id 1.
 The DiT attends to those padding embeddings. Only unused cache tail values
-are removed; heterogeneous prompt windows are forwarded separately to preserve
-conditioning. Image positional coordinates are scaled by 0.5.
+are masked; heterogeneous prompt windows share a single batched forward, with
+trained padding still visible. Image positional coordinates are scaled by 0.5.
 
 The sampler also accepts one optional reference image. The distilled
 `black-forest-labs/flux-3-image-klein` checkpoint can be sampled with CFG 1 and
@@ -47,6 +47,8 @@ uses your captions/prompts as entered, without automatic rewriting or an extra
 - Transformer and frozen-encoder INT8/NF4/FP8 quantization; transformer W8A8/SVD options.
 - SDPA, Flash Attention and cuDNN through Diffusers' backend selection.
 - Gradient checkpointing, block compilation, layer/activation offloading.
+  Mixed RLHF requires Fused Back Pass and Fused Gradient Reduce disabled so
+  normal and preference gradients accumulate before a parameter update.
   Reference-only blocks are checkpointed but excluded from the T2I offload
   schedule because they do not execute during T2I training.
 - Original or Diffusers transformer safetensors overrides, local or HF URL.

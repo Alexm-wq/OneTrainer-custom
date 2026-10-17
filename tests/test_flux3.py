@@ -214,8 +214,11 @@ class Flux3Test(unittest.TestCase):
                 optimizer = torch.optim.AdamW(params, lr=.001)
                 before = [p.detach().clone() for p in params]
                 out = self.setup.predict(self.model, self.batch(), self.config, TrainProgress())
+                self.assertTrue(torch.isfinite(out["predicted"]).all(), "nonfinite quantized prediction")
                 out["predicted"].square().mean().backward()
-                self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in params))
+                bad = [n for n, p in self.model.transformer_lora.named_parameters()
+                       if p.grad is None or not torch.isfinite(p.grad).all()]
+                self.assertEqual(bad, [])
                 optimizer.step()
                 self.assertTrue(any(not torch.equal(p, b) for p, b in zip(params, before, strict=True)))
 
@@ -310,6 +313,12 @@ class Flux3Test(unittest.TestCase):
         self.assertIn("text_encoder_hidden_state", kwargs["text_split_names"])
         self.assertIn("flux3-", kwargs["config"].cache_dir)
 
+    def test_mixed_rlhf_rejects_premature_fused_updates(self):
+        self.config.rlhf_enabled = True
+        self.config.optimizer.fused_back_pass = True
+        with self.assertRaisesRegex(ValueError, "must finish accumulating"):
+            self.setup.setup_optimizations(self.model, self.config)
+
     def test_distilled_training_guard(self):
         self.model.transformer = tiny_transformer(flow_map=True)
         with self.assertRaisesRegex(ValueError, "flow-map"):
@@ -348,6 +357,8 @@ class Flux3Test(unittest.TestCase):
                 if self.keep and not torch.is_grad_enabled():
                     self.pending.add(call_id)
 
+        from modules.module.flux3_window_attention import enable_flux3_window_attention
+        enable_flux3_window_attention(self.model.transformer)
         baseline = copy.deepcopy(self.model)
         conductor = TrackingConductor()
         lists = [
@@ -372,7 +383,7 @@ class Flux3Test(unittest.TestCase):
         actual.backward()
         expected.backward()
         self.assertFalse(conductor.pending)
-        self.assertEqual(conductor.starts.count(True), 4)
+        self.assertEqual(conductor.starts.count(True), 2)
         for a, e in zip(self.model.transformer.parameters(), baseline.transformer.parameters(), strict=True):
             if e.grad is not None:
                 torch.testing.assert_close(a.grad, e.grad, atol=1e-6, rtol=1e-4)
