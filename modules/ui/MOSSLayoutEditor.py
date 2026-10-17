@@ -52,6 +52,8 @@ class MOSSLayoutEditor:
             outer.addWidget(scroll, 0, 0)
             self.figure = Figure(figsize=(7, 7))
             self.canvas = FigureCanvasQTAgg(self.figure)
+            # Matplotlib may have queued an idle draw when the parent is deleted.
+            self.canvas.destroyed.connect(lambda: setattr(self.canvas, "_draw_pending", False))
             outer.addWidget(self.canvas, 0, 1)
             outer.setColumnStretch(1, 1)
         else:
@@ -389,14 +391,14 @@ class MOSSLayoutEditor:
 
     def refresh(self):
         self._selecting = True
-        choices = [f"{i}: {item['label']} {item['caption'][:28]}" for i, item in enumerate(self.document["items"])] or ["None"]
+        choices = ["None"] + [f"{i}: {item['label']} {item['caption'][:28]}" for i, item in enumerate(self.document["items"])]
         if self.qt:
             self.object_choice.clear()
             self.object_choice.addItems(choices)
-            self.object_choice.setCurrentIndex(self.selected if self.selected is not None else 0)
+            self.object_choice.setCurrentIndex(self.selected + 1 if self.selected is not None else 0)
         else:
             self.object_choice.configure(values=choices)
-            self.object_choice.set(choices[self.selected if self.selected is not None else 0])
+            self.object_choice.set(choices[self.selected + 1 if self.selected is not None else 0])
         self._selecting = False
         self.fill_selection()
         self.redraw()

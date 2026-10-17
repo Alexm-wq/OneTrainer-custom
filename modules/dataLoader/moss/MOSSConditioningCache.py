@@ -19,7 +19,7 @@ import torch
 class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineModule):
     NAMES = ["prompt", "tokens", "tokens_mask", "text_encoder_hidden_state"]
 
-    def __init__(self, model, max_length, cache_dir, identity, before_cache, enabled=True):
+    def __init__(self, model, max_length, cache_dir, identity, before_cache, enabled=True, prepare_empty=False):
         super().__init__()
         self.model = model
         self.max_length = max_length or 4096
@@ -27,6 +27,8 @@ class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineM
         self.identity = identity
         self.before_cache = before_cache
         self.enabled = enabled
+        self.prepare_empty = prepare_empty
+        self.initialized = False
         self.entries = []
 
     def get_inputs(self):
@@ -36,7 +38,7 @@ class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineM
         return self.NAMES
 
     def length(self):
-        return len(self.entries) if self.enabled else self._get_previous_length("prompt")
+        return len(self.entries) if self.enabled and self.initialized else self._get_previous_length("prompt")
 
     def _key(self, prompt):
         value = json.dumps([self.identity, self.max_length, prompt], sort_keys=True, ensure_ascii=False)
@@ -94,8 +96,10 @@ class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineM
                 self._save(path, self._encode(prompt))
                 misses += 1
         # Empty conditioning is process-local and must exist even on a cache hit.
-        if not prepared and self.entries:
+        if (not prepared and self.entries and self.prepare_empty
+                and self.max_length not in self.model.empty_text):
             self.before_cache()
+        self.initialized = True
         print(f"[OT-MOSS-TEXT-CACHE] rows={len(self.entries)}, unique={len(seen)}, "
               f"encoded={misses}, reused={len(seen) - misses}")
 

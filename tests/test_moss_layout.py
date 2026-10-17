@@ -206,7 +206,7 @@ class GeometryTests(unittest.TestCase):
         source = _Source({"image": image, "mask": image[:1], "moss_layout": value,
                           "enabled": False, "fixed": True, "angle": 90})
         for cls in (MOSSRandomFlip, MOSSRandomRotate):
-            kwargs = dict(names=["image"], enabled_in_name="enabled", fixed_enabled_in_name="fixed")
+            kwargs = {"names": ["image"], "enabled_in_name": "enabled", "fixed_enabled_in_name": "fixed"}
             if cls is MOSSRandomRotate:
                 kwargs["max_angle_in_name"] = "angle"
             module = cls(**kwargs)

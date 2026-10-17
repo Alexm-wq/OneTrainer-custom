@@ -100,7 +100,8 @@ class EditorAssertions:
             restored.load_image(image)
             self.assertEqual(restored.image.size, editor.image.size)
             self.assertEqual(restored.document["items"][0]["bbox"], editor.document["items"][0]["bbox"])
-            self.assertEqual(Image.open(image_path).size, (201, 127))
+            with Image.open(image_path) as original:
+                self.assertEqual(original.size, (201, 127))
 
     def test_sample_editor_updates_config_and_both_ui_entry_points_exist(self):
         sample = SampleConfig.default_values(ModelType.MOSS_IMAGE)

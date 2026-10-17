@@ -163,6 +163,7 @@ class MOSSImageBaseDataLoader(
             MOSSConditioningCache(
                 model, config.text_encoder_sequence_length, os.path.join(config.cache_dir, "text"),
                 identity, lambda: model_setup.prepare_text_caching(model, config), enabled=config.text_caching,
+                prepare_empty=bool(config.text_encoder.dropout_probability),
             ),
         ]
         return modules
