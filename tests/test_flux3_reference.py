@@ -8,15 +8,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from modules.dataLoader.Flux3BaseDataLoader import Flux3BaseDataLoader
 from modules.model.Flux3Model import Flux3Model
 from modules.modelLoader.Flux3ModelLoader import Flux3ModelLoader
 from modules.modelSampler.Flux3Sampler import Flux3Sampler, sampling_sigmas
 from modules.modelSaver.flux3.Flux3ModelSaver import Flux3ModelSaver
-from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.ConceptConfig import ConceptConfig
-from modules.dataLoader.Flux3BaseDataLoader import Flux3BaseDataLoader
-from modules.util.TrainProgress import TrainProgress
-from PIL import Image
+from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.convert_util import convert
 from modules.util.enum.DataType import DataType
@@ -25,6 +23,7 @@ from modules.util.enum.ModelType import ModelType
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.quantization_util import replace_linear_with_quantized_layers
+from modules.util.TrainProgress import TrainProgress
 
 import torch
 
@@ -39,6 +38,7 @@ from transformers import (
 )
 
 import test_flux3 as fixtures
+from PIL import Image
 
 
 def real_components(model, root):

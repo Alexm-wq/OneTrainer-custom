@@ -1,12 +1,8 @@
 """Focused FLUX.3 integration tests with tiny random weights; no model downloads."""
 import copy
-import importlib.util
 import json
-import os
-import sys
 import tempfile
 import unittest
-from contextlib import nullcontext
 from pathlib import Path
 from random import Random
 from types import SimpleNamespace
@@ -14,24 +10,20 @@ from unittest.mock import Mock, patch
 
 from modules.dataLoader.Flux3BaseDataLoader import Flux3BaseDataLoader
 from modules.model.Flux3Model import Flux3Model
-from modules.modelLoader.Flux3ModelLoader import Flux3LoRALoader, Flux3ModelLoader
-from modules.modelSampler.Flux3Sampler import Flux3Sampler, sampling_sigmas
+from modules.modelLoader.Flux3ModelLoader import Flux3LoRALoader
+from modules.modelSampler.Flux3Sampler import sampling_sigmas
 from modules.modelSaver.flux3.Flux3LoRASaver import Flux3LoRASaver
-from modules.modelSaver.flux3.Flux3ModelSaver import Flux3ModelSaver
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.trainer.GenericTrainer import GenericTrainer
-from modules.util.enum.DPORefMode import DPORefMode
 from modules.util import create
 from modules.util.config.SampleConfig import SampleConfig
-from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
+from modules.util.config.TrainConfig import TrainConfig
 from modules.util.convert_util import convert
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DataType import DataType
-from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.ModelNames import ModelNames
-from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.optimizer.muon_util import build_muon_adam_key_fn
 from modules.util.quantization_util import replace_linear_with_quantized_layers
 from modules.util.TrainProgress import TrainProgress
@@ -39,18 +31,10 @@ from modules.util.TrainProgress import TrainProgress
 import torch
 from torch import nn
 
-from diffusers import AutoencoderKLFlux2, FlowMatchEulerDiscreteScheduler, Flux3Transformer2DModel
+from diffusers import FlowMatchEulerDiscreteScheduler, Flux3Transformer2DModel
 from diffusers.loaders.single_file_utils import convert_flux3_transformer_checkpoint_to_diffusers
-from transformers import (
-    Qwen2Tokenizer,
-    Qwen2VLImageProcessor,
-    Qwen3VLConfig,
-    Qwen3VLModel,
-    Qwen3VLProcessor,
-    Qwen3VLVideoProcessor,
-)
 
-from safetensors.torch import load_file, save_file
+from safetensors.torch import load_file
 
 
 def tiny_transformer(flow_map=False):

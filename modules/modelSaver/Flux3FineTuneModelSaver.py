@@ -1,6 +1,6 @@
 from modules.model.Flux3Model import Flux3Model
-from modules.modelSaver.GenericFineTuneModelSaver import make_fine_tune_model_saver
 from modules.modelSaver.flux3.Flux3ModelSaver import Flux3ModelSaver
+from modules.modelSaver.GenericFineTuneModelSaver import make_fine_tune_model_saver
 from modules.util.enum.ModelType import ModelType
 
 Flux3FineTuneModelSaver = make_fine_tune_model_saver(

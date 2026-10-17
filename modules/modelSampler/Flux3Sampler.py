@@ -7,9 +7,9 @@ from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelType import ModelType
 from modules.util.torch_util import torch_gc
 
-import numpy as np
 import torch
 
+import numpy as np
 from PIL import Image, ImageOps
 from tqdm import tqdm
 

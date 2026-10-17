@@ -1,6 +1,6 @@
 from modules.model.Flux3Model import Flux3Model
-from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseFlux3Setup import BaseFlux3Setup
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig

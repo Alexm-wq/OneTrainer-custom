@@ -4,8 +4,8 @@ import json
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.flux3.EncodeFlux3Text import EncodeFlux3Text
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.model.Flux3Model import Flux3Model
 from modules.modelSetup.BaseFlux3Setup import BaseFlux3Setup
 from modules.util import factory
