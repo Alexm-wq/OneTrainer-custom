@@ -39,6 +39,9 @@ jobs:
           CONDA_OVERRIDE_CUDA: "13.0"
         run: |
           pixi lock
+          cp pixi.lock /tmp/moss-kernels-first.lock
+          pixi lock
+          diff -u /tmp/moss-kernels-first.lock pixi.lock || true
           pixi lock --check
       - name: Install only the kernel test dependencies
         run: |
