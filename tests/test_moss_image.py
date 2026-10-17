@@ -13,16 +13,19 @@ from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelLoader.MOSSImageModelLoader import MOSSImageLoRALoader, MOSSImageModelLoader
 from modules.modelSampler.MOSSImageSampler import MOSSImageSampler
 from modules.modelSaver.moss.MOSSImageLoRASaver import MOSSImageLoRASaver
+from modules.modelSaver.moss.MOSSImageModelSaver import MOSSImageModelSaver
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.moss.pipeline_moss_image import MOSSImagePipeline, MOSSImageScheduler, MOSSImageTransformer
 from modules.trainer.GenericTrainer import GenericTrainer
 from modules.util import create
+from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import QuantizationConfig, TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DataType import DataType
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
@@ -32,6 +35,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from diffusers import AutoencoderKLFlux2
+from transformers import Qwen2Tokenizer, Qwen3_5Config, Qwen3_5Model
+
+from PIL import Image
 from safetensors.torch import load_file, save_file
 
 
@@ -226,7 +233,7 @@ class MOSSImageTest(unittest.TestCase):
                 restored = MOSSImageLoRALoader()._to_canonical(self.model, load_file(path))
                 self.assertEqual(set(original), set(restored))
                 for key in original:
-                    torch.testing.assert_close(original[key], restored[key])
+                    torch.testing.assert_close(original[key].to(torch.float32), restored[key], rtol=0, atol=0)
 
     def test_transformer_override_strict_and_vae_fp32(self):
         with tempfile.TemporaryDirectory() as root:
@@ -318,6 +325,118 @@ class MOSSImageTest(unittest.TestCase):
             loader._cache_modules(self.config, self.model, self.setup)
             self.assertIn("tokens_mask", cache.call_args.kwargs["text_split_names"])
             self.assertIn("latent_image", cache.call_args.kwargs["image_split_names"])
+
+
+    def real_components(self):
+        self.model.text_encoder = Qwen3_5Model(Qwen3_5Config(
+            text_config={
+                "vocab_size": 32, "hidden_size": 8, "intermediate_size": 16,
+                "num_hidden_layers": 2, "num_attention_heads": 1,
+                "num_key_value_heads": 1, "head_dim": 8,
+                "layer_types": ["linear_attention", "full_attention"],
+                "linear_key_head_dim": 8, "linear_value_head_dim": 8,
+                "linear_num_key_heads": 1, "linear_num_value_heads": 1,
+                "pad_token_id": 0, "eos_token_id": 0,
+                "rope_parameters": {
+                    "rope_type": "default", "rope_theta": 10000,
+                    "partial_rotary_factor": 1.0, "mrope_section": [1, 1, 2],
+                    "mrope_interleaved": True,
+                },
+            },
+            vision_config={
+                "depth": 1, "hidden_size": 8, "intermediate_size": 16,
+                "num_heads": 1, "out_hidden_size": 8, "patch_size": 2,
+                "spatial_merge_size": 1, "num_position_embeddings": 16,
+            },
+            image_token_id=29, video_token_id=30, vision_start_token_id=28, vision_end_token_id=27,
+        )).eval().requires_grad_(False)
+        self.model.tokenizer = Qwen2Tokenizer(
+            vocab={"<|endoftext|>": 0, "a": 1, "b": 2, "c": 3}, merges=[],
+            chat_template="{% for m in messages %}a{{ m['content'] }}{% endfor %}",
+        )
+        self.model.vae = AutoencoderKLFlux2(
+            block_out_channels=(8, 8, 8, 8), decoder_block_out_channels=(8, 8, 8, 8),
+            norm_num_groups=8, layers_per_block=1, sample_size=32,
+        ).eval().requires_grad_(False)
+
+    def test_real_qwen35_encoder_cache_parity(self):
+        self.real_components()
+        tokens = torch.tensor([[0, 1, 2, 0], [1, 2, 3, 0]])
+        mask = torch.tensor([[0, 1, 1, 0], [1, 1, 1, 0]])
+        hidden, _ = self.model.encode_text("cpu", tokens=tokens, tokens_mask=mask)
+        direct = self.model.text_encoder(
+            input_ids=tokens[:1, 1:3], attention_mask=torch.ones(1, 2, dtype=torch.long),
+            use_cache=False,
+        ).last_hidden_state
+        torch.testing.assert_close(hidden[:1, 1:3], direct)
+        self.assertTrue(torch.isfinite(hidden).all())
+
+    def test_full_export_and_public_loader_roundtrip_preserve_fp32_vae(self):
+        self.real_components()
+        expected_vae = {k: v.clone() for k, v in self.model.vae.state_dict().items()}
+        with tempfile.TemporaryDirectory() as root:
+            MOSSImageModelSaver().save(self.model, ModelFormat.DIFFUSERS, root, torch.bfloat16)
+            loaded = MOSSImageModel(ModelType.MOSS_IMAGE)
+            dtypes = ModelWeightDtypes.from_single_dtype(DataType.BFLOAT_16)
+            MOSSImageModelLoader().load(
+                loaded, ModelType.MOSS_IMAGE, ModelNames(base_model=root), dtypes,
+                QuantizationConfig.default_values(),
+            )
+            for key, value in expected_vae.items():
+                torch.testing.assert_close(value, loaded.vae.state_dict()[key], rtol=0, atol=0)
+            for key, value in self.model.transformer.state_dict().items():
+                expected = value if key == "rope.bands" else value.bfloat16()
+                torch.testing.assert_close(expected, loaded.transformer.state_dict()[key], rtol=0, atol=0)
+            self.assertTrue((Path(root) / "pipeline_moss_image.py").is_file())
+            self.assertTrue((Path(root) / "MOSS-LICENSE").is_file())
+            index = json.loads((Path(root) / "model_index.json").read_text())
+            self.assertEqual(index["transformer"], ["pipeline_moss_image", "MOSSImageTransformer"])
+            hidden, mask = loaded.encode_text("cpu", text="abc", text_encoder_sequence_length=8)
+            self.assertTrue(torch.isfinite(hidden).all())
+            self.assertGreater(mask.sum(), 0)
+
+    def test_real_dataloader_cache_restart_and_multiple_resolutions(self):
+        self.real_components()
+        self.config.text_encoder_sequence_length = 8
+        self.config.image_caching = self.config.text_caching = True
+        self.config.aspect_ratio_bucketing = False
+        self.config.resolution = "32,64"
+        self.config.caching_threads = 1
+        with tempfile.TemporaryDirectory() as root:
+            images = Path(root) / "images"
+            images.mkdir()
+            self.config.cache_dir = str(Path(root) / "cache")
+            concept = ConceptConfig.default_values()
+            concept.path = str(images)
+            concept.image_variations = concept.text_variations = 1
+            self.config.concepts = [concept]
+            for count in (1, 2):
+                Image.new("RGB", (64, 64), "red").save(images / f"{count}.png")
+                (images / f"{count}.txt").write_text("abc")
+                loader = object.__new__(MOSSImageBaseDataLoader)
+                loader.train_device = loader.temp_device = torch.device("cpu")
+                ds = loader._create_dataset(self.config, self.model, self.setup, TrainProgress())
+                try:
+                    seen = set()
+                    for _ in range(2):
+                        ds.start_next_epoch()
+                        rows = list(ds)
+                        self.assertEqual(len(rows), count)
+                        for row in rows:
+                            self.assertEqual(row["latent_image"].shape[0], 32)
+                            self.assertEqual(row["latent_image"].dtype, torch.float32)
+                            self.assertTrue(torch.isfinite(row["text_encoder_hidden_state"]).all())
+                            seen.add(row["latent_image"].shape[-1] * 8)
+                    self.assertEqual(seen, {32, 64})
+                finally:
+                    ds.loading_pipeline.modules[0]._state.executor.shutdown(wait=True)
+
+    def test_cached_restart_prepares_empty_dropout_conditioning(self):
+        self.config.text_encoder.dropout_probability = .1
+        self.config.text_caching = True
+        self.model.prepare_empty_text = Mock()
+        self.setup.setup_train_device(self.model, self.config)
+        self.model.prepare_empty_text.assert_called_once_with(self.config.text_encoder_sequence_length)
 
     def test_unsupported_offload_rejected_before_training(self):
         self.config.transformer.offload_fraction = .5

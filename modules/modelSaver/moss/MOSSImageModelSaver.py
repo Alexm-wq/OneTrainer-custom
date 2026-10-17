@@ -1,11 +1,11 @@
-import json
 import os.path
 import shutil
+import json
 from pathlib import Path
 
 from modules.model.MOSSImageModel import MOSSImageModel
-from modules.modelSaver.mixin.DtypeModelSaverMixin import DtypeModelSaverMixin
 from modules.module.moss import pipeline_moss_image
+from modules.modelSaver.mixin.DtypeModelSaverMixin import DtypeModelSaverMixin
 from modules.util.convert_util import convert
 from modules.util.enum.ModelFormat import ModelFormat
 
@@ -34,7 +34,13 @@ class MOSSImageModelSaver(
         os.makedirs(Path(destination).absolute(), exist_ok=True)
         # Preserve the original fp32 VAE instead of rounding its weights to output_dtype.
         save_pipeline.vae = model.vae
-        save_pipeline.save_pretrained(destination)
+        # Save explicit components: Diffusers' library discovery does not know
+        # OneTrainer's nested custom module package.
+        save_pipeline.transformer.save_pretrained(os.path.join(destination, "transformer"))
+        save_pipeline.scheduler.save_pretrained(os.path.join(destination, "scheduler"))
+        save_pipeline.text_encoder.save_pretrained(os.path.join(destination, "text_encoder"))
+        save_pipeline.tokenizer.save_pretrained(os.path.join(destination, "tokenizer"))
+        model.vae.save_pretrained(os.path.join(destination, "vae"))
         shutil.copyfile(pipeline_moss_image.__file__, os.path.join(destination, "pipeline_moss_image.py"))
         shutil.copyfile(
             os.path.join(os.path.dirname(pipeline_moss_image.__file__), "LICENSE"),
@@ -42,8 +48,12 @@ class MOSSImageModelSaver(
         )
         # Portable custom-component names, independent of OneTrainer's package layout.
         index_path = os.path.join(destination, "model_index.json")
-        with open(index_path, encoding="utf-8") as handle:
-            index = json.load(handle)
+        index = {
+            "_class_name": "MOSSImagePipeline",
+            "text_encoder": ["transformers", "Qwen3_5Model"],
+            "tokenizer": ["transformers", "Qwen2Tokenizer"],
+            "vae": ["diffusers", "AutoencoderKLFlux2"],
+        }
         index["transformer"] = ["pipeline_moss_image", "MOSSImageTransformer"]
         index["scheduler"] = ["pipeline_moss_image", "MOSSImageScheduler"]
         with open(index_path, "w", encoding="utf-8") as handle:

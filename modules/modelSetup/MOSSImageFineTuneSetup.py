@@ -1,6 +1,6 @@
 from modules.model.MOSSImageModel import MOSSImageModel
-from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
+from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
@@ -64,15 +64,20 @@ class MOSSImageFineTuneSetup(
             model: MOSSImageModel,
             config: TrainConfig,
     ):
+        if config.text_encoder.dropout_probability and (config.text_encoder_sequence_length or 4096) not in model.empty_text:
+            # Cache hits do not invoke prepare_text_caching, so initialize dropout
+            # conditioning here as well, before moving the DiT onto the GPU.
+            model.transformer_to(self.temp_device)
+            model.vae_to(self.temp_device)
+            model.text_encoder_to(self.train_device)
+            model.prepare_empty_text(config.text_encoder_sequence_length)
+
         vae_on_train_device = not config.image_caching
         text_encoder_on_train_device = not config.text_caching
 
         model.text_encoder_to(self.train_device if text_encoder_on_train_device else self.temp_device)
         model.vae_to(self.train_device if vae_on_train_device else self.temp_device)
         model.transformer_to(self.train_device)
-
-        if not config.text_caching and config.text_encoder.dropout_probability:
-            model.prepare_empty_text(config.text_encoder_sequence_length)
 
         model.text_encoder.eval()
         model.vae.eval()
