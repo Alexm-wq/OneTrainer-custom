@@ -35,8 +35,8 @@ class MOSSLayoutEditor:
         self.fields = {}
         self._selecting = False
         if qt:
-            from PySide6.QtWidgets import QDialog, QGridLayout, QWidget
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from PySide6.QtWidgets import QDialog, QGridLayout, QWidget
             self.window = QDialog(parent)
             self.window.setWindowTitle("MOSS layout")
             self.window.resize(1160, 760)

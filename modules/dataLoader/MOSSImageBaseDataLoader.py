@@ -4,8 +4,8 @@ import json
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
+from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.moss.MOSSConditioningCache import MOSSConditioningCache
 from modules.dataLoader.moss.MOSSLayout import (
     LoadMOSSLayout,
