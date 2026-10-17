@@ -1,6 +1,6 @@
 from modules.model.MOSSImageModel import MOSSImageModel
-from modules.modelSaver.moss.MOSSImageModelSaver import MOSSImageModelSaver
 from modules.modelSaver.GenericFineTuneModelSaver import make_fine_tune_model_saver
+from modules.modelSaver.moss.MOSSImageModelSaver import MOSSImageModelSaver
 from modules.util.enum.ModelType import ModelType
 
 MOSSImageFineTuneModelSaver = make_fine_tune_model_saver(

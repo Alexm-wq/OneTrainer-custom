@@ -2,8 +2,8 @@ import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
-from modules.model.MOSSImageModel import MOSSImageModel
 from modules.dataLoader.moss.EncodeMOSSImageText import EncodeMOSSImageText
+from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
