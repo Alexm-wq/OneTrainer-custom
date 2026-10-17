@@ -78,4 +78,4 @@ jobs:
       - name: Tested commit
         run: git rev-parse HEAD
 
-# Combined dependency lock and focused FLUX.3 / optimizer validation.
+# Validate FP8 accumulation range with the combined dependency lock.

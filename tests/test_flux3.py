@@ -268,6 +268,20 @@ class Flux3Test(unittest.TestCase):
                 optimizer.step()
                 self.assertTrue(any(not torch.equal(p, b) for p, b in zip(params, before, strict=True)))
 
+    def test_fp8_fallback_preserves_accumulation_range(self):
+        import importlib.util
+        import sys
+
+        spec = importlib.util.spec_from_file_location("flux3_mm_fallback", "modules/util/mm_8bit.py")
+        fallback = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {"modules.util.triton_mm_8bit": None}):
+            spec.loader.exec_module(fallback)
+        a = torch.full((32, 32), 448, dtype=torch.float32).to(torch.float8_e4m3fn)
+        b = a.clone()
+        result = fallback.mm_8bit(a, b)
+        self.assertEqual(result.dtype, torch.float32)
+        torch.testing.assert_close(result, a.float() @ b.float())
+
     def test_compile_executes_forward_and_backward(self):
         self.config.compile = True
         original = nn.Module.compile
