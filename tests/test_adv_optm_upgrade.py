@@ -1,5 +1,6 @@
 """Focused adv-optm upgrade checks; tiny CPU tensors, no model weights."""
 import copy
+import json
 import os
 import sys
 import tempfile
@@ -117,7 +118,6 @@ class AdvOptmUpgradeTests(unittest.TestCase):
         config, model, _, optimizer = make_optimizer(Optimizer.SINKSGD_ADV, **options)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.json"
-            import json
             path.write_text(json.dumps(config.to_dict()), encoding="utf-8")
             restored = TrainConfig.default_values()
             restored.from_dict(json.loads(path.read_text(encoding="utf-8")))
@@ -201,8 +201,39 @@ class AdvOptmUpgradeTests(unittest.TestCase):
                 self.assertEqual(optimizer.param_groups[0]["lr"], 0.002)
                 self.assertEqual(optimizer.param_groups[1]["lr"], 0.0007)
                 self.assertEqual(optimizer.param_groups[0]["nesterov_coef"], 0.23)
+                self.assertEqual(optimizer.param_groups[1]["adam_betas"], (0.81, 0.96))
+                self.assertEqual(optimizer.param_groups[1]["adam_eps"], 2e-7)
+                self.assertEqual(optimizer.param_groups[1]["adam_nesterov_coef"], 0.31)
                 for index in range(3):
                     step(optimizer, index)
+
+
+    def test_resume_preserves_fp32_moments_for_bf16_parameters(self):
+        _, model, _, optimizer = make_optimizer(Optimizer.SINKSGD_ADV, dtype=torch.bfloat16, state_precision="fp32")
+        for index in range(3):
+            step(optimizer, index)
+        saved = copy.deepcopy(optimizer.state_dict())
+        _, _, _, restored = make_optimizer(
+            Optimizer.SINKSGD_ADV, state_dict=copy.deepcopy(saved),
+            dtype=torch.bfloat16, state_precision="fp32",
+        )
+        for state_id, state in saved["state"].items():
+            torch.testing.assert_close(
+                restored.state_dict()["state"][state_id]["momentum_buffer"],
+                state["momentum_buffer"], rtol=0, atol=0,
+            )
+        self.assertTrue(all(torch.isfinite(p).all() for p in model.transformer.parameters()))
+
+    def test_automatic_moments_follow_changed_parameter_dtype(self):
+        _, _, _, optimizer = make_optimizer(Optimizer.SINKSGD_ADV)
+        step(optimizer, 0)
+        _, model, _, restored = make_optimizer(
+            Optimizer.SINKSGD_ADV, state_dict=copy.deepcopy(optimizer.state_dict()), dtype=torch.bfloat16,
+        )
+        for state in restored.state.values():
+            self.assertEqual(state["momentum_buffer"].dtype, torch.bfloat16)
+        step(restored, 1)
+        self.assertTrue(all(torch.isfinite(p).all() for p in model.transformer.parameters()))
 
     @unittest.skipUnless(os.environ.get("ADV_OPTM_LEGACY_FIXTURE"), "Cross-version fixture is generated only in focused CI")
     def test_resume_real_2512_states_and_preserve_next_step(self):
@@ -217,10 +248,15 @@ class AdvOptmUpgradeTests(unittest.TestCase):
                 with torch.no_grad():
                     for parameter, saved in zip(model.transformer.parameters(), fixture["weights"], strict=True):
                         parameter.copy_(saved)
+                loaded_states = optimizer.state_dict()["state"]
+                for state_id, saved_state in fixture["state"]["state"].items():
+                    for key, value in saved_state.items():
+                        if isinstance(value, torch.Tensor):
+                            torch.testing.assert_close(loaded_states[state_id][key], value, rtol=0, atol=0)
                 step(optimizer, 2)
                 for actual, expected in zip(weights(model), fixture["expected"], strict=True):
                     # BF16 Sinkhorn now preserves native precision upstream.
-                    tolerance = 0.01 if actual.dtype == torch.bfloat16 else 1e-5
+                    tolerance = 0.001 if actual.dtype == torch.bfloat16 else 1e-5
                     torch.testing.assert_close(actual, expected, rtol=tolerance, atol=tolerance)
 
 

@@ -21,6 +21,12 @@ tags, Muon/AuxAdam grouping, per-group learning rates, fused backward integratio
 and optimizer-state mapping are retained. Existing user presets are not rewritten.
 Upstream did not change SinkSGD's Nesterov mixing formula.
 
+The upgrade also fixes two demonstrated upstream resume failures in the fork:
+missing precision metadata in Lion/Muon auxiliary groups, and signed INT8
+momentum being reinterpreted as UINT8. A narrow loading helper retains the
+upstream loader and restores saved state tensors directly, preserving FP32
+moments without first rounding them through BF16 parameter precision.
+
 The focused GitHub Actions workflow generates real checkpoints with 2.5.12,
 then upgrades to 2.5.16 and checks factory construction, optimization steps,
 custom settings, fused stepping and resume. It uses tiny CPU tensors and does
