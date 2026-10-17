@@ -17,8 +17,6 @@ class TrainingTabController:
         ui_state.get_var("optimizer").update(optimizer_config)
 
     def get_attention_mechanisms(self) -> list[tuple[str, AttentionMechanism]]:
-        if self.config.model_type.is_moss_image():
-            return [("torch SDPA", AttentionMechanism.SDP)]
         return [
             ("torch SDPA", AttentionMechanism.SDP),
             ("flash-attn", AttentionMechanism.FLASH),
@@ -26,8 +24,6 @@ class TrainingTabController:
         ]
 
     def get_train_dtypes(self) -> list[tuple[str, DataType]]:
-        if self.config.model_type.is_moss_image():
-            return [("float32", DataType.FLOAT_32), ("bfloat16", DataType.BFLOAT_16)]
         return [
             ("float32", DataType.FLOAT_32),
             ("float16", DataType.FLOAT_16),

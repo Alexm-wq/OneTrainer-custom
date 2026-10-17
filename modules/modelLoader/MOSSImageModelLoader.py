@@ -12,40 +12,61 @@ from modules.util.enum.ModelType import ModelType
 import torch
 
 from diffusers import AutoencoderKLFlux2
+from diffusers.loaders.single_file_utils import load_single_file_checkpoint
 from transformers import Qwen2Tokenizer, Qwen3_5Model
 
-from safetensors.torch import load_file
 
 
 class MOSSImageModelLoader(HFModelLoaderMixin):
     def load(self, model, model_type, model_names, weight_dtypes, quantization):
-        # The upstream forward explicitly casts activations to weight.dtype.
-        # Integer/float8 weights therefore require a dedicated quantization integration.
         for name in ("transformer", "text_encoder"):
-            if getattr(weight_dtypes, name) not in (DataType.FLOAT_32, DataType.BFLOAT_16):
-                raise ValueError(f"MOSS {name} currently supports FLOAT_32 or BFLOAT_16 weights.")
+            dtype = getattr(weight_dtypes, name)
+            if dtype.is_gguf():
+                raise ValueError(
+                    f"MOSS {name} expects native safetensors or a Diffusers directory, not GGUF. "
+                    "Select INT8, NF4 or FP8 to quantize during loading."
+                )
         base = model_names.base_model
         override = model_names.transformer_model
-        if override and os.path.isfile(override):
+        storage_dtype = weight_dtypes.transformer.torch_dtype() or torch.bfloat16
+        is_single_file = override and (
+            os.path.isfile(override) or override.lower().split("?")[0].endswith(".safetensors")
+        )
+        if is_single_file:
             config = MOSSImageTransformer.load_config(base, subfolder="transformer")
-            # meta + assign avoids constructing a second 5B model in CPU RAM.
             with torch.device("meta"):
                 transformer = MOSSImageTransformer.from_config(config)
-            transformer.load_state_dict(load_file(override), strict=True, assign=True)
-            transformer.to(dtype=weight_dtypes.transformer.torch_dtype())
+            state = load_single_file_checkpoint(override)
+            for prefix in ("model.diffusion_model.", "diffusion_model.", "transformer."):
+                if state and all(key.startswith(prefix) for key in state):
+                    state = {key.removeprefix(prefix): value for key, value in state.items()}
+                    break
+            for key in state:
+                state[key] = state[key].to(storage_dtype)
+            transformer.load_state_dict(state, strict=True, assign=True)
+            del state
         else:
             transformer = MOSSImageTransformer.from_pretrained(
                 override or base, subfolder=None if override else "transformer",
-                torch_dtype=weight_dtypes.transformer.torch_dtype(),
+                torch_dtype=storage_dtype,
             )
+        transformer = self._convert_diffusers_sub_module_to_dtype(
+            transformer, weight_dtypes.transformer, weight_dtypes.train_dtype, quantization,
+        )
         # Accelerate's direct tensor placement can bypass the upstream RoPE load
         # hook. Rebuild the derived frequencies in fp32 immediately after loading.
         transformer.rope.float()
         model.transformer = transformer
         model.tokenizer = Qwen2Tokenizer.from_pretrained(base, subfolder="tokenizer")
-        model.text_encoder = Qwen3_5Model.from_pretrained(
-            base, subfolder="text_encoder", dtype=weight_dtypes.text_encoder.torch_dtype(),
+        text_encoder = Qwen3_5Model.from_pretrained(
+            base, subfolder="text_encoder",
+            dtype=weight_dtypes.text_encoder.torch_dtype() or torch.bfloat16,
         ).eval()
+        # Native Transformers loading preserves Qwen3.5's derived buffers and
+        # checkpoint conversion. Reuse OneTrainer's quantizers after loading.
+        model.text_encoder = self._convert_transformers_sub_module_to_dtype(
+            text_encoder, weight_dtypes.text_encoder, weight_dtypes.fallback_train_dtype,
+        )
         model.vae = AutoencoderKLFlux2.from_pretrained(
             model_names.vae_model or base, subfolder=None if model_names.vae_model else "vae",
             torch_dtype=torch.float32,

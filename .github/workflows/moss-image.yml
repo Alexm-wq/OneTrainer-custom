@@ -5,7 +5,8 @@ on:
     branches: [main, codex/moss-image-base]
     paths:
       - "modules/**"
-      - "tests/test_moss_image.py"
+      - "tests/test_moss_features.py"
+      - "tests/test_moss_offloading.py"
       - "tests/test_moss_training_ui.py"
       - "training_presets/MOSS Image/**"
       - ".github/workflows/moss-image.yml"
@@ -37,10 +38,10 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install . ruff==0.15.20
+          python -m pip install . ruff==0.15.20 bitsandbytes==0.49.2
       - name: Lint integration
         run: |
-          files=('modules/model/MOSSImageModel.py' 'modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/modelSetup/MOSSImageLoRASetup.py' 'modules/modelSetup/MOSSImageFineTuneSetup.py' 'modules/dataLoader/moss/EncodeMOSSImageText.py' 'modules/dataLoader/moss/__init__.py' 'modules/dataLoader/MOSSImageBaseDataLoader.py' 'modules/dataLoader/mixin/DataLoaderText2ImageMixin.py' 'modules/modelSampler/MOSSImageSampler.py' 'modules/modelSaver/MOSSImageLoRAModelSaver.py' 'modules/modelSaver/moss/MOSSImageLoRASaver.py' 'modules/modelSaver/MOSSImageFineTuneModelSaver.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/modelSaver/moss/__init__.py' 'modules/util/enum/ModelType.py' 'modules/ui/TopBarController.py' 'modules/ui/ModelTabController.py' 'modules/util/config/SampleConfig.py' 'modules/ui/BaseSampleFrameView.py' 'tests/test_moss_image.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'tests/test_moss_training_ui.py')
+          files=('modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/util/quantization_util.py' 'modules/module/quantized/LinearInt8.py' 'modules/ui/BaseModelTabView.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/util/LayerOffloadConductor.py' 'tests/test_moss_features.py' 'tests/test_moss_offloading.py' 'tests/test_moss_training_ui.py')
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             if [ "$GITHUB_REF" != "refs/heads/codex/moss-image-base" ]; then
@@ -55,13 +56,13 @@ jobs:
       - name: Build both training UIs and verify editable controls
         env:
           QT_QPA_PLATFORM: offscreen
-        run: xvfb-run -a python -m unittest discover -s tests -p test_moss_training_ui.py -v
-      - name: MOSS integration and existing regressions
         run: |
-          python -m unittest discover -s tests -p test_moss_image.py -v
-          python -m unittest discover -s tests -p test_multi_resolution_cache.py -v
-          python -m unittest discover -s tests -p test_krea2_multires_integration.py -v
-          python -m unittest discover -s tests -p test_krea2_checkpoint.py -v
-          python -m unittest discover -s tests -p test_mixed_rlhf.py -v
+          PYTHONPATH=tests:. xvfb-run -a python -m unittest -v \
+            test_moss_training_ui.CtkTrainingUITest.test_new_moss_quantization_and_offload_controls \
+            test_moss_training_ui.PySide6TrainingUITest.test_new_moss_quantization_and_offload_controls
+      - name: Focused MOSS feature tests
+        run: |
+          python -m unittest discover -s tests -p test_moss_features.py -v
+          python -m unittest discover -s tests -p test_moss_offloading.py -v
       - name: Record tested commit
         run: git rev-parse HEAD

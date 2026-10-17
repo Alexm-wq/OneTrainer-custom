@@ -763,6 +763,10 @@ class LayerOffloadConductor:
             ):
                 self.__schedule_layer_to(i, self.__train_device, is_forward=self.__is_forward_pass)
 
+            # Skipped blocks (e.g. MOSS negative-branch guidance) can bypass
+            # the usual prefetch. Wait for a newly scheduled current layer too.
+            self.__wait_layer_transfer(layer_index)
+
         return activations
 
     def after_layer(self, layer_index: int, call_index: int, activations: Any):

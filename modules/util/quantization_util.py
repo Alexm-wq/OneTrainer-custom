@@ -18,11 +18,13 @@ from tqdm import tqdm
 
 try:
     from modules.module.quantized.LinearNf4 import LinearNf4
+    from modules.module.quantized.LinearInt8 import LinearInt8
 
     import bitsandbytes as bnb
 except ImportError:
     bnb = None
     LinearNf4 = None
+    LinearInt8 = None
 
 def quantize_int8(x: Tensor, scale: float | Tensor) -> Tensor:
     q = x.float().mul(1.0 / scale).round_().clamp_(-128.0, 127.0).to(torch.int8)
@@ -126,7 +128,8 @@ def __replace_linear_layers(
     if isinstance(parent_module, (nn.ModuleList, nn.Sequential, nn.ModuleDict)):
         for key, module in (parent_module.items() if isinstance(parent_module, nn.ModuleDict) else enumerate(parent_module)):
             if isinstance(module, convert_type):
-                if filters is not None and len(filters) > 0 and not any(f.matches(name_prefix) for f in filters):
+                key_name = f"{name_prefix}.{key}" if name_prefix else str(key)
+                if filters is not None and len(filters) > 0 and not any(f.matches(key_name) for f in filters):
                     continue
 
                 quant_linear = __create_linear_layer(construct_fn, module, copy_parameters)
@@ -178,7 +181,7 @@ def replace_linear_with_quantized_layers(
     if dtype.quantize_nf4():
         linear_class = LinearNf4
     elif dtype.quantize_int8():
-        linear_class = bnb.nn.Linear8bitLt
+        linear_class = LinearInt8
         kwargs = {'has_fp16_weights': False}
     elif dtype.quantize_fp8():
         linear_class = LinearFp8
@@ -279,6 +282,11 @@ def get_unquantized_weight(module: nn.Linear, dtype: torch.dtype, device: torch.
     assert isinstance(module, nn.Linear)
     if isinstance(module, QuantizedLinearMixin):
         return module.unquantized_weight(dtype, device)
+    elif bnb is not None and isinstance(module, bnb.nn.Linear8bitLt):
+        if module.weight.dtype == torch.int8:
+            scale = module.weight.SCB if module.weight.SCB is not None else module.state.SCB
+            return bnb.functional.int8_vectorwise_dequant(module.weight.to(device), scale.to(device)).to(dtype)
+        return module.weight.detach().to(device=device, dtype=dtype)
     elif isinstance(module, GGUFLinear):
         return dequantize_gguf_tensor(module.weight).to(dtype=dtype)
     else:
@@ -297,6 +305,10 @@ def get_offload_tensors(module: nn.Module) -> list[torch.Tensor]:
             tensors += [module.quant_state.absmax]
     if isinstance(module, nn.Linear | nn.Conv2d):
         tensors += [module.weight]
+    if bnb is not None and isinstance(module, bnb.nn.Linear8bitLt) and module.weight.dtype == torch.int8:
+        scale = module.weight.SCB if module.weight.SCB is not None else module.state.SCB
+        if scale is not None:
+            tensors.append(scale)
     if isinstance(module, nn.Linear) and module.bias is not None:
         tensors += [module.bias]
     if isinstance(module, BaseLinearSVD):
@@ -328,3 +340,12 @@ def offload_quantized(
             new_tensor = allocator(tensor)
             new_tensor.copy_(tensor.data, non_blocking=non_blocking)
             tensor.data = new_tensor
+
+    # INT8 matmul state must follow allocator-backed weight storage. Otherwise
+    # bnb.forward() restores an old CB pointer, undoing the conductor's move.
+    if bnb is not None and isinstance(module, bnb.nn.Linear8bitLt) and module.weight.dtype == torch.int8:
+        scale = module.weight.SCB if module.weight.SCB is not None else module.state.SCB
+        module.state.CB = module.weight.data
+        module.state.SCB = scale
+        module.weight.CB = None
+        module.weight.SCB = None

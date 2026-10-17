@@ -11,6 +11,10 @@ from pathlib import Path
 from modules.util import create  # noqa: F401
 
 # isort: split
+from modules.ui.CtkModelTabView import CtkModelTabView
+from modules.ui.PySide6ModelTabView import PySide6ModelTabView
+from modules.ui.ModelTabController import ModelTabController
+from modules.util.enum.DataType import DataType
 from modules.ui.CtkTrainingTabView import CtkTrainingTabView
 from modules.ui.PySide6TrainingTabView import PySide6TrainingTabView
 from modules.ui.TrainingTabController import TrainingTabController
@@ -40,19 +44,43 @@ class TrainingUIAssertions:
             "Transformer Learning Rate", "Gradient Checkpointing", "Text Encoder",
             "Text Encoder Sequence Length", "Caption Dropout Probability", "EMA",
             "Timestep Distribution", "Timestep Shift", "Masked Training", "MSE Strength",
-            "Loss Weight Function", "Layer Filter",
+            "Loss Weight Function", "Layer Filter", "Layer Offload Fraction", "Offload Activations",
         }
         self.assertTrue(required <= labels, f"Missing controls: {required - labels}")
         unsupported = {
             "Train Text Encoder", "Text Encoder Learning Rate", "Clip Skip",
-            "Layer Offload Fraction", "Offload Activations", "Force Attention Mask",
+            "Force Attention Mask",
             "Guidance Scale", "Dynamic Timestep Shifting",
         }
         self.assertFalse(unsupported & labels, f"Unsupported controls: {unsupported & labels}")
-        self.assertEqual(self.options("Train Data Type"), ["float32", "bfloat16"])
-        self.assertEqual(self.options("Attention"), ["torch SDPA"])
-        self.assertEqual(self.options("Layer Filter"), ["attn-mlp", "full", "custom"])
+        self.assertEqual(self.options("Train Data Type"), ["float32", "float16", "bfloat16", "tfloat32"])
+        self.assertEqual(self.options("Attention"), ["torch SDPA", "flash-attn", "torch cuDNN"])
+        self.assertEqual(self.options("Layer Filter"), ["attn-mlp", "attention", "mlp", "text-refiner", "full", "custom"])
         self.assertNotIn("Gamma", labels)  # Flow-matching loss controls.
+
+    def test_new_moss_quantization_and_offload_controls(self):
+        for path in sorted(PRESET_DIR.glob("*.json")):
+            self.config.from_dict(json.loads(path.read_text()))
+            self.state.update(self.config)
+            self.view.refresh_ui()
+            self.assert_moss_controls()
+            self.assertEqual(self.labels().count("Layer Offload Fraction"), 2)
+            old = self.config.transformer.activation_offloading
+            self.toggle("Offload Activations")
+            self.assertEqual(self.config.transformer.activation_offloading, not old)
+            self.assertEqual(self.config.vae.weight_dtype, DataType.FLOAT_32)
+            self.assertFalse(self.config.text_encoder.train)
+        view_cls = PySide6ModelTabView if isinstance(self.state, PySide6UIState) else CtkModelTabView
+        self.view = view_cls(self.parent, ModelTabController(self.config), self.state)
+        for label in ("Transformer Data Type", "Text Encoder Data Type"):
+            options = self.options(label)
+            for dtype in ("int8", "nfloat4", "float8 (W8)"):
+                self.assertIn(dtype, options)
+            self.assertNotIn("GGUF", options)
+        self.assertIn("int W8A8", self.options("Transformer Data Type"))
+        self.assertEqual(self.options("VAE Data Type"), ["float32"])
+        self.assertIn("Override Transformer", self.labels())
+        self.assertIn("Compile transformer blocks", self.labels())
 
     def test_moss_presets_build_controls_and_edit_real_config(self):
         for filename in ("#moss-image LoRA.json", "#moss-image Mixed DPO LoRA.json"):

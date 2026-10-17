@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright OpenMOSS Team. Vendored without behavioral changes from:
+# Copyright OpenMOSS Team. Adapted for OneTrainer quantization and block offloading from:
 # https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base/blob/1ceede80badddd6a7812069619edaa5633587192/pipeline_moss_image.py
-# See LICENSE in this directory. OneTrainer integration lives outside this file.
+# See LICENSE in this directory. Native checkpoint names and inference semantics are preserved.
 """MOSSImage modeling and text-to-image pipeline (no Motor/TorchTitan imports).
 
 Dependencies: torch>=2.9, diffusers>=0.38, transformers>=5.3, safetensors,
@@ -51,6 +51,7 @@ from diffusers.schedulers.scheduling_utils import SchedulerMixin  # Required by 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.attention_dispatch import dispatch_attention_fn
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.pipelines.pipeline_utils import ImagePipelineOutput
 from diffusers.utils.torch_utils import randn_tensor
@@ -86,18 +87,41 @@ def _rotate(x, rope):
     return x * cos + torch.cat((-b, a), -1) * sin
 
 
-def _attention(q, k, v, rope, heads):
-    shape = (*q.shape[:2], heads, q.shape[-1] // heads)
-    q = _rotate(q.reshape(shape), rope).transpose(1, 2)
-    k = _rotate(k.reshape(shape), rope).transpose(1, 2)
-    v = v.reshape(shape).transpose(1, 2)
-    return F.scaled_dot_product_attention(q.to(v.dtype), k.to(v.dtype), v).transpose(1, 2).flatten(2)
+def _linear_input(x, layer):
+    # Storage precision is not compute precision for INT8/NF4/FP8/SVDQuant.
+    dtype = getattr(layer, "compute_dtype", None)
+    if dtype is None:
+        weight_dtype = layer.weight.dtype
+        dtype = weight_dtype if weight_dtype in (
+            torch.float32, torch.float16, torch.bfloat16, torch.float64,
+        ) else x.dtype
+    return x.to(dtype)
 
+
+def _attention(q, k, v, rope, heads, lengths=None, backend="native"):
+    shape = (*q.shape[:2], heads, q.shape[-1] // heads)
+    q = _rotate(q.reshape(shape), rope).to(v.dtype)
+    k = _rotate(k.reshape(shape), rope).to(v.dtype)
+    v = v.reshape(shape)
+    if lengths is None:
+        return dispatch_attention_fn(q, k, v, backend=backend).flatten(2)
+    # Dispatch unpadded attention for each row. Flash/cuDNN therefore need no
+    # padding mask, while the surrounding block still executes once per batch
+    # for checkpointing, compilation and the layer-offload conductor.
+    rows = []
+    for index, length in enumerate(lengths):
+        out = dispatch_attention_fn(
+            q[index:index + 1, :length], k[index:index + 1, :length],
+            v[index:index + 1, :length], backend=backend,
+        ).flatten(2)
+        rows.append(F.pad(out, (0, 0, 0, shape[1] - length)))
+    return torch.cat(rows)
 
 class _TextBlock(nn.Module):
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
         self.heads = heads
+        self.attention_backend = "native"
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
         self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
         self.qkv = nn.Linear(dim, 3 * dim)
@@ -105,13 +129,15 @@ class _TextBlock(nn.Module):
         self.ffn_gate, self.ffn_up = nn.Linear(dim, ffn_dim), nn.Linear(dim, ffn_dim)
         self.ffn_down = nn.Linear(ffn_dim, dim)
 
-    def forward(self, x, rope):
-        q, k, v = self.qkv(self.norm1(x)).chunk(3, -1)
+    def forward(self, x, rope, lengths=None):
+        q, k, v = self.qkv(_linear_input(self.norm1(x), self.qkv)).chunk(3, -1)
         q = self.q_norm(q.unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(k.unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj(_attention(q, k, v, rope, self.heads))
+        attention = _attention(q, k, v, rope, self.heads, lengths, self.attention_backend)
+        x = x + self.proj(_linear_input(attention, self.proj))
         y = self.norm2(x)
-        return x + self.ffn_down(_situ(self.ffn_up(y), self.ffn_gate(y)))
+        hidden = _situ(self.ffn_up(_linear_input(y, self.ffn_up)), self.ffn_gate(_linear_input(y, self.ffn_gate)))
+        return x + self.ffn_down(_linear_input(hidden, self.ffn_down))
 
 
 class _TextProjection(nn.Module):
@@ -120,10 +146,10 @@ class _TextProjection(nn.Module):
         self.proj = nn.Linear(text_dim, dim)
         self.blocks = nn.ModuleList([_TextBlock(dim, ffn_dim, heads) for _ in range(2)])
 
-    def forward(self, x, rope):
-        x = self.proj(x.to(self.proj.weight.dtype))
+    def forward(self, x, rope, lengths=None):
+        x = self.proj(_linear_input(x, self.proj))
         for block in self.blocks:
-            x = block(x, rope)
+            x = block(x, rope, lengths)
         return x
 
 
@@ -131,6 +157,7 @@ class _Block(nn.Module):
     def __init__(self, dim, ffn_dim, heads):
         super().__init__()
         self.heads = heads
+        self.attention_backend = "native"
         self.norm1, self.norm2 = _RMSNorm(dim), _RMSNorm(dim)
         self.q_norm, self.k_norm = _RMSNorm(dim // heads), _RMSNorm(dim // heads)
         self.proj = nn.ModuleDict({
@@ -139,17 +166,17 @@ class _Block(nn.Module):
         self.proj['ffn_up_gate'] = nn.Linear(dim, 2 * ffn_dim, bias=False)
         self.proj['ffn_down'] = nn.Linear(ffn_dim, dim, bias=False)
 
-    def forward(self, x, rope, modulation):
+    def forward(self, x, rope, modulation, lengths=None):
         shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
         y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
-        dtype = self.proj['q'].weight.dtype
-        y = y.to(dtype)
-        q = self.q_norm(self.proj['q'](y).unflatten(-1, (self.heads, -1))).flatten(2)
-        k = self.k_norm(self.proj['k'](y).unflatten(-1, (self.heads, -1))).flatten(2)
-        x = x + self.proj['o'](_attention(q, k, self.proj['v'](y), rope, self.heads)) * gate_a[:, None]
+        q = self.q_norm(self.proj['q'](_linear_input(y, self.proj['q'])).unflatten(-1, (self.heads, -1))).flatten(2)
+        k = self.k_norm(self.proj['k'](_linear_input(y, self.proj['k'])).unflatten(-1, (self.heads, -1))).flatten(2)
+        v = self.proj['v'](_linear_input(y, self.proj['v']))
+        attention = _attention(q, k, v, rope, self.heads, lengths, self.attention_backend)
+        x = x + self.proj['o'](_linear_input(attention, self.proj['o'])) * gate_a[:, None]
         y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
-        hidden, gate = self.proj['ffn_up_gate'](y.to(dtype)).chunk(2, -1)
-        return x + self.proj['ffn_down'](_situ(hidden, gate)) * gate_f[:, None]
+        hidden, gate = self.proj['ffn_up_gate'](_linear_input(y, self.proj['ffn_up_gate'])).chunk(2, -1)
+        return x + self.proj['ffn_down'](_linear_input(_situ(hidden, gate), self.proj['ffn_down'])) * gate_f[:, None]
 
 
 class _RoPE(nn.Module):
@@ -193,8 +220,8 @@ class _RoPE(nn.Module):
 class MOSSImageTransformer(ModelMixin, ConfigMixin):
     """MOSSImage DiT with training-compatible state-dict names and SDPA attention.
 
-    Each sample is evaluated at its true text length, including text refinement;
-    padded tokens cannot influence either text or joint attention.
+    Attention uses each row's true text length, including text refinement.
+    Each block executes once per batch, preserving layer-offloading order.
     """
     @register_to_config
     def __init__(self, dim=3072, ffn_dim=8192, num_heads=24, num_layers=42,
@@ -211,6 +238,13 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         self.final_norm_video = _RMSNorm(dim)
         self.final_linear_video = nn.Linear(dim, latent_channels, bias=False)
         self.video_head_modulation = nn.Linear(dim, 2 * dim)
+
+    def set_attention_backend(self, backend):
+        if backend not in ("native", "flash", "_native_cudnn"):
+            raise ValueError(f"Unsupported MOSS attention backend: {backend}")
+        for module in self.modules():
+            if isinstance(module, (_TextBlock, _Block)):
+                module.attention_backend = backend
 
     def load_training_state_dict(self, state_dict, *, prefix=''):
         """Load a consolidated raw/EMA model mapping, strictly; no silent key drops."""
@@ -240,28 +274,33 @@ class MOSSImageTransformer(ModelMixin, ConfigMixin):
         freq = 10000 ** (-torch.arange(half, device=times.device, dtype=torch.float64) / half)
         phase = times.double()[:, None] * freq
         embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
-        time = self.time_embedding(embedding.to(self.time_embedding[0].weight.dtype)).float()
-        mod = self.shared_block_modulation(time.to(self.shared_block_modulation.weight.dtype)).view(batch, 6, -1)
-        head = self.video_head_modulation(time.to(self.video_head_modulation.weight.dtype)).view(batch, 2, -1)
-        outputs = []
-        for index in range(batch):
-            context = encoder_hidden_states[index:index + 1, mask[index].bool()]
-            if context.shape[1] == 0:
-                raise ValueError('Each sample needs at least one valid text token.')
-            video = hidden_states[index:index + 1].flatten(2).transpose(1, 2)
-            video = self.video_embedder(video.to(self.video_embedder.weight.dtype).contiguous())
-            # Match the reference activation dtype under fp32 weights + autocast.
-            rope = self.rope(height, width, context.shape[1], hidden_states.device).to(video.dtype)
-            text = self.text_embedder(context, rope[:, height * width:])
-            x = torch.cat((video, text), 1)
-            for layer_index, layer in enumerate(self.layers):
-                if layer_index not in skip_layers:
-                    x = layer(x, rope, mod[index:index + 1])
-            x = self.final_norm_video(x[:, :height * width].to(self.final_norm_video.weight.dtype))
-            x = x * (1 + head[index:index + 1, 1, None]) + head[index:index + 1, 0, None]
-            x = self.final_linear_video(x.to(self.final_linear_video.weight.dtype))
-            outputs.append(x.transpose(1, 2).reshape(1, -1, height, width))
-        sample = torch.cat(outputs)
+        time = self.time_embedding(_linear_input(embedding, self.time_embedding[0])).float()
+        mod = self.shared_block_modulation(_linear_input(time, self.shared_block_modulation)).view(batch, 6, -1)
+        head = self.video_head_modulation(_linear_input(time, self.video_head_modulation)).view(batch, 2, -1)
+        lengths = tuple(mask.bool().sum(1).tolist())
+        if any(length == 0 for length in lengths):
+            raise ValueError('Each sample needs at least one valid text token.')
+        text_length = max(lengths)
+        context = torch.stack([
+            F.pad(row[valid.bool()], (0, 0, 0, text_length - length))
+            for row, valid, length in zip(encoder_hidden_states, mask, lengths, strict=True)
+        ])
+        video = hidden_states.flatten(2).transpose(1, 2)
+        video = self.video_embedder(_linear_input(video, self.video_embedder).contiguous())
+        rope = torch.cat([
+            F.pad(self.rope(height, width, length, hidden_states.device), (0, 0, 0, text_length - length))
+            for length in lengths
+        ]).to(video.dtype)
+        text = self.text_embedder(context, rope[:, height * width:], lengths)
+        x = torch.cat((video, text), 1)
+        joint_lengths = tuple(height * width + length for length in lengths)
+        for layer_index, layer in enumerate(self.layers):
+            if layer_index not in skip_layers:
+                x = layer(x, rope, mod, joint_lengths)
+        x = self.final_norm_video(x[:, :height * width].to(self.final_norm_video.weight.dtype))
+        x = x * (1 + head[:, 1, None]) + head[:, 0, None]
+        x = self.final_linear_video(_linear_input(x, self.final_linear_video))
+        sample = x.transpose(1, 2).reshape(batch, -1, height, width)
         return Transformer2DModelOutput(sample=sample) if return_dict else (sample,)
 
 

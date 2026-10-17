@@ -53,7 +53,7 @@ class BaseModelTabView(ABC):
             ui_state,
         )
 
-    def __create_dtype_options(self, include_gguf: bool = False, include_a8: bool = False) -> list[tuple[str, DataType]]:
+    def __create_dtype_options(self, include_gguf: bool = False, include_a8: bool = False, include_int8: bool = False) -> list[tuple[str, DataType]]:
         options = [
             ("float32", DataType.FLOAT_32),
             ("bfloat16", DataType.BFLOAT_16),
@@ -62,6 +62,8 @@ class BaseModelTabView(ABC):
             # ("int8", DataType.INT_8),  # TODO: reactivate when the int8 implementation is fixed in bitsandbytes: https://github.com/bitsandbytes-foundation/bitsandbytes/issues/1332
             ("nfloat4", DataType.NFLOAT_4),
         ]
+        if include_int8:
+            options.insert(4, ("int8", DataType.INT_8))
         if include_a8:
             options += [
                 ("float W8A8", DataType.FLOAT_W8A8),
@@ -127,6 +129,7 @@ class BaseModelTabView(ABC):
             has_text_encoder_4: bool = False,
             has_vae: bool = False,
     ) -> int:
+        is_moss = controller.train_config.model_type.is_moss_image()
         if has_unet:
             # unet weight dtype
             self.components.label(frame, row, 3, "UNet Data Type",
@@ -163,10 +166,14 @@ class BaseModelTabView(ABC):
                     "Keep a Krea 2 Diffusers repository or directory in Base Model for the text encoder, "
                     "tokenizer, VAE and scheduler. Use unquantized weights; OneTrainer can quantize them when loading."
                 ) if is_krea2 else (
+                    "Native MOSS transformer safetensors (local file or Hugging Face URL), or a model directory. "
+                    "Keep the MOSS repository in Base Model for its other components. "
+                    "OneTrainer quantizes floating-point checkpoints while loading."
+                ) if is_moss else (
                     "Can be used to override the transformer in the base model. Safetensors and GGUF files are supported, "
                     "local and on Huggingface. If a GGUF file is used, the DataType must also be set to GGUF"
                 )
-                self.components.label(frame, row, 0, "Override Transformer" if is_krea2 else "Override Transformer / GGUF",
+                self.components.label(frame, row, 0, "Override Transformer" if is_krea2 or is_moss else "Override Transformer / GGUF",
                                       tooltip=override_tooltip)
                 self.components.path_entry(
                     frame, row, 1, ui_state, "transformer.model_name",
@@ -176,7 +183,7 @@ class BaseModelTabView(ABC):
             # transformer weight dtype
             self.components.label(frame, row, 3, "Transformer Data Type",
                              tooltip="The transformer weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=not is_krea2, include_a8=True),
+            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=not (is_krea2 or is_moss), include_a8=True, include_int8=is_moss),
                                   ui_state, "transformer.weight_dtype")
 
             row += 1
@@ -219,7 +226,7 @@ class BaseModelTabView(ABC):
             # text encoder weight dtype
             self.components.label(frame, row, 3, "Text Encoder Data Type",
                              tooltip="The text encoder weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(),
+            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_int8=is_moss),
                                   ui_state, "text_encoder.weight_dtype")
 
             row += 1
@@ -281,7 +288,7 @@ class BaseModelTabView(ABC):
             # vae weight dtype
             self.components.label(frame, row, 3, "VAE Data Type",
                              tooltip="The vae weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(),
+            self.components.options_kv(frame, row, 4, ([("float32", DataType.FLOAT_32)] if is_moss else self.__create_dtype_options()),
                                   ui_state, "vae.weight_dtype")
 
             row += 1

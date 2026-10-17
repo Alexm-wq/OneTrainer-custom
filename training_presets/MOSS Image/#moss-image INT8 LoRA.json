@@ -1,0 +1,48 @@
+{
+    "__version": 12,
+    "base_model_name": "OpenMOSS-Team/MOSS-Image-Base",
+    "model_type": "MOSS_IMAGE",
+    "training_method": "LORA",
+    "batch_size": 1,
+    "gradient_accumulation_steps": 4,
+    "resolution": "1024",
+    "learning_rate": 0.00005,
+    "train_dtype": "BFLOAT_16",
+    "output_dtype": "BFLOAT_16",
+    "output_model_format": "COMFY_LORA",
+    "attention_mechanism": "SDP",
+    "compile": false,
+    "transformer": {
+        "train": true,
+        "weight_dtype": "INT_8",
+        "gradient_checkpointing": true,
+        "offload_fraction": 0,
+        "activation_offloading": false
+    },
+    "text_encoder": {
+        "train": false,
+        "weight_dtype": "INT_8",
+        "offload_fraction": 0,
+        "activation_offloading": false,
+        "dropout_probability": 0
+    },
+    "vae": {
+        "weight_dtype": "FLOAT_32"
+    },
+    "image_caching": true,
+    "text_caching": true,
+    "text_encoder_sequence_length": 512,
+    "layer_filter": "layers.",
+    "layer_filter_preset": "attn-mlp",
+    "lora_rank": 32,
+    "lora_alpha": 32,
+    "dropout_probability": 0,
+    "timestep_distribution": "LOGIT_NORMAL",
+    "timestep_shift": 1,
+    "dynamic_timestep_shifting": false,
+    "quantization": {
+        "layer_filter": "layers.",
+        "layer_filter_preset": "attn-mlp",
+        "layer_filter_regex": false
+    }
+}

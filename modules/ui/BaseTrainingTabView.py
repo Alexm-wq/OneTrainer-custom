@@ -205,13 +205,13 @@ class BaseTrainingTabView(ABC):
         self.__create_base_frame(column_0, 0, controller, ui_state)
         self.__create_text_encoder_frame(
             column_0, 1, ui_state, supports_clip_skip=False, supports_training=False,
-            supports_sequence_length=True, supports_layer_offloading=False,
+            supports_sequence_length=True, supports_layer_offloading=True,
         )
 
         self.__create_base2_frame(column_1, 0, controller, ui_state)
         self.__create_transformer_frame(
             column_1, 1, ui_state, supports_force_attention_mask=False,
-            supports_layer_offloading=False, supports_activation_offloading=False,
+            supports_layer_offloading=True, supports_activation_offloading=True,
         )
         self.__create_noise_frame(column_1, 2, ui_state)
 

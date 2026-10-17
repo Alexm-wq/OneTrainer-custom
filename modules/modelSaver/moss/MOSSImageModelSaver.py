@@ -6,12 +6,16 @@ from pathlib import Path
 from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelSaver.mixin.DtypeModelSaverMixin import DtypeModelSaverMixin
 from modules.module.moss import pipeline_moss_image
+from modules.module.quantized.LinearA8 import LinearA8
+from modules.module.quantized.mixin.QuantizedLinearMixin import QuantizedLinearMixin
+from modules.util.quantization_util import get_unquantized_weight
 from modules.util.convert_util import convert
 from modules.util.enum.ModelFormat import ModelFormat
 
 import torch
 
 from safetensors.torch import save_file
+from transformers import Qwen3_5Model
 
 
 class MOSSImageModelSaver(
@@ -20,26 +24,46 @@ class MOSSImageModelSaver(
     def __init__(self):
         super().__init__()
 
+    @staticmethod
+    def _plain_state_dict(module, dtype=None):
+        """Portable floating weights, including quantized frozen text encoders."""
+        state = module.state_dict()
+        for name, layer in module.named_modules():
+            if isinstance(layer, (QuantizedLinearMixin, LinearA8)):
+                prefix = name.replace(".checkpoint.", ".") + "."
+                for key in [key for key in state if key.startswith(prefix)]:
+                    del state[key]
+                compute_dtype = dtype or getattr(layer, "compute_dtype", None) or torch.float32
+                state[prefix + "weight"] = get_unquantized_weight(layer, compute_dtype, torch.device("cpu"))
+                if layer.bias is not None:
+                    state[prefix + "bias"] = layer.bias.detach()
+        return {
+            key: value.detach().to(device="cpu", dtype=dtype if value.is_floating_point() else None).contiguous()
+            for key, value in state.items()
+        }
+
     def __save_diffusers(
             self,
             model: MOSSImageModel,
             destination: str,
             dtype: torch.dtype | None,
     ):
-        # Copy the model to cpu by first moving the original model to cpu. This preserves some VRAM.
-        pipeline = model.create_pipeline()
-        pipeline.to("cpu")
-        save_pipeline = self._copy_pipeline_to_dtype(pipeline, dtype, pipeline.tokenizer)
+        # Let conductors release their device allocations before exporting.
+        model.to(torch.device("cpu"))
+        with torch.device("meta"):
+            transformer = pipeline_moss_image.MOSSImageTransformer.from_config(model.transformer.config)
+            text_encoder = Qwen3_5Model(model.text_encoder.config)
+        transformer.load_state_dict(self._plain_state_dict(model.transformer, dtype), strict=True, assign=True)
+        text_encoder.load_state_dict(self._plain_state_dict(model.text_encoder, dtype), strict=True, assign=True)
 
         os.makedirs(Path(destination).absolute(), exist_ok=True)
         # Preserve the original fp32 VAE instead of rounding its weights to output_dtype.
-        save_pipeline.vae = model.vae
         # Save explicit components: Diffusers' library discovery does not know
         # OneTrainer's nested custom module package.
-        save_pipeline.transformer.save_pretrained(os.path.join(destination, "transformer"))
-        save_pipeline.scheduler.save_pretrained(os.path.join(destination, "scheduler"))
-        save_pipeline.text_encoder.save_pretrained(os.path.join(destination, "text_encoder"))
-        save_pipeline.tokenizer.save_pretrained(os.path.join(destination, "tokenizer"))
+        transformer.save_pretrained(os.path.join(destination, "transformer"))
+        model.noise_scheduler.save_pretrained(os.path.join(destination, "scheduler"))
+        text_encoder.save_pretrained(os.path.join(destination, "text_encoder"))
+        model.tokenizer.save_pretrained(os.path.join(destination, "tokenizer"))
         model.vae.save_pretrained(os.path.join(destination, "vae"))
         shutil.copyfile(pipeline_moss_image.__file__, os.path.join(destination, "pipeline_moss_image.py"))
         shutil.copyfile(
@@ -60,8 +84,6 @@ class MOSSImageModelSaver(
             json.dump(index, handle, indent=2)
             handle.write("\n")
 
-        if dtype is not None:
-            del save_pipeline
 
     def __save_safetensors(
             self,
@@ -69,7 +91,8 @@ class MOSSImageModelSaver(
             destination: str,
             dtype: torch.dtype | None,
     ):
-        state_dict = model.transformer.state_dict()
+        model.transformer_to(torch.device("cpu"))
+        state_dict = self._plain_state_dict(model.transformer, dtype)
         state_dict = convert(state_dict, model.checkpoint_diffusers_to_original())
 
         save_state_dict = self._convert_state_dict_dtype(state_dict, dtype)
