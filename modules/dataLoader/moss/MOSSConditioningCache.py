@@ -15,6 +15,8 @@ from mgds.pipelineModuleTypes.SingleVariationRandomAccessPipelineModule import S
 
 import torch
 
+from tqdm import tqdm
+
 
 class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineModule):
     NAMES = ["prompt", "tokens", "tokens_mask", "text_encoder_hidden_state"]
@@ -82,24 +84,32 @@ class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineM
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         prepared, seen, misses = False, set(), 0
-        for index in range(self._get_previous_length("prompt")):
-            prompt = self._get_previous_item(variation, "prompt", index)
-            key = self._key(prompt)
-            path = self.cache_dir / (key + ".pt")
-            self.entries.append((prompt, path))
-            if key in seen:
-                continue
-            seen.add(key)
-            if self._load(path) is None:
-                if not prepared:
-                    self.before_cache()
-                    prepared = True
-                self._save(path, self._encode(prompt))
-                misses += 1
-        # Empty conditioning is process-local and must exist even on a cache hit.
-        if (not prepared and self.entries and self.prepare_empty
-                and self.max_length not in self.model.empty_text):
-            self.before_cache()
+        total = self._get_previous_length("prompt")
+        with tqdm(total=total, smoothing=0.1, desc="caching MOSS text", unit="prompt") as progress:
+            for index in range(total):
+                prompt = self._get_previous_item(variation, "prompt", index)
+                key = self._key(prompt)
+                path = self.cache_dir / (key + ".pt")
+                self.entries.append((prompt, path))
+                if key not in seen:
+                    seen.add(key)
+                    if self._load(path) is None:
+                        if not prepared:
+                            progress.set_postfix(stage="preparing encoder", encoded=misses,
+                                                 reused=len(seen) - misses - 1)
+                            self.before_cache()
+                            prepared = True
+                        progress.set_postfix(stage="encoding", encoded=misses,
+                                             reused=len(seen) - misses - 1)
+                        self._save(path, self._encode(prompt))
+                        misses += 1
+                progress.set_postfix(encoded=misses, reused=len(seen) - misses, refresh=False)
+                progress.update(1)
+            # Empty conditioning is process-local and must exist even on a cache hit.
+            if (not prepared and self.entries and self.prepare_empty
+                    and self.max_length not in self.model.empty_text):
+                progress.set_postfix(stage="empty conditioning", encoded=misses, reused=len(seen) - misses)
+                self.before_cache()
         self.initialized = True
         print(f"[OT-MOSS-TEXT-CACHE] rows={len(self.entries)}, unique={len(seen)}, "
               f"encoded={misses}, reused={len(seen) - misses}")
