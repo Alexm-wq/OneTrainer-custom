@@ -6,13 +6,16 @@ import torch
 import bitsandbytes as bnb
 
 
-class LinearInt8(bnb.nn.Linear8bitLt, QuantizedLinearMixin, QuantizedModuleMixin):
+class LinearInt8(bnb.nn.Linear8bitLt, QuantizedModuleMixin, QuantizedLinearMixin):
     """Keep bitsandbytes' INT8 statistics attached during recursive model moves.
 
     nn.Module.to() recursively invokes _apply(), not child.to(). The bnb
     Linear8bitLt.to() override alone therefore cannot move its MatmulLtState
     when OneTrainer moves an entire transformer or text encoder.
     """
+
+    def __init__(self, in_features, out_features, bias=True, **kwargs):
+        super().__init__(in_features, out_features, bias=bias, **kwargs)
 
     @torch.no_grad()
     def quantize(self, device=None):

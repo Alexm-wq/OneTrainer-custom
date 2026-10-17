@@ -188,7 +188,7 @@ class MOSSFeaturesTest(unittest.TestCase):
                 dtypes = ModelWeightDtypes.from_single_dtype(DataType.FLOAT_32)
                 dtypes.transformer = DataType.INT_8
                 MOSSImageModelLoader().load(
-                    loaded, ModelType.MOSS_IMAGE, ModelNames(base_model=root, transformer=url), dtypes,
+                    loaded, ModelType.MOSS_IMAGE, ModelNames(base_model=root, transformer_model=url), dtypes,
                     QuantizationConfig.default_values(),
                 )
                 self.assertEqual(download.call_args.args[0], url)
@@ -251,6 +251,7 @@ class MOSSFeaturesTest(unittest.TestCase):
                 self.setUp()
                 self.config.peft_type = peft
                 self.config.lora_decompose = decompose
+                self.config.dora_oft = decompose
                 self.config.lokr_weight_decompose = decompose
                 self.config.oft_block_size = 8
                 self.convert(self.model.transformer, DataType.INT_8)
