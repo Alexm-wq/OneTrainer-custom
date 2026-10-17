@@ -7,6 +7,10 @@ import json
 import unittest
 from pathlib import Path
 
+# Initialize the model factories before optimizer dialogs, as the full UI does.
+from modules.util import create  # noqa: F401
+
+# isort: split
 from modules.ui.CtkTrainingTabView import CtkTrainingTabView
 from modules.ui.PySide6TrainingTabView import PySide6TrainingTabView
 from modules.ui.TrainingTabController import TrainingTabController
