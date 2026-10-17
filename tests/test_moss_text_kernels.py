@@ -6,6 +6,7 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
+from modules.module.quantized.LinearFp8 import LinearFp8
 from modules.module.moss.text_encoder_kernels import (
     _GatedRMSNorm,
     _load_fla,
@@ -34,7 +35,32 @@ def make_block(device="cpu", dtype=torch.float32, head_dim=16):
     return Qwen3_5GatedDeltaNet(config, 0).to(device=device, dtype=dtype).eval()
 
 
+def quantize_projections(block):
+    for name, module in list(block.named_children()):
+        if isinstance(module, torch.nn.Linear):
+            quantized = LinearFp8(
+                module.in_features, module.out_features, bias=module.bias is not None,
+                device=module.weight.device, dtype=module.weight.dtype,
+            ).requires_grad_(False)
+            quantized.load_state_dict(module.state_dict(), strict=False)
+            quantized.quantize()
+            setattr(block, name, quantized)
+
+
 class MOSSKernelTest(unittest.TestCase):
+    def test_real_fp8_projection_keeps_bf16_compute_for_kernel_dispatch(self):
+        block = make_block(dtype=torch.bfloat16).requires_grad_(False)
+        quantize_projections(block)
+        configure_moss_text_kernels(block)
+        self.assertEqual(block.in_proj_qkv.weight.dtype, torch.float8_e4m3fn)
+        kernels = block.norm.kernels
+        with patch.object(kernels, "operations", wraps=kernels.operations) as select, torch.no_grad():
+            output = block(torch.randn(1, 7, 64, dtype=torch.bfloat16))
+        self.assertEqual(output.dtype, torch.bfloat16)
+        self.assertTrue(torch.isfinite(output).all())
+        self.assertTrue(select.call_args_list)
+        self.assertTrue(all(call.args[0].dtype == torch.bfloat16 for call in select.call_args_list))
+
     def test_real_fla_package_exports_expected_api(self):
         # Import the installed, pinned package; do not substitute dummy kernels.
         conv, chunk, norm = _load_fla()
@@ -156,17 +182,22 @@ class MOSSKernelTest(unittest.TestCase):
 class MOSSCUDAKernelTest(unittest.TestCase):
     def test_fla_prefill_matches_reference_with_real_qwen_head_dimensions(self):
         # This test must actually execute all three FLA kernels, not mocks.
-        for dtype in (torch.bfloat16, torch.float16):
+        for dtype, fp8 in (
+            (torch.bfloat16, False), (torch.float16, False), (torch.bfloat16, True),
+        ):
             torch.manual_seed(42)
             reference = make_block("cuda", dtype, head_dim=128)
             target = make_block("cuda", dtype, head_dim=128)
             target.load_state_dict(reference.state_dict())
+            if fp8:
+                quantize_projections(reference)
+                quantize_projections(target)
             with patch.dict(os.environ, {"OT_MOSS_TEXT_KERNELS": "0"}):
                 configure_moss_text_kernels(reference)
             with patch.dict(os.environ, {"OT_MOSS_TEXT_KERNELS": "1"}):
                 configure_moss_text_kernels(target)
             for length in (1, 7, 65, 257):
-                with self.subTest(dtype=dtype, length=length), torch.no_grad():
+                with self.subTest(dtype=dtype, fp8=fp8, length=length), torch.no_grad():
                     x = torch.randn(1, length, 64, device="cuda", dtype=dtype)
                     self.assertIsNotNone(target.norm.kernels.operations(x))
                     expected, actual = reference(x), target(x)

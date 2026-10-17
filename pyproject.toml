@@ -174,11 +174,19 @@ platforms = ["linux-cuda13", "win-cuda13"]
 [tool.pixi.feature.cuda13.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu130"]
 
+# Use one source for the identical NCCL wheel shared by CUDA environments.
+# Otherwise Pixi can lock it to cu130 and reject the cuda12 environment.
+[tool.pixi.feature.cuda13.target.linux-64.pypi-dependencies]
+nvidia-nccl-cu13 = { version = "==2.29.7", index = "https://pypi.org/simple" }
+
 [tool.pixi.feature.cuda12]
 platforms = ["linux-cuda12", "win-cuda12"]
 
 [tool.pixi.feature.cuda12.pypi-options]
 extra-index-urls = ["https://download.pytorch.org/whl/cu126"]
+
+[tool.pixi.feature.cuda12.target.linux-64.pypi-dependencies]
+nvidia-nccl-cu13 = { version = "==2.29.7", index = "https://pypi.org/simple" }
 
 [tool.pixi.feature.rocm]
 platforms = ["linux-generic"]
