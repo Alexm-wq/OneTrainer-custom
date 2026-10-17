@@ -29,6 +29,10 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: pyproject.toml
+      - name: Install headless GUI runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libegl1 libopengl0 libxkbcommon0 xvfb xauth
       - name: Install CPU dependencies
         run: |
           python -m pip install --upgrade pip
@@ -48,6 +52,10 @@ jobs:
             git commit -m "Normalize MOSS integration imports and lint"
             git push origin HEAD:codex/moss-image-base
           fi
+      - name: Build both training UIs and verify editable controls
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: xvfb-run -a python -m unittest discover -s tests -p test_moss_training_ui.py -v
       - name: MOSS integration and existing regressions
         run: |
           python -m unittest discover -s tests -p test_moss_image.py -v
@@ -55,9 +63,5 @@ jobs:
           python -m unittest discover -s tests -p test_krea2_multires_integration.py -v
           python -m unittest discover -s tests -p test_krea2_checkpoint.py -v
           python -m unittest discover -s tests -p test_mixed_rlhf.py -v
-      - name: Build both training UIs and verify editable controls
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: xvfb-run -a python -m unittest discover -s tests -p test_moss_training_ui.py -v
       - name: Record tested commit
         run: git rev-parse HEAD
