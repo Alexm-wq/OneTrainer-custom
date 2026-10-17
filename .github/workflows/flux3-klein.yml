@@ -51,3 +51,5 @@ jobs:
           PYTHONPATH=tests:. xvfb-run -a python -m unittest -v test_flux3_ui
       - name: Tested commit
         run: git rev-parse HEAD
+
+# Focused integration validation; no pretrained weights.
