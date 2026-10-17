@@ -94,8 +94,10 @@ class MOSSKernelTest(unittest.TestCase):
     def test_delta_rule_preserves_gates_normalization_and_state_options(self):
         kernels = _TextKernels()
         q, k, v = [torch.randn(1, 7, 2, 16) for _ in range(3)]
-        kwargs = dict(g=-torch.rand(1, 7, 2), beta=torch.rand(1, 7, 2),
-                      initial_state=None, output_final_state=False, use_qk_l2norm_in_kernel=True)
+        kwargs = {
+            "g": -torch.rand(1, 7, 2), "beta": torch.rand(1, 7, 2),
+            "initial_state": None, "output_final_state": False, "use_qk_l2norm_in_kernel": True,
+        }
         backend = Mock(wraps=torch_chunk_gated_delta_rule)
         with patch.object(kernels, "operations", return_value=(None, backend, None)):
             actual, state = kernels.chunk(q, k, v, **kwargs)
@@ -143,9 +145,11 @@ class MOSSKernelTest(unittest.TestCase):
         kernels = _TextKernels()
         backend = Mock(side_effect=RuntimeError("kernel compilation failed"))
         q = torch.zeros(1, 7, 2, 16)
-        with patch.object(kernels, "operations", return_value=(None, backend, None)):
-            with self.assertRaisesRegex(RuntimeError, "kernel compilation failed"):
-                kernels.chunk(q, q, q)
+        with (
+            patch.object(kernels, "operations", return_value=(None, backend, None)),
+            self.assertRaisesRegex(RuntimeError, "kernel compilation failed"),
+        ):
+            kernels.chunk(q, q, q)
 
 
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip is None, "requires a real NVIDIA CUDA GPU")
