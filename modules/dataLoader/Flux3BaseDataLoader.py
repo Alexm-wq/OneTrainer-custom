@@ -57,6 +57,7 @@ class Flux3BaseDataLoader(
             "version": 1, "conditioning": "qwen3-vl-layers4:4:32-pad80-position1", "base": config.base_model_name, "vae": config.vae.model_name,
             "text_dtype": str(config.text_encoder.weight_dtype),
             "sequence_length": config.text_encoder_sequence_length or 4096,
+            "compute_dtype": str(config.fallback_train_dtype), "quantization": config.quantization.to_dict(),
         }
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
         config.cache_dir = os.path.join(config.cache_dir, "flux3-" + key)

@@ -52,4 +52,4 @@ jobs:
       - name: Tested commit
         run: git rev-parse HEAD
 
-# Focused integration validation; no pretrained weights.
+# Focused integration validation with compatible Hub dependency; no model weights.

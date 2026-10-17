@@ -163,19 +163,32 @@ class Flux3Model(Flux2Model):
         # One shared-length batch remains a single forward. Different windows cannot
         # be padded together: Flux3 attention intentionally has no text padding mask.
         groups = [list(range(len(lengths)))] if len(set(lengths)) == 1 else [[i] for i in range(len(lengths))]
+        def forward(dummy, inputs, context, times, image_ids, text_ids, target, cond, cond_ids):
+            return self.transformer(
+                hidden_states=inputs, timestep=times, encoder_hidden_states=context,
+                img_ids=image_ids, txt_ids=text_ids, target_timestep=target,
+                image_cond_hidden_states=cond, image_cond_ids=cond_ids,
+            ).sample
+
         for indices in groups:
             length = lengths[indices[0]]
-            kwargs = {}
-            if target_timestep is not None:
-                kwargs["target_timestep"] = target_timestep.expand(len(lengths))[indices]
-            if reference is not None:
-                kwargs["image_cond_hidden_states"] = self.pack_latents(reference[indices]).to(packed.dtype)
-                kwargs["image_cond_ids"] = self.image_ids(*reference.shape[-2:], latents.device, reference_index=0)
-            output = self.transformer(
-                hidden_states=packed[indices], timestep=timestep.expand(len(lengths))[indices],
-                encoder_hidden_states=hidden[indices, :length].to(packed.dtype),
-                img_ids=image_ids, txt_ids=self.text_ids(length, latents.device), **kwargs,
-            ).sample
+            target = target_timestep.expand(len(lengths))[indices] if target_timestep is not None else None
+            cond = self.pack_latents(reference[indices]).to(packed.dtype) if reference is not None else None
+            cond_ids = self.image_ids(*reference.shape[-2:], latents.device, reference_index=0) if reference is not None else None
+            args = (
+                packed.new_zeros((), requires_grad=True),
+                packed[indices], hidden[indices, :length].to(packed.dtype),
+                timestep.expand(len(lengths))[indices], image_ids,
+                self.text_ids(length, latents.device), target, cond, cond_ids,
+            )
+            if torch.is_grad_enabled() and self.transformer_offload_conductor is not None:
+                # Each conductor owns one live activation arena. Defer its saved
+                # activations to this outer checkpoint's recompute, immediately
+                # followed by that window's backward. This also keeps separate
+                # normal/chosen/rejected forwards from overwriting each other.
+                output = torch.utils.checkpoint.checkpoint(forward, *args, use_reentrant=True)
+            else:
+                output = forward(*args)
             outputs.append(output)
         return self.unpack_latents(torch.cat(outputs), *latents.shape[-2:])
 

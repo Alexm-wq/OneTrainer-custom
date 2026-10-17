@@ -332,5 +332,67 @@ class Flux3Test(unittest.TestCase):
             self.setup.setup_optimizations(self.model, self.config)
 
 
+    def test_multiple_windows_keep_offload_activation_lifetimes_separate(self):
+        from modules.util.checkpointing_util import create_checkpoint
+
+        class TrackingConductor:
+            def __init__(self):
+                self.pending = set()
+                self.keep = False
+                self.starts = []
+
+            def offload_activated(self):
+                return True
+
+            def add_layer(self, *args):
+                pass
+
+            def start_forward(self, keep):
+                if self.pending:
+                    raise AssertionError("A new forward overwrote an unfinished activation arena")
+                self.keep = keep
+                self.starts.append(keep)
+
+            def before_layer(self, layer, call_id, args):
+                if torch.is_grad_enabled():
+                    if call_id not in self.pending:
+                        raise AssertionError("Backward lost its saved activations")
+                    self.pending.remove(call_id)
+                return args
+
+            def after_layer(self, layer, call_id, args):
+                if self.keep and not torch.is_grad_enabled():
+                    self.pending.add(call_id)
+
+        baseline = copy.deepcopy(self.model)
+        conductor = TrackingConductor()
+        lists = [
+            self.model.transformer.txt_mode_blocks, self.model.transformer.mode_blocks["image"],
+            self.model.transformer.single_transformer_blocks,
+        ]
+        index = 0
+        for layers in lists:
+            for i, layer in enumerate(layers):
+                layers[i] = create_checkpoint(
+                    layer, torch.device("cpu"), [], conductor, True, index,
+                )
+                index += 1
+        self.model.transformer_offload_conductor = conductor
+        batch = self.batch()
+        x, t = torch.randn(2, 8, 2, 2), torch.tensor([.2, .7])
+        hidden, mask = batch["text_encoder_hidden_state"], batch["tokens_mask"]
+        # Multiple windows and independent chosen/normal forwards are outstanding
+        # together, as in mixed RLHF, before the combined backward.
+        actual = sum(self.model.predict_velocity(x+i, t, hidden, mask).square().mean() for i in (0, 1))
+        expected = sum(baseline.predict_velocity(x+i, t, hidden, mask).square().mean() for i in (0, 1))
+        actual.backward()
+        expected.backward()
+        self.assertFalse(conductor.pending)
+        self.assertEqual(conductor.starts.count(True), 4)
+        for a, e in zip(self.model.transformer.parameters(), baseline.transformer.parameters(), strict=True):
+            if e.grad is not None:
+                torch.testing.assert_close(a.grad, e.grad, atol=1e-6, rtol=1e-4)
+
+
 if __name__ == "__main__":
     unittest.main()
