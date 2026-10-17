@@ -41,7 +41,7 @@ jobs:
           python -m pip install . ruff==0.15.20 bitsandbytes==0.49.2
       - name: Lint integration
         run: |
-          files=('modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/util/quantization_util.py' 'modules/module/quantized/LinearInt8.py' 'modules/ui/BaseModelTabView.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/util/LayerOffloadConductor.py' 'tests/test_moss_features.py' 'tests/test_moss_offloading.py' 'tests/test_moss_training_ui.py')
+          files=('modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/util/quantization_util.py' 'modules/module/quantized/LinearInt8.py' 'modules/ui/BaseModelTabView.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/util/LayerOffloadConductor.py' 'modules/module/LoRAModule.py' 'tests/test_moss_features.py' 'tests/test_moss_offloading.py' 'tests/test_moss_training_ui.py')
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             if [ "$GITHUB_REF" != "refs/heads/codex/moss-image-base" ]; then
@@ -61,8 +61,10 @@ jobs:
             test_moss_training_ui.CtkTrainingUITest.test_new_moss_quantization_and_offload_controls \
             test_moss_training_ui.PySide6TrainingUITest.test_new_moss_quantization_and_offload_controls
       - name: Focused MOSS feature tests
-        run: |
-          python -m unittest discover -s tests -p test_moss_features.py -v
-          python -m unittest discover -s tests -p test_moss_offloading.py -v
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s tests -p test_moss_features.py -v
+      - name: Focused MOSS offloading tests
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s tests -p test_moss_offloading.py -v
       - name: Record tested commit
         run: git rev-parse HEAD

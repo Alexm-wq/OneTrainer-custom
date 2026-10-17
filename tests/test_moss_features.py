@@ -208,8 +208,8 @@ class MOSSFeaturesTest(unittest.TestCase):
                 torch.randn(2, 128, 2, 2), 400, torch.randn(2, 3, 8),
                 torch.tensor([[1, 0, 0], [1, 1, 1]]),
             )
-        self.assertEqual(set(x[0] for x in observed), {"flash"})
-        self.assertEqual(set(x[1] for x in observed), {1, 3, 5, 7})
+        self.assertEqual({x[0] for x in observed}, {"flash"})
+        self.assertEqual({x[1] for x in observed}, {1, 3, 5, 7})
         self.model.transformer.set_attention_backend("native")
         compile_original = nn.Module.compile
         self.config.compile = True
@@ -221,6 +221,42 @@ class MOSSFeaturesTest(unittest.TestCase):
         prediction = self.setup.predict(self.model, self.f.batch(), self.config, TrainProgress())
         prediction["predicted"].square().mean().backward()
         self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in parameters))
+
+    def test_nf4_and_fp8_real_qwen_text_encoding(self):
+        for dtype in (DataType.NFLOAT_4, DataType.FLOAT_8):
+            with self.subTest(dtype=dtype):
+                self.setUp()
+                self.f.real_components()
+                tokens, mask = self.f.batch()["tokens"], self.f.batch()["tokens_mask"]
+                reference, _ = self.model.encode_text("cpu", tokens=tokens, tokens_mask=mask)
+                self.convert(self.model.text_encoder, dtype)
+                self.setup.setup_optimizations(self.model, self.config)
+                actual, _ = self.model.encode_text("cpu", tokens=tokens, tokens_mask=mask)
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue((actual[~mask.bool()] == 0).all())
+                similarity = torch.nn.functional.cosine_similarity(
+                    actual[mask.bool()].float(), reference[mask.bool()].float(), dim=-1,
+                )
+                self.assertGreater(similarity.min().item(), .9)
+
+    def test_int8_peft_variants_receive_finite_gradients(self):
+        from modules.util.enum.ModelType import PeftType
+        for peft, decompose in ((PeftType.LORA, True), (PeftType.LOHA, False),
+                                (PeftType.LOKR, False), (PeftType.LOKR, True),
+                                (PeftType.OFT_2, False), (PeftType.OFT_2, True)):
+            with self.subTest(peft=peft, decompose=decompose):
+                self.setUp()
+                self.config.peft_type = peft
+                self.config.lora_decompose = decompose
+                self.config.lokr_weight_decompose = decompose
+                self.config.oft_block_size = 8
+                self.convert(self.model.transformer, DataType.INT_8)
+                self.setup.setup_optimizations(self.model, self.config)
+                parameters = self.f.attach_lora()
+                result = self.setup.predict(self.model, self.f.batch(), self.config, TrainProgress())
+                result["predicted"].square().mean().backward()
+                self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all() for p in parameters))
+                self.assertTrue(all(p.is_floating_point() for p in parameters))
 
     def test_full_finetune_rejects_quantized_trainable_base(self):
         self.config.training_method = TrainingMethod.FINE_TUNE
