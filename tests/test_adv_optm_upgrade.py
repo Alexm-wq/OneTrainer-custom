@@ -224,6 +224,36 @@ class AdvOptmUpgradeTests(unittest.TestCase):
             )
         self.assertTrue(all(torch.isfinite(p).all() for p in model.transformer.parameters()))
 
+
+    def test_resume_retains_centered_weight_decay_anchors(self):
+        for mode in ("full", "int8", "int4", "float8"):
+            with self.subTest(anchor_mode=mode):
+                _, model, _, optimizer = make_optimizer(
+                    Optimizer.SINKSGD_ADV, dtype=torch.bfloat16, state_precision="fp32",
+                    centered_wd=0.02, centered_wd_mode=mode,
+                )
+                for index in range(2):
+                    step(optimizer, index)
+                saved = copy.deepcopy(optimizer.state_dict())
+                _, restored_model, _, restored = make_optimizer(
+                    Optimizer.SINKSGD_ADV, state_dict=copy.deepcopy(saved), dtype=torch.bfloat16,
+                    state_precision="fp32", centered_wd=0.02, centered_wd_mode=mode,
+                )
+                for state_id, state in saved["state"].items():
+                    for key, value in state.items():
+                        if isinstance(value, torch.Tensor):
+                            actual = restored.state_dict()["state"][state_id][key]
+                            self.assertEqual(actual.dtype, value.dtype)
+                            # Float8 CPU has no isclose kernel.
+                            torch.testing.assert_close(actual.float(), value.float(), rtol=0, atol=0)
+                with torch.no_grad():
+                    for parameter, original in zip(restored_model.transformer.parameters(), weights(model), strict=True):
+                        parameter.copy_(original)
+                step(optimizer, 2)
+                step(restored, 2)
+                for actual, expected in zip(weights(restored_model), weights(model), strict=True):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     def test_automatic_moments_follow_changed_parameter_dtype(self):
         _, _, _, optimizer = make_optimizer(Optimizer.SINKSGD_ADV)
         step(optimizer, 0)

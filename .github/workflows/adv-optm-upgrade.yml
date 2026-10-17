@@ -7,6 +7,8 @@ on:
       - "tests/test_adv_optm_upgrade.py"
       - ".github/workflows/adv-optm-upgrade.yml"
       - "pyproject.toml"
+      - "modules/util/optimizer/adv_optm_util.py"
+      - "modules/util/create.py"
 permissions:
   contents: read
 jobs:
