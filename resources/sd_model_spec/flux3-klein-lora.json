@@ -1,0 +1,6 @@
+{
+    "modelspec.sai_model_spec": "1.0.0",
+    "modelspec.architecture": "flux-3-image-klein/lora",
+    "modelspec.implementation": "https://github.com/black-forest-labs/flux-3-image-klein",
+    "modelspec.title": "FLUX.3 Image Klein LoRA"
+}

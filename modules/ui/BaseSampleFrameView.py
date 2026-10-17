@@ -78,6 +78,19 @@ class BaseSampleFrameView:
                 )
                 self.components.entry(bottom_frame, 5, 1, ui_state, "moss_uncond_skip_layers")
 
+            if controller.model_type.is_flux_3():
+                self.components.label(
+                    bottom_frame, 5, 0, "timestep shift:",
+                    tooltip="FLUX.3 sampling alpha. BFL reference default: 16. Separate from the training shift.",
+                )
+                self.components.entry(bottom_frame, 5, 1, ui_state, "flux3_timestep_shift")
+                self.components.label(bottom_frame, 6, 0, "reference image:",
+                                      tooltip="Optional reference image for FLUX.3 editing samples. Empty for text-to-image.")
+                self.components.path_entry(
+                    bottom_frame, 6, 1, ui_state, "base_image_path", mode="file",
+                    allow_model_files=False, allow_image_files=True,
+                )
+
             # inpainting
             if is_inpainting_model:
                 self.components.label(bottom_frame, 5, 0, "inpainting:",

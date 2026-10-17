@@ -29,6 +29,7 @@ class ModelType(Enum):
     FLUX_DEV_1 = 'FLUX_DEV_1'
     FLUX_FILL_DEV_1 = 'FLUX_FILL_DEV_1'
     FLUX_2 = 'FLUX_2'
+    FLUX_3_KLEIN = 'FLUX_3_KLEIN'
 
     SANA = 'SANA'
 
@@ -91,7 +92,8 @@ class ModelType(Enum):
     def is_flux(self):
         return self == ModelType.FLUX_DEV_1 \
             or self == ModelType.FLUX_FILL_DEV_1 \
-            or self == ModelType.FLUX_2
+            or self == ModelType.FLUX_2 \
+            or self == ModelType.FLUX_3_KLEIN
 
     def is_flux_1(self):
         return self == ModelType.FLUX_DEV_1 \
@@ -99,6 +101,9 @@ class ModelType(Enum):
 
     def is_flux_2(self):
         return self == ModelType.FLUX_2
+
+    def is_flux_3(self):
+        return self == ModelType.FLUX_3_KLEIN
 
     def is_chroma(self):
         return self == ModelType.CHROMA_1
@@ -208,7 +213,7 @@ class ModelType(Enum):
                 or self.is_hi_dream() \
                 or self.is_chroma():
             return (TrainingMethod.FINE_TUNE, TrainingMethod.LORA, TrainingMethod.EMBEDDING)
-        if self.is_qwen() or self.is_z_image() or self.is_flux_2() or self.is_ernie() \
+        if self.is_qwen() or self.is_z_image() or self.is_flux_2() or self.is_flux_3() or self.is_ernie() \
                 or self.is_anima() or self.is_krea2() or self.is_moss_image() or self.is_ideogram():
             return (TrainingMethod.FINE_TUNE, TrainingMethod.LORA)
         raise ValueError(f"No supported training methods defined for model type {self}")
@@ -248,7 +253,7 @@ class ModelType(Enum):
         formats = [ModelFormat.DIFFUSERS]
         if self.is_stable_diffusion() or self.is_stable_diffusion_xl() or self.is_stable_diffusion_3():
             formats.append(ModelFormat.ORIGINAL_SINGLE_FILE)
-        elif (self.is_flux_1() or self.is_flux_2() or self.is_chroma() or self.is_hunyuan_video()
+        elif (self.is_flux_1() or self.is_flux_2() or self.is_flux_3() or self.is_chroma() or self.is_hunyuan_video()
                 or self.is_hi_dream() or self.is_pixart() or self.is_qwen() or self.is_ernie()
                 or self.is_z_image() or self.is_anima() or self.is_krea2() or self.is_moss_image() or self.is_ideogram()):
             formats.append(ModelFormat.ORIGINAL_TRANSFORMER)
@@ -306,6 +311,7 @@ _MODEL_PARTS: dict[ModelType, tuple[str, ...]] = {
     ModelType.FLUX_DEV_1: ("transformer", "text_encoder", "text_encoder_2", "vae"),
     ModelType.FLUX_FILL_DEV_1: ("transformer", "text_encoder", "text_encoder_2", "vae"),
     ModelType.FLUX_2: ("transformer", "text_encoder", "vae"),
+    ModelType.FLUX_3_KLEIN: ("transformer", "text_encoder", "vae"),
     ModelType.ANIMA: ("transformer", "text_encoder", "vae"),
     ModelType.SANA: ("transformer", "text_encoder", "vae"),
     ModelType.HUNYUAN_VIDEO: ("transformer", "text_encoder", "text_encoder_2", "vae"),

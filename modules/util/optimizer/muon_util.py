@@ -51,6 +51,10 @@ def build_muon_adam_key_fn(
                     'layers',
                     'refiner',
                 ]
+            case ModelType.FLUX_3_KLEIN:
+                default_patterns = ['mode_blocks', 'single_transformer_blocks']
+            case ModelType.MOSS_IMAGE:
+                default_patterns = ['layers', 'text_embedder.blocks']
             case ModelType.KREA_2:
                 default_patterns = [
                     'transformer_blocks',

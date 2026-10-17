@@ -130,6 +130,7 @@ class BaseModelTabView(ABC):
             has_vae: bool = False,
     ) -> int:
         is_moss = controller.train_config.model_type.is_moss_image()
+        is_flux3 = controller.train_config.model_type.is_flux_3()
         if has_unet:
             # unet weight dtype
             self.components.label(frame, row, 3, "UNet Data Type",
@@ -170,10 +171,13 @@ class BaseModelTabView(ABC):
                     "Keep the MOSS repository in Base Model for its other components. "
                     "OneTrainer quantizes floating-point checkpoints while loading."
                 ) if is_moss else (
+                    "FLUX.3 transformer safetensors (original or Diffusers), local path or Hugging Face URL. "
+                    "Keep flux-3-image-klein-base in Base Model. INT8/NF4/FP8 are applied while loading."
+                ) if is_flux3 else (
                     "Can be used to override the transformer in the base model. Safetensors and GGUF files are supported, "
                     "local and on Huggingface. If a GGUF file is used, the DataType must also be set to GGUF"
                 )
-                self.components.label(frame, row, 0, "Override Transformer" if is_krea2 or is_moss else "Override Transformer / GGUF",
+                self.components.label(frame, row, 0, "Override Transformer" if is_krea2 or is_moss or is_flux3 else "Override Transformer / GGUF",
                                       tooltip=override_tooltip)
                 self.components.path_entry(
                     frame, row, 1, ui_state, "transformer.model_name",
@@ -183,7 +187,7 @@ class BaseModelTabView(ABC):
             # transformer weight dtype
             self.components.label(frame, row, 3, "Transformer Data Type",
                              tooltip="The transformer weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=not (is_krea2 or is_moss), include_a8=True, include_int8=is_moss),
+            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_gguf=not (is_krea2 or is_moss or is_flux3), include_a8=True, include_int8=is_moss or is_flux3),
                                   ui_state, "transformer.weight_dtype")
 
             row += 1
@@ -226,7 +230,7 @@ class BaseModelTabView(ABC):
             # text encoder weight dtype
             self.components.label(frame, row, 3, "Text Encoder Data Type",
                              tooltip="The text encoder weight data type")
-            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_int8=is_moss),
+            self.components.options_kv(frame, row, 4, self.__create_dtype_options(include_int8=is_moss or is_flux3),
                                   ui_state, "text_encoder.weight_dtype")
 
             row += 1
@@ -288,7 +292,7 @@ class BaseModelTabView(ABC):
             # vae weight dtype
             self.components.label(frame, row, 3, "VAE Data Type",
                              tooltip="The vae weight data type")
-            self.components.options_kv(frame, row, 4, ([("float32", DataType.FLOAT_32)] if is_moss else self.__create_dtype_options()),
+            self.components.options_kv(frame, row, 4, ([("float32", DataType.FLOAT_32)] if is_moss or is_flux3 else self.__create_dtype_options()),
                                   ui_state, "vae.weight_dtype")
 
             row += 1

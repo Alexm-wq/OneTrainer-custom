@@ -12,4 +12,4 @@ except ImportError as e:
             return torch._int_mm(a, b)
         else:
             one = torch.ones(1, device=a.device)
-            return torch._scaled_mm(a, b.T.contiguous().T, scale_a=one, scale_b=one)
+            return torch._scaled_mm(a, b.T.contiguous().T, scale_a=one, scale_b=one, out_dtype=torch.float32)
