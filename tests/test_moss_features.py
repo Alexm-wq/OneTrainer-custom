@@ -5,8 +5,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import test_moss_image as fixtures
-
 from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelLoader.MOSSImageModelLoader import MOSSImageModelLoader
 from modules.modelSaver.moss.MOSSImageModelSaver import MOSSImageModelSaver
@@ -23,13 +21,18 @@ from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.quantization_util import (
-    get_offload_tensors, get_unquantized_weight, offload_quantized,
-    quantize_layers, replace_linear_with_quantized_layers,
+    get_offload_tensors,
+    get_unquantized_weight,
+    offload_quantized,
+    quantize_layers,
+    replace_linear_with_quantized_layers,
 )
 from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import nn
+
+import test_moss_image as fixtures
 
 
 class MOSSFeaturesTest(unittest.TestCase):

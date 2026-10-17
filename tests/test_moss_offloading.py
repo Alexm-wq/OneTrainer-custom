@@ -2,12 +2,12 @@
 import unittest
 from unittest.mock import Mock, patch
 
-import test_moss_image as fixtures
-
 from modules.util.LayerOffloadConductor import LayerOffloadConductor
 from modules.util.TrainProgress import TrainProgress
 
 import torch
+
+import test_moss_image as fixtures
 
 
 class RecordingConductor:

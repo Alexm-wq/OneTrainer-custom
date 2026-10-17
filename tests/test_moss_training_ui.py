@@ -12,13 +12,13 @@ from modules.util import create  # noqa: F401
 
 # isort: split
 from modules.ui.CtkModelTabView import CtkModelTabView
-from modules.ui.PySide6ModelTabView import PySide6ModelTabView
-from modules.ui.ModelTabController import ModelTabController
-from modules.util.enum.DataType import DataType
 from modules.ui.CtkTrainingTabView import CtkTrainingTabView
+from modules.ui.ModelTabController import ModelTabController
+from modules.ui.PySide6ModelTabView import PySide6ModelTabView
 from modules.ui.PySide6TrainingTabView import PySide6TrainingTabView
 from modules.ui.TrainingTabController import TrainingTabController
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ui.CtkUIState import CtkUIState

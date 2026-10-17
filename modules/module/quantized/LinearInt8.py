@@ -1,5 +1,4 @@
 from modules.module.quantized.mixin.QuantizedLinearMixin import QuantizedLinearMixin
-
 from modules.module.quantized.mixin.QuantizedModuleMixin import QuantizedModuleMixin
 
 import torch

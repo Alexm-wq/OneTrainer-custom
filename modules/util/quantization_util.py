@@ -17,8 +17,8 @@ import accelerate
 from tqdm import tqdm
 
 try:
-    from modules.module.quantized.LinearNf4 import LinearNf4
     from modules.module.quantized.LinearInt8 import LinearInt8
+    from modules.module.quantized.LinearNf4 import LinearNf4
 
     import bitsandbytes as bnb
 except ImportError:

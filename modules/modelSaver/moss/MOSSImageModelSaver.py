@@ -8,14 +8,15 @@ from modules.modelSaver.mixin.DtypeModelSaverMixin import DtypeModelSaverMixin
 from modules.module.moss import pipeline_moss_image
 from modules.module.quantized.LinearA8 import LinearA8
 from modules.module.quantized.mixin.QuantizedLinearMixin import QuantizedLinearMixin
-from modules.util.quantization_util import get_unquantized_weight
 from modules.util.convert_util import convert
 from modules.util.enum.ModelFormat import ModelFormat
+from modules.util.quantization_util import get_unquantized_weight
 
 import torch
 
-from safetensors.torch import save_file
 from transformers import Qwen3_5Model
+
+from safetensors.torch import save_file
 
 
 class MOSSImageModelSaver(
