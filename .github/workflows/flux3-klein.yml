@@ -15,6 +15,7 @@ jobs:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       OMP_NUM_THREADS: "1"
+      PYTHONPATH: "."
       QT_QPA_PLATFORM: offscreen
       FLUX3_REFERENCE_DIT: /tmp/flux3-reference-dit.py
     steps:
