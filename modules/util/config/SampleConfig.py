@@ -193,6 +193,8 @@ class SampleConfig(BaseConfig):
     transformer_attention_mask: bool
     force_last_timestep: bool
 
+    moss_layout_enabled: bool
+    moss_layout_json: str
     moss_uncond_skip_layers: str
     flux3_timestep_shift: float
 
@@ -240,6 +242,8 @@ class SampleConfig(BaseConfig):
         data.append(("transformer_attention_mask", False, bool, False))
         data.append(("force_last_timestep", False, bool, False))
 
+        data.append(("moss_layout_enabled", False, bool, False))
+        data.append(("moss_layout_json", "", str, False))
         data.append(("moss_uncond_skip_layers", "22", str, False))
         data.append(("flux3_timestep_shift", 16.0, float, False))
 

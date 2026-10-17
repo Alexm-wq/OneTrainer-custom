@@ -117,6 +117,24 @@ class BaseConceptWindowView:
             "dpo_rejected_pattern",
         )
 
+        if controller.train_config.model_type.is_moss_image():
+            self.components.label(
+                frame, 12, 0, "MOSS layouts",
+                tooltip="Auto mixes ordinary captions and native MOSS JSON sidecars. "
+                        "Required fails on missing layouts. Off uses ordinary caption handling.",
+            )
+            self.components.options_kv(
+                frame, 12, 1, [("Auto (mixed captions/layouts)", "auto"), ("Required", "required"), ("Off", "off")],
+                text_ui_state, "moss_layout_mode",
+            )
+            from modules.ui.MOSSLayoutEditor import open_concept_layout
+            self.components.button(
+                frame, 13, 0, "Annotate MOSS layouts",
+                lambda: open_concept_layout(frame, self.components, controller),
+                tooltip="Draw boxes on the original, EXIF-oriented image and save a .layout.json sidecar. "
+                        "Training transforms the boxes together with the bucketed image.",
+            )
+
     def build_image_augmentation_tab(self, frame, controller, image_ui_state):
         # header
         self.components.label(frame, 0, 1, "Random",

@@ -1,8 +1,10 @@
+import threading
 from random import Random
 
 from modules.model.Flux2Model import Flux2Model
 from modules.module.moss.pipeline_moss_image import MOSSImagePipeline
 from modules.util.enum.DataType import DataType
+from modules.util.moss_layout import is_layout
 
 import torch
 
@@ -41,10 +43,22 @@ class MOSSImageModel(Flux2Model):
             )
             for prompt in prompts
         ]
-        return self.tokenizer(
-            rendered, padding="max_length", truncation=True,
-            max_length=max_length or 4096, return_tensors="pt",
-        )
+        limit = max_length or 4096
+        if not hasattr(self.tokenizer, "_mgds_tokenizer_lock"):
+            self.tokenizer._mgds_tokenizer_lock = threading.Lock()
+        with self.tokenizer._mgds_tokenizer_lock:
+            if any(is_layout(prompt) for prompt in prompts):
+                full = self.tokenizer(rendered, padding=False, truncation=False).input_ids
+                for prompt, ids in zip(prompts, full, strict=True):
+                    if is_layout(prompt) and len(ids) > limit:
+                        raise ValueError(
+                            f"MOSS layout needs {len(ids)} tokens including the chat template; "
+                            f"Text Encoder Sequence Length is {limit}. Increase it or simplify the layout."
+                        )
+            return self.tokenizer(
+                rendered, padding="max_length", truncation=True,
+                max_length=limit, return_tensors="pt",
+            )
 
     @torch.no_grad()
     def encode_tokens(self, tokens, mask):
