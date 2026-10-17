@@ -45,6 +45,7 @@ jobs:
             git push origin HEAD:codex/flux3-klein
           fi
       - name: Install test dependencies on hosted runner
+        id: dependencies
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libegl1 libopengl0 libxkbcommon0 xvfb xauth
@@ -67,15 +68,17 @@ jobs:
         run: |
           PYTHONPATH=tests:. python -m unittest -v test_flux3 test_flux3_reference
       - name: Check optimizer update with real previous-version checkpoints
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: |
           python -m pip install --no-deps adv-optm==2.5.12
           python tests/test_adv_optm_upgrade.py --write-legacy "$RUNNER_TEMP/adv-optm-2512.pt"
           python -m pip install --no-deps adv-optm==2.5.16
           ADV_OPTM_LEGACY_FIXTURE="$RUNNER_TEMP/adv-optm-2512.pt" python -m unittest discover -s tests -p test_adv_optm_upgrade.py -v
       - name: Both FLUX.3 training UIs
+        if: ${{ !cancelled() && steps.dependencies.outcome == 'success' }}
         run: |
           PYTHONPATH=tests:. xvfb-run -a python -m unittest -v test_flux3_ui
       - name: Tested commit
         run: git rev-parse HEAD
 
-# Validate FP8 accumulation range with the combined dependency lock.
+# Validate full training initialization, UI integration, and optimizer upgrade.

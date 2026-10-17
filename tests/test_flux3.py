@@ -413,6 +413,7 @@ class Flux3Test(unittest.TestCase):
             ModelType.FLUX_3_KLEIN, torch.device("cpu"), torch.device("cpu"), TrainingMethod.FINE_TUNE,
         )
         setup.setup_optimizations(self.model, self.config)
+        self.model.train_config = self.config
         setup.setup_model(self.model, self.config)
         self.assertFalse(any(p.requires_grad for p in self.model.text_encoder.parameters()))
         self.assertFalse(any(p.requires_grad for p in self.model.vae.parameters()))
