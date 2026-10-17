@@ -34,6 +34,9 @@ jobs:
           run-install: false
           cache: false
       - name: Resolve the CUDA kernel dependency in the lock file
+        # Resolution only: the hosted runner has no GPU. Tests never fake CUDA.
+        env:
+          CONDA_OVERRIDE_CUDA: "13.0"
         run: |
           pixi lock
           pixi lock --check
