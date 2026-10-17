@@ -232,7 +232,7 @@ class MOSSLayoutEditor:
         raw, _ = read_layout_source(path)
         width, height = image.size
         caption_path = Path(path).with_suffix(".txt")
-        caption = caption_path.read_text(encoding="utf-8-sig").splitlines()[0] if caption_path.is_file() and caption_path.stat().st_size else ""
+        caption = caption_path.read_text(encoding="utf-8-sig").strip() if caption_path.is_file() else ""
         document = parse_layout(raw or empty_layout(width, height, caption), width, height, match_image=True)
         self.image, self.image_path, self.document = image, Path(path), document
         self.bucketed = False

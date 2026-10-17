@@ -183,7 +183,7 @@ def sample_layout_prompt(config, width, height):
     raw = getattr(config, "moss_layout_json", "") if getattr(config, "moss_layout_enabled", False) else ""
     if raw:
         layout = parse_layout(raw, config.width, config.height)
-        extra = config.prompt
+        extra = "" if is_layout(config.prompt) else config.prompt
     elif getattr(config, "moss_layout_enabled", False):
         raise ValueError("MOSS layout is enabled but empty. Open the layout editor or disable layout.")
     elif is_layout(config.prompt):

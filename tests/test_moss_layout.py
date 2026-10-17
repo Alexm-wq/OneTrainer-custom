@@ -176,6 +176,14 @@ class GeometryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "empty"):
             sample_layout_prompt(sample, 192, 128)
 
+    def test_enabling_editor_for_a_json_prompt_does_not_embed_json_in_caption(self):
+        sample = SampleConfig.default_values(ModelType.MOSS_IMAGE)
+        sample.width, sample.height = 192, 128
+        sample.prompt = sample.moss_layout_json = json.dumps(annotation())
+        sample.moss_layout_enabled = True
+        result = json.loads(sample_layout_prompt(sample, 192, 128))
+        self.assertEqual(result["summary"]["caption"], annotation()["summary"]["caption"])
+
     def test_layout_token_overflow_fails_but_plain_prompt_keeps_existing_truncation(self):
         model = TinyModel()
         prompt = layout_prompt(parse_layout(annotation()))
