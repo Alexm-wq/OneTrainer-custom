@@ -86,9 +86,9 @@ class ProgressTests(unittest.TestCase):
             raise RuntimeError("test encoder failure")
 
         cache._encode = fail
-        with redirect_stderr(self.output), redirect_stdout(self.summary):
-            with self.assertRaisesRegex(RuntimeError, "test encoder failure"):
-                cache.start(0)
+        with (redirect_stderr(self.output), redirect_stdout(self.summary),
+              self.assertRaisesRegex(RuntimeError, "test encoder failure")):
+            cache.start(0)
         self.assertFalse(cache.initialized)
         self.assertIn("stage=encoding", self.output.getvalue())
         self.assertNotIn("[OT-MOSS-TEXT-CACHE]", self.summary.getvalue())
