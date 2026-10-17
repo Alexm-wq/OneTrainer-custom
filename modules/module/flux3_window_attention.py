@@ -77,14 +77,14 @@ def _single_forward(
     norm_encoder_hidden_states = self.norm(encoder_hidden_states)
     norm_encoder_hidden_states = (1 + c_mod_scale) * norm_encoder_hidden_states + c_mod_shift
 
-    combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+    combined = torch.cat([norm_hidden_states, norm_encoder_hidden_states], dim=1)
 
     attn_output = self.attn(hidden_states=combined, image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
     ff_output = self.ff(combined)
     output = attn_output + ff_output
 
-    context_output, content_output = torch.split(
-        output, [encoder_hidden_states.shape[1], hidden_states.shape[1]], dim=1
+    content_output, context_output = torch.split(
+        output, [hidden_states.shape[1], encoder_hidden_states.shape[1]], dim=1
     )
     encoder_hidden_states = encoder_hidden_states + c_mod_gate * context_output
     hidden_states = hidden_states + mod_gate * content_output
@@ -184,27 +184,29 @@ def _transformer_forward(
             else:
                 image_cond_hidden_states = block(image_cond_hidden_states, cond_early_mod, cond_rotary_emb)
 
-    # 6. Joint single transformer blocks over [txt, image, image_cond]
+    # 6. Joint attention is permutation-equivariant. Put image/reference before
+    # text so every visible key is a prefix, as required by flash_varlen.
+    # RoPE follows the same permutation; outputs are split back by stream.
     if image_cond_hidden_states is not None:
         content_states = torch.cat([hidden_states, image_cond_hidden_states], dim=1)
         content_mod = torch.cat([image_single_mod, cond_single_mod], dim=1)
         joint_rotary_emb = (
-            torch.cat([txt_rotary_emb[0], image_rotary_emb[0], cond_rotary_emb[0]], dim=0),
-            torch.cat([txt_rotary_emb[1], image_rotary_emb[1], cond_rotary_emb[1]], dim=0),
+            torch.cat([image_rotary_emb[0], cond_rotary_emb[0], txt_rotary_emb[0]], dim=0),
+            torch.cat([image_rotary_emb[1], cond_rotary_emb[1], txt_rotary_emb[1]], dim=0),
         )
     else:
         content_states = hidden_states
         content_mod = image_single_mod
         joint_rotary_emb = (
-            torch.cat([txt_rotary_emb[0], image_rotary_emb[0]], dim=0),
-            torch.cat([txt_rotary_emb[1], image_rotary_emb[1]], dim=0),
+            torch.cat([image_rotary_emb[0], txt_rotary_emb[0]], dim=0),
+            torch.cat([image_rotary_emb[1], txt_rotary_emb[1]], dim=0),
         )
 
     joint_mask = None
     if text_window_mask is not None:
-        joint_mask = torch.cat((text_window_mask, torch.ones(
+        joint_mask = torch.cat((torch.ones(
             batch_size, 1, 1, content_states.shape[1], dtype=torch.bool, device=hidden_states.device,
-        )), dim=-1)
+        ), text_window_mask), dim=-1)
 
     for block in self.single_transformer_blocks:
         if torch.is_grad_enabled() and self.gradient_checkpointing:

@@ -42,6 +42,8 @@ class BaseFlux3Setup(BaseFlux2Setup):
                 "Disable Fused Back Pass and Fused Gradient Reduce for mixed FLUX.3 RLHF: "
                 "normal and preference forwards share parameters and must finish accumulating before updates."
             )
+        if config.rlhf_enabled and config.training_method == TrainingMethod.FINE_TUNE and config.transformer.offload_fraction > 0:
+            raise ValueError("Mixed FLUX.3 full fine-tuning requires transformer layer offloading disabled; activation offloading is supported.")
         enable_flux3_window_attention(model.transformer)
         model.transformer_offload_conductor = enable_checkpointing(
             model.transformer, config, config.transformer, config.compile,

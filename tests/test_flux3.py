@@ -102,6 +102,52 @@ def train_config():
     return config
 
 
+class TrackingConductor:
+    def __init__(self):
+        self.pending = set()
+        self.keep = False
+        self.starts = []
+
+    def offload_activated(self):
+        return True
+
+    def add_layer(self, *args):
+        pass
+
+    def start_forward(self, keep):
+        if self.pending:
+            raise AssertionError("A new forward overwrote an unfinished activation arena")
+        self.keep = keep
+        self.starts.append(keep)
+
+    def before_layer(self, layer, call_id, args):
+        if torch.is_grad_enabled():
+            if call_id not in self.pending:
+                raise AssertionError("Backward lost its saved activations")
+            self.pending.remove(call_id)
+        return args
+
+    def after_layer(self, layer, call_id, args):
+        if self.keep and not torch.is_grad_enabled():
+            self.pending.add(call_id)
+
+
+def track_offload(model):
+    from modules.module.flux3_window_attention import enable_flux3_window_attention
+    from modules.util.checkpointing_util import create_checkpoint
+    enable_flux3_window_attention(model.transformer)
+    conductor = TrackingConductor()
+    lists = [model.transformer.txt_mode_blocks, model.transformer.mode_blocks["image"],
+             model.transformer.single_transformer_blocks]
+    index = 0
+    for layers in lists:
+        for i, layer in enumerate(layers):
+            layers[i] = create_checkpoint(layer, torch.device("cpu"), [], conductor, True, index)
+            index += 1
+    model.transformer_offload_conductor = conductor
+    return conductor
+
+
 class Flux3Test(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(17)
@@ -216,7 +262,7 @@ class Flux3Test(unittest.TestCase):
                 out = self.setup.predict(self.model, self.batch(), self.config, TrainProgress())
                 self.assertTrue(torch.isfinite(out["predicted"]).all(), "nonfinite quantized prediction")
                 out["predicted"].square().mean().backward()
-                bad = [n for n, p in self.model.transformer_lora.named_parameters()
+                bad = [n for n, p in enumerate(params)
                        if p.grad is None or not torch.isfinite(p.grad).all()]
                 self.assertEqual(bad, [])
                 optimizer.step()
@@ -326,53 +372,8 @@ class Flux3Test(unittest.TestCase):
 
 
     def test_multiple_windows_keep_offload_activation_lifetimes_separate(self):
-        from modules.util.checkpointing_util import create_checkpoint
-
-        class TrackingConductor:
-            def __init__(self):
-                self.pending = set()
-                self.keep = False
-                self.starts = []
-
-            def offload_activated(self):
-                return True
-
-            def add_layer(self, *args):
-                pass
-
-            def start_forward(self, keep):
-                if self.pending:
-                    raise AssertionError("A new forward overwrote an unfinished activation arena")
-                self.keep = keep
-                self.starts.append(keep)
-
-            def before_layer(self, layer, call_id, args):
-                if torch.is_grad_enabled():
-                    if call_id not in self.pending:
-                        raise AssertionError("Backward lost its saved activations")
-                    self.pending.remove(call_id)
-                return args
-
-            def after_layer(self, layer, call_id, args):
-                if self.keep and not torch.is_grad_enabled():
-                    self.pending.add(call_id)
-
-        from modules.module.flux3_window_attention import enable_flux3_window_attention
-        enable_flux3_window_attention(self.model.transformer)
         baseline = copy.deepcopy(self.model)
-        conductor = TrackingConductor()
-        lists = [
-            self.model.transformer.txt_mode_blocks, self.model.transformer.mode_blocks["image"],
-            self.model.transformer.single_transformer_blocks,
-        ]
-        index = 0
-        for layers in lists:
-            for i, layer in enumerate(layers):
-                layers[i] = create_checkpoint(
-                    layer, torch.device("cpu"), [], conductor, True, index,
-                )
-                index += 1
-        self.model.transformer_offload_conductor = conductor
+        conductor = track_offload(self.model)
         batch = self.batch()
         x, t = torch.randn(2, 8, 2, 2), torch.tensor([.2, .7])
         hidden, mask = batch["text_encoder_hidden_state"], batch["tokens_mask"]
@@ -387,6 +388,94 @@ class Flux3Test(unittest.TestCase):
         for a, e in zip(self.model.transformer.parameters(), baseline.transformer.parameters(), strict=True):
             if e.grad is not None:
                 torch.testing.assert_close(a.grad, e.grad, atol=1e-6, rtol=1e-4)
+
+
+
+    def test_full_finetune_updates_dit_and_keeps_encoder_vae_frozen(self):
+        self.config.training_method = TrainingMethod.FINE_TUNE
+        self.config.transformer.weight_dtype = DataType.FLOAT_32
+        self.config.transformer.train = True
+        setup = create.create_model_setup(
+            ModelType.FLUX_3_KLEIN, torch.device("cpu"), torch.device("cpu"), TrainingMethod.FINE_TUNE,
+        )
+        setup.setup_optimizations(self.model, self.config)
+        setup.setup_model(self.model, self.config)
+        self.assertFalse(any(p.requires_grad for p in self.model.text_encoder.parameters()))
+        self.assertFalse(any(p.requires_grad for p in self.model.vae.parameters()))
+        parameters = [p for p in self.model.transformer.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(parameters, lr=.001)
+        before = [p.detach().clone() for p in parameters]
+        batch = self.batch()
+        result = setup.predict(self.model, batch, self.config, TrainProgress())
+        setup.calculate_loss(self.model, batch, result, self.config).backward()
+        self.assertTrue(any(p.grad is not None for p in parameters))
+        self.assertTrue(all(p.grad is None or torch.isfinite(p.grad).all() for p in parameters))
+        optimizer.step()
+        self.assertTrue(any(not torch.equal(p, old) for p, old in zip(parameters, before, strict=True)))
+
+    def test_offloaded_fused_step_accumulates_all_prompt_windows_once(self):
+        from collections import Counter
+
+        baseline = copy.deepcopy(self.model)
+        conductor = track_offload(self.model)
+        counts = Counter()
+        handles = []
+        for name, parameter in self.model.transformer.named_parameters():
+            def step(parameter, name=name):
+                counts[name] += 1
+                with torch.no_grad():
+                    parameter.add_(parameter.grad, alpha=-.01)
+                parameter.grad = None
+            handles.append(parameter.register_post_accumulate_grad_hook(step))
+        batch = self.batch()
+        x, t = torch.randn(2, 8, 2, 2), torch.tensor([.2, .7])
+        hidden, mask = batch["text_encoder_hidden_state"], batch["tokens_mask"]
+        self.model.predict_velocity(x, t, hidden, mask).square().mean().backward()
+        baseline.predict_velocity(x, t, hidden, mask).square().mean().backward()
+        with torch.no_grad():
+            for name, parameter in baseline.transformer.named_parameters():
+                if parameter.grad is not None:
+                    parameter.add_(parameter.grad, alpha=-.01)
+                    self.assertEqual(counts[name], 1)
+                torch.testing.assert_close(self.model.transformer.get_parameter(name), parameter, atol=1e-6, rtol=1e-4)
+        self.assertFalse(conductor.pending)
+        self.assertEqual(conductor.starts.count(True), 1)
+        for handle in handles:
+            handle.remove()
+
+    def test_flash_varlen_prefix_contract_matches_sdpa_with_reference(self):
+        from diffusers.models import attention_dispatch
+
+        batch = self.batch()
+        x, t, ref = torch.randn(2, 8, 2, 2), torch.tensor([.2, .7]), torch.randn(2, 8, 2, 2)
+        hidden, mask = batch["text_encoder_hidden_state"], batch["tokens_mask"]
+        expected = self.model.predict_velocity(x, t, hidden, mask, reference=ref)
+
+        def cpu_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs):
+            outputs = []
+            for i in range(len(cu_seqlens_q)-1):
+                qs = q[int(cu_seqlens_q[i]):int(cu_seqlens_q[i+1])].transpose(0, 1)
+                ks = k[int(cu_seqlens_k[i]):int(cu_seqlens_k[i+1])].transpose(0, 1)
+                vs = v[int(cu_seqlens_k[i]):int(cu_seqlens_k[i+1])].transpose(0, 1)
+                outputs.append(torch.nn.functional.scaled_dot_product_attention(qs, ks, vs).transpose(0, 1))
+            return torch.cat(outputs)
+
+        def dispatch(q, k, v, attn_mask=None, **kwargs):
+            return attention_dispatch._flash_varlen_attention(q, k, v, attn_mask=attn_mask)
+
+        # Exercise upstream packing and the actual model mask, substituting only
+        # the unavailable CUDA kernel with its exact CPU attention operation.
+        with patch.object(attention_dispatch, "flash_attn_varlen_func", cpu_varlen), patch(
+            "diffusers.models.transformers.transformer_flux3.dispatch_attention_fn", dispatch,
+        ):
+            actual = self.model.predict_velocity(x, t, hidden, mask, reference=ref)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-4)
+        params = tuple(self.model.transformer.parameters())
+        ga = torch.autograd.grad(actual.square().mean(), params, allow_unused=True)
+        ge = torch.autograd.grad(expected.square().mean(), params, allow_unused=True)
+        for a, e in zip(ga, ge, strict=True):
+            if e is not None:
+                torch.testing.assert_close(a, e, atol=1e-6, rtol=1e-4)
 
 
 if __name__ == "__main__":

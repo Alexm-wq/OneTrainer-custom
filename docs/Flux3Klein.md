@@ -49,6 +49,8 @@ uses your captions/prompts as entered, without automatic rewriting or an extra
 - Gradient checkpointing, block compilation, layer/activation offloading.
   Mixed RLHF requires Fused Back Pass and Fused Gradient Reduce disabled so
   normal and preference gradients accumulate before a parameter update.
+  Full fine-tuning with mixed RLHF also requires transformer layer offloading
+  disabled; LoRA base-weight offloading and activation offloading remain usable.
   Reference-only blocks are checkpointed but excluded from the T2I offload
   schedule because they do not execute during T2I training.
 - Original or Diffusers transformer safetensors overrides, local or HF URL.
