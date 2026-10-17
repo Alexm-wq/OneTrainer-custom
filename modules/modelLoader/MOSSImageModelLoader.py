@@ -12,8 +12,9 @@ from modules.util.enum.ModelType import ModelType
 import torch
 
 from diffusers import AutoencoderKLFlux2
-from safetensors.torch import load_file
 from transformers import Qwen2Tokenizer, Qwen3_5Model
+
+from safetensors.torch import load_file
 
 
 class MOSSImageModelLoader(HFModelLoaderMixin):
