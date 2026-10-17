@@ -45,7 +45,7 @@ jobs:
           python -m pip install . ruff==0.15.20 bitsandbytes==0.49.2
       - name: Lint changed layout files
         run: |
-          files=(modules/util/moss_layout.py modules/util/moss_bucketing.py modules/dataLoader/moss/MOSSLayout.py modules/dataLoader/moss/MOSSConditioningCache.py modules/dataLoader/MOSSImageBaseDataLoader.py modules/model/MOSSImageModel.py modules/modelSampler/MOSSImageSampler.py modules/ui/MOSSLayoutEditor.py scripts/moss_layout_ui.py tests/test_moss_layout.py tests/test_moss_layout_ui.py)
+          files=(modules/util/moss_layout.py modules/util/moss_bucketing.py modules/dataLoader/moss/MOSSLayout.py modules/dataLoader/moss/MOSSConditioningCache.py modules/dataLoader/moss/MOSSImageCache.py modules/dataLoader/MOSSImageBaseDataLoader.py modules/model/MOSSImageModel.py modules/modelSampler/MOSSImageSampler.py modules/ui/MOSSLayoutEditor.py scripts/moss_layout_ui.py tests/test_moss_layout.py tests/test_moss_layout_ui.py)
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             if [ "$GITHUB_REF" != "refs/heads/codex/moss-layout" ]; then

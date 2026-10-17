@@ -18,19 +18,21 @@ class MOSSLayoutInventory(PipelineModule, RandomAccessPipelineModule):
     def __init__(self):
         super().__init__()
         self.rows = []
+        self.by_source = {}
 
     def get_inputs(self):
         return ["image_path", "concept"]
 
     def get_outputs(self):
-        return ["moss_layout_source", "moss_source_index", "concept"]
+        return ["moss_layout_source", "moss_source_index", "moss_source_key", "concept"]
 
     def length(self):
         return len(self.rows)
 
     def start(self, variation):
         self.rows = []
-        fingerprints, concepts = {}, {}
+        self.by_source = {}
+        fingerprints, concepts, counts = {}, {}, {}
         for index in range(self._get_previous_length("image_path")):
             concept = self._get_previous_item(variation, "concept", index)
             key = json.dumps(concept, sort_keys=True)
@@ -41,19 +43,30 @@ class MOSSLayoutInventory(PipelineModule, RandomAccessPipelineModule):
             )
             concepts.setdefault(key, dict(concept))
             fingerprints.setdefault(key, hashlib.sha256(b"moss-layout-v1"))
-            # Hash the contents, including absence, and ordered image identity.
-            fingerprints[key].update(json.dumps([index, path, source, raw]).encode())
-            self.rows.append({"key": key, "raw": raw, "source": source, "path": path})
+            # Ordering matters within a concept, never across unrelated concepts.
+            local_index = counts.get(key, 0)
+            counts[key] = local_index + 1
+            fingerprints[key].update(json.dumps([local_index, path, source, raw]).encode())
+            source_key = json.dumps([path, *[
+                concept.get(name) for name in (
+                    "path", "seed", "include_subdirectories", "dpo_chosen_pattern",
+                    "dpo_rejected_pattern", "_dpo_split", "_dpo_validation_percentage", "_dpo_validation_seed",
+                )
+            ]], sort_keys=True)
+            self.rows.append({"key": key, "raw": raw, "source": source, "path": path,
+                              "source_key": source_key, "source_index": local_index})
         for key, concept in concepts.items():
             concept["_moss_layout_fingerprint"] = fingerprints[key].hexdigest()
         for row in self.rows:
             row["concept"] = concepts[row.pop("key")]
+            self.by_source[row["source_key"]] = row
         print(f"[OT-MOSS-LAYOUT] layout_rows={sum(bool(r['raw']) for r in self.rows)}, "
               f"caption_rows={sum(not r['raw'] for r in self.rows)}")
 
     def get_item(self, variation, index, requested_name=None):
         row = self.rows[index]
-        return {"concept": row["concept"], "moss_layout_source": row["raw"], "moss_source_index": index}
+        return {"concept": row["concept"], "moss_layout_source": row["raw"],
+                "moss_source_index": row["source_index"], "moss_source_key": row["source_key"]}
 
 
 class LoadMOSSLayout(PipelineModule, RandomAccessPipelineModule):
@@ -182,7 +195,7 @@ class MOSSMaskRotateCrop(RandomMaskRotateCrop):
 
 
 class MOSSRestoreConcept(PipelineModule, RandomAccessPipelineModule):
-    """Resolve the *current* config using the source row stored with the image.
+    """Resolve the current config by stable source identity, never a global row.
 
     This keeps balancing/resume/DPO ordering aligned without caching stale loss
     weights or recaching VAE latents when ordinary caption settings change.
@@ -192,17 +205,17 @@ class MOSSRestoreConcept(PipelineModule, RandomAccessPipelineModule):
         self.inventory = inventory
 
     def get_inputs(self):
-        return ["moss_source_index"]
+        return ["moss_source_key"]
 
     def get_outputs(self):
         return ["concept"]
 
     def length(self):
-        return self._get_previous_length("moss_source_index")
+        return self._get_previous_length("moss_source_key")
 
     def get_item(self, variation, index, requested_name=None):
-        source = self._get_previous_item(variation, "moss_source_index", index)
-        return {"concept": self.inventory.rows[source]["concept"]}
+        source = self._get_previous_item(variation, "moss_source_key", index)
+        return {"concept": self.inventory.by_source[source]["concept"]}
 
 
 class MOSSNormalPrompt(PipelineModule, RandomAccessPipelineModule):

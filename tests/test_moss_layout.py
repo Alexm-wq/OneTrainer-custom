@@ -1,5 +1,6 @@
 """Focused MOSS layout/conditioning tests; no model weights or GPU required."""
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -10,6 +11,7 @@ from types import SimpleNamespace
 from modules.util import create  # noqa: F401
 
 # isort: split
+from modules.dataLoader.moss.MOSSImageCache import MOSSImageCache
 from modules.dataLoader.moss.MOSSLayout import MOSSMaskRotateCrop, MOSSRandomFlip, MOSSRandomRotate
 from modules.dataLoader.MOSSImageBaseDataLoader import MOSSImageBaseDataLoader
 from modules.model.MOSSImageModel import MOSSImageModel
@@ -262,7 +264,8 @@ class PipelineTests(unittest.TestCase):
         (self.data / "caption.txt").write_text("ordinary, blue, sky", encoding="utf-8")
 
     def make(self, *, image_cache=True, text_cache=True, epoch=0, index=0,
-             resolution="128,256", concept=None, cache="cache", rlhf=False, batch_size=1):
+             resolution="128,256", concept=None, cache="cache", rlhf=False, batch_size=1,
+             extra_concepts=(), prepend=False):
         config = TrainConfig.default_values()
         config.model_type = ModelType.MOSS_IMAGE
         config.train_device = config.temp_device = "cpu"
@@ -280,7 +283,7 @@ class PipelineTests(unittest.TestCase):
         concept.path = str(self.data)
         concept.seed = 123
         concept.image.enable_crop_jitter = False
-        config.concepts = [concept]
+        config.concepts = [*extra_concepts, concept] if prepend else [concept, *extra_concepts]
         if rlhf:
             normal = ConceptConfig.default_values()
             normal.path, normal.seed = str(self.data), 123
@@ -419,6 +422,96 @@ class PipelineTests(unittest.TestCase):
         rows = self.epoch(resumed)
         self.assertEqual(len(rows), 3)
         self.assertTrue(all(row["loss_weight"] == 0.25 for row in rows))
+
+    def extra_concept(self):
+        path = self.root / "additional"
+        path.mkdir(exist_ok=True)
+        Image.new("RGB", (192, 128), "blue").save(path / "extra.png")
+        (path / "extra.txt").write_text("new concept caption", encoding="utf-8")
+        concept = ConceptConfig.default_values()
+        concept.path, concept.seed, concept.loss_weight = str(path), 456, 0.75
+        concept.image.enable_crop_jitter = False
+        return concept
+
+    def test_prepend_reorder_and_remove_concept_reuse_existing_caches(self):
+        concept = ConceptConfig.default_values()
+        concept.loss_weight = 0.25
+        concept.text.enable_tag_shuffling = True
+        (self.data / "caption.txt").write_text("one, two, three\nfour, five, six", encoding="utf-8")
+        original, _, _ = self.make(concept=concept, resolution="128")
+        expected = {r["image_path"]: r["prompt"] for r in self.epoch(original)}
+        extra = self.extra_concept()
+        added, model, _ = self.make(concept=concept, resolution="128",
+                                     extra_concepts=[extra], prepend=True)
+        rows = self.epoch(added)
+        self.assertEqual(model.image_calls, 1)
+        self.assertEqual(model.text_calls, 1)
+        for row in rows:
+            if row["image_path"] in expected:
+                self.assertEqual(row["prompt"], expected[row["image_path"]])
+                self.assertEqual(row["loss_weight"], 0.25)
+            else:
+                self.assertEqual(row["loss_weight"], 0.75)
+        for extras in ([extra], []):
+            resumed, model, _ = self.make(concept=concept, resolution="128", extra_concepts=extras)
+            self.epoch(resumed)
+            self.assertEqual(model.image_calls, 0)
+            self.assertEqual(model.text_calls, 0)
+
+    def legacy_cache(self, loader):
+        """Turn current manifests into the exact previous global-row format."""
+        cache = next(m for m in loader.get_data_set().loading_pipeline.modules if isinstance(m, MOSSImageCache))
+        files = {}
+        for group, indices in cache.group_indices.items():
+            digest = hashlib.sha256(b"moss-layout-v1")
+            for index in indices:
+                row = loader.layout_inventory.rows[index]
+                digest.update(json.dumps([index, row["path"], row["source"], row["raw"]]).encode())
+            fingerprint = digest.hexdigest()
+            values = [fingerprint if name == "concept._moss_layout_fingerprint"
+                      else cache._get_previous_item(0, name, indices[0])
+                      for name in cache.variations_group_in_names]
+            old_group = cache._hash(values)
+            directory = Path(cache._cache_dir(group, 0))
+            manifest = cache._manifest(str(directory))
+            for item, index in zip(manifest["items"], indices, strict=True):
+                for variant in item["variants"]:
+                    del variant["moss_source_key"]
+                    variant["moss_source_index"] = index
+            manifest["cache_layout"]["concept"]["_moss_layout_fingerprint"] = fingerprint
+            cache._save(manifest, str(directory / "aggregate.pt"), False)
+            destination = directory.parent.parent / old_group
+            if destination != directory.parent:
+                directory.parent.rename(destination)
+            for path in (destination / "variation-0").glob("[0-9]*.pt"):
+                files[path.name + old_group] = (path.stat().st_mtime_ns, path.read_bytes())
+        return files
+
+    def test_legacy_cache_upgrade_reuses_latents_and_conditioning_after_prepend(self):
+        extra = self.extra_concept()
+        original, _, _ = self.make(resolution="128", extra_concepts=[extra], prepend=True)
+        expected = {r["image_path"]: r["prompt"] for r in self.epoch(original)}
+        payloads = self.legacy_cache(original)
+        resumed, model, _ = self.make(resolution="128", extra_concepts=[extra])
+        actual = {r["image_path"]: r["prompt"] for r in self.epoch(resumed)}
+        self.assertEqual(actual, expected)
+        self.assertEqual(model.image_calls, 0)
+        self.assertEqual(model.text_calls, 0)
+        current = [(p.stat().st_mtime_ns, p.read_bytes()) for p in
+                   (self.root / "cache").rglob("*.pt") if p.stem.isdecimal()]
+        self.assertCountEqual(current, payloads.values())
+
+    def test_legacy_cache_with_edited_layout_is_not_reused(self):
+        original, _, _ = self.make(resolution="128")
+        self.epoch(original)
+        self.legacy_cache(original)
+        (self.data / "layout.layout.json").write_text(
+            json.dumps(annotation(caption="changed annotation")), encoding="utf-8")
+        resumed, model, _ = self.make(resolution="128")
+        self.assertTrue(any("changed annotation" in row["prompt"] for row in self.epoch(resumed)))
+        self.assertEqual(model.image_calls, 2)
+        self.assertEqual(model.text_calls, 1)
+
 
     def test_mixed_dpo_keeps_layout_with_chosen_and_rejected_resolution(self):
         for folder in ("chosen", "rejected"):

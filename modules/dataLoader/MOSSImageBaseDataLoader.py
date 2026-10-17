@@ -4,7 +4,7 @@ import json
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
-from modules.dataLoader.cache.MultiResolutionDiskCache import MultiResolutionDiskCache
+from modules.dataLoader.moss.MOSSImageCache import MOSSImageCache
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.moss.MOSSConditioningCache import MOSSConditioningCache
 from modules.dataLoader.moss.MOSSLayout import (
@@ -116,7 +116,7 @@ class MOSSImageBaseDataLoader(
             image_split.append("latent_mask")
         # Layout and source index belong to the SAME resolution/augmentation as
         # the latent. No separate row-based text cache may select a different one.
-        image_aggregate = ["crop_resolution", "image_path", "moss_layout", "moss_source_index"]
+        image_aggregate = ["crop_resolution", "image_path", "moss_layout", "moss_source_index", "moss_source_key"]
         if config.rlhf_enabled:
             image_split.append("latent_image_rejected")
             image_aggregate += [
@@ -138,7 +138,8 @@ class MOSSImageBaseDataLoader(
             torch_gc()
 
         if config.image_caching:
-            modules = [MultiResolutionDiskCache(
+            modules = [MOSSImageCache(
+                inventory=self.layout_inventory,
                 cache_dir=os.path.join(config.cache_dir, "image"),
                 split_names=image_split, aggregate_names=image_aggregate,
                 variations_in_name="concept.image_variations",
