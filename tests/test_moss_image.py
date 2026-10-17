@@ -13,7 +13,6 @@ from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelLoader.MOSSImageModelLoader import MOSSImageLoRALoader, MOSSImageModelLoader
 from modules.modelSampler.MOSSImageSampler import MOSSImageSampler
 from modules.modelSaver.moss.MOSSImageLoRASaver import MOSSImageLoRASaver
-from modules.modelSetup.MOSSImageLoRASetup import MOSSImageLoRASetup
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.moss.pipeline_moss_image import MOSSImagePipeline, MOSSImageScheduler, MOSSImageTransformer
 from modules.trainer.GenericTrainer import GenericTrainer
@@ -102,7 +101,9 @@ class MOSSImageTest(unittest.TestCase):
         torch.set_num_threads(1)
         self.model = tiny_model()
         self.config = train_config()
-        self.setup = MOSSImageLoRASetup(torch.device("cpu"), torch.device("cpu"), False)
+        self.setup = create.get_model_setup_class(ModelType.MOSS_IMAGE, TrainingMethod.LORA)(
+            torch.device("cpu"), torch.device("cpu"), False,
+        )
 
     def attach_lora(self):
         self.model.transformer.requires_grad_(False)

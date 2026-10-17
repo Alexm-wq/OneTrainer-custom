@@ -1,9 +1,12 @@
+import copy
+import hashlib
+import json
 import os
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
-from modules.dataLoader.moss.EncodeMOSSImageText import EncodeMOSSImageText
 from modules.model.MOSSImageModel import MOSSImageModel
+from modules.dataLoader.moss.EncodeMOSSImageText import EncodeMOSSImageText
 from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
@@ -47,6 +50,16 @@ class MOSSImageBaseDataLoader(
         return modules
 
     def _cache_modules(self, config: TrainConfig, model: MOSSImageModel, model_setup: BaseMOSSImageSetup):
+        # Separate MOSS from other model families and invalidate conditioning caches
+        # when the base/encoder precision/context length or VAE override changes.
+        config = copy.copy(config)
+        identity = {
+            "version": 1, "base": config.base_model_name, "vae": config.vae.model_name,
+            "text_dtype": str(config.text_encoder.weight_dtype),
+            "sequence_length": config.text_encoder_sequence_length or 4096,
+        }
+        key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
+        config.cache_dir = os.path.join(config.cache_dir, "moss-image-" + key)
         image_split_names = ['latent_image', 'original_resolution', 'crop_offset']
 
         if config.masked_training or config.model_type.has_mask_input():
