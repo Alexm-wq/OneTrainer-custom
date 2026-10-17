@@ -2,7 +2,17 @@ name: MOSS layout support
 
 on:
   push:
-    branches: [codex/moss-layout]
+    branches: [main, codex/moss-image-base, codex/moss-layout]
+    paths:
+      - "modules/dataLoader/moss/**"
+      - "modules/dataLoader/MOSSImageBaseDataLoader.py"
+      - "modules/model/MOSSImageModel.py"
+      - "modules/modelSampler/MOSSImageSampler.py"
+      - "modules/util/moss_*.py"
+      - "modules/ui/MOSSLayoutEditor.py"
+      - "scripts/moss_layout_ui.py"
+      - "tests/test_moss_layout*.py"
+      - ".github/workflows/moss-layout.yml"
   workflow_dispatch:
 
 permissions:
@@ -38,6 +48,9 @@ jobs:
           files=(modules/util/moss_layout.py modules/util/moss_bucketing.py modules/dataLoader/moss/MOSSLayout.py modules/dataLoader/moss/MOSSConditioningCache.py modules/dataLoader/MOSSImageBaseDataLoader.py modules/model/MOSSImageModel.py modules/modelSampler/MOSSImageSampler.py modules/ui/MOSSLayoutEditor.py scripts/moss_layout_ui.py tests/test_moss_layout.py tests/test_moss_layout_ui.py)
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
+            if [ "$GITHUB_REF" != "refs/heads/codex/moss-layout" ]; then
+              git diff --exit-code
+            fi
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -- "${files[@]}"

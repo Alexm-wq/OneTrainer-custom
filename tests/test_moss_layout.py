@@ -72,7 +72,7 @@ class TinyModel:
         self.text_encoder = SimpleNamespace(config=SimpleNamespace(_commit_hash="test-encoder"))
         self.vae_train_dtype = self.train_dtype = DataType.FLOAT_32
         self.vae_autocast_context = self.autocast_context = nullcontext()
-        self.vae = SimpleNamespace(encode=self.encode_image)
+        self.vae = SimpleNamespace(encode=self.encode_image, parameters=lambda: iter([torch.zeros(1)]))
         self.image_calls = 0
         self.text_calls = 0
 
@@ -254,7 +254,7 @@ class PipelineTests(unittest.TestCase):
         (self.data / "caption.txt").write_text("ordinary, blue, sky", encoding="utf-8")
 
     def make(self, *, image_cache=True, text_cache=True, epoch=0, index=0,
-             resolution="128,256", concept=None, cache="cache", rlhf=False):
+             resolution="128,256", concept=None, cache="cache", rlhf=False, batch_size=1):
         config = TrainConfig.default_values()
         config.model_type = ModelType.MOSS_IMAGE
         config.train_device = config.temp_device = "cpu"
@@ -265,7 +265,7 @@ class PipelineTests(unittest.TestCase):
         config.image_caching, config.text_caching = image_cache, text_cache
         config.cache_dir = str(self.root / cache)
         config.resolution = resolution
-        config.batch_size, config.caching_threads = 1, 2
+        config.batch_size, config.caching_threads = batch_size, 2
         config.aspect_ratio_bucketing = True
         config.rlhf_enabled = rlhf
         concept = concept or ConceptConfig.default_values()
@@ -273,6 +273,11 @@ class PipelineTests(unittest.TestCase):
         concept.seed = 123
         concept.image.enable_crop_jitter = False
         config.concepts = [concept]
+        if rlhf:
+            normal = ConceptConfig.default_values()
+            normal.path, normal.seed = str(self.data), 123
+            normal.image.enable_crop_jitter = False
+            config.concepts.insert(0, normal)
         model = TinyModel()
         setup = SimpleNamespace(prepare_text_caching=lambda model, cfg: None)
         progress = TrainProgress()
@@ -326,6 +331,32 @@ class PipelineTests(unittest.TestCase):
                     for _ in range(2):
                         for row in self.epoch(loader):
                             self.assert_conditioning(row)
+
+    def test_layout_and_plain_caption_collate_in_the_same_batch(self):
+        loader, _, _ = self.make(resolution="128", batch_size=2)
+        loader.get_data_set().start_next_epoch()
+        batches = list(loader.get_data_loader())
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["tokens"].shape, (2, 1024))
+        self.assertEqual(sum(prompt.startswith("{") for prompt in batches[0]["prompt"]), 1)
+
+    def test_balanced_image_variations_resume_mid_epoch_without_layout_drift(self):
+        concept = ConceptConfig.default_values()
+        concept.balancing = 2.0
+        concept.image_variations = 2
+        concept.text_variations = 2
+        concept.image.enable_random_flip = True
+        loader, _, _ = self.make(concept=concept)
+        for _ in range(3):
+            expected = self.epoch(loader)
+        self.assertEqual(len(expected), 4)
+        resumed, model, _ = self.make(concept=concept, epoch=2, index=1)
+        actual = self.epoch(resumed)
+        self.assertEqual([r["prompt"] for r in actual], [r["prompt"] for r in expected[1:]])
+        self.assertEqual(model.image_calls, 0)
+        self.assertEqual(model.text_calls, 0)
+        for row in actual:
+            self.assert_conditioning(row)
 
     def test_resume_reuses_cache_and_preserves_selected_layout(self):
         loader, _, _ = self.make()

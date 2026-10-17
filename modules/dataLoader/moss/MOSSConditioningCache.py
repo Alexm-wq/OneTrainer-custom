@@ -46,7 +46,8 @@ class MOSSConditioningCache(PipelineModule, SingleVariationRandomAccessPipelineM
 
     def _load(self, path):
         try:
-            value = torch.load(path, map_location="cpu", weights_only=True)
+            # Inspect shapes without rereading every large embedding at epoch start.
+            value = torch.load(path, map_location="cpu", weights_only=True, mmap=True)
             ids, mask, hidden = (value[name] for name in self.NAMES[1:])
             if ids.shape != (self.max_length,) or mask.shape != ids.shape or hidden.shape[0] != self.max_length:
                 return None
