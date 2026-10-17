@@ -5,8 +5,8 @@ from modules.modelLoader.GenericFineTuneModelLoader import make_fine_tune_model_
 from modules.modelLoader.GenericLoRAModelLoader import make_lora_model_loader
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.LoRALoaderMixin import LoRALoaderMixin
-from modules.module.moss.text_encoder_kernels import configure_moss_text_kernels
 from modules.module.moss.pipeline_moss_image import MOSSImageScheduler, MOSSImageTransformer
+from modules.module.moss.text_encoder_kernels import configure_moss_text_kernels
 from modules.util.enum.ModelType import ModelType
 
 import torch

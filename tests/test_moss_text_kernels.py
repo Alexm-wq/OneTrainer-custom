@@ -6,13 +6,13 @@ import os
 import unittest
 from unittest.mock import Mock, patch
 
-from modules.module.quantized.LinearFp8 import LinearFp8
 from modules.module.moss.text_encoder_kernels import (
     _GatedRMSNorm,
     _load_fla,
     _TextKernels,
     configure_moss_text_kernels,
 )
+from modules.module.quantized.LinearFp8 import LinearFp8
 
 import torch
 import torch.nn.functional as F
