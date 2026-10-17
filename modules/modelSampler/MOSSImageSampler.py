@@ -5,6 +5,7 @@ from modules.module.moss.pipeline_moss_image import _validate_skip_layers
 from modules.util import factory
 from modules.util.enum.FileType import FileType
 from modules.util.enum.ModelType import ModelType
+from modules.util.moss_layout import sample_layout_prompt
 from modules.util.torch_util import torch_gc
 
 import torch
@@ -29,6 +30,7 @@ class MOSSImageSampler(BaseModelSampler):
         skip = tuple(int(item.strip()) for item in config.moss_uncond_skip_layers.split(",") if item.strip())
         _validate_skip_layers(skip, len(model.transformer.layers), "moss_uncond_skip_layers")
         width, height = self.quantize_resolution(config.width, 16), self.quantize_resolution(config.height, 16)
+        prompt = sample_layout_prompt(config, width, height)
         scheduler = copy.deepcopy(model.noise_scheduler)
         generator = torch.Generator(device="cpu")
         if config.random_seed:
@@ -39,7 +41,7 @@ class MOSSImageSampler(BaseModelSampler):
         model.text_encoder_to(self.train_device)
         try:
             positive, positive_mask = model.encode_text(
-                train_device=self.train_device, text=config.prompt,
+                train_device=self.train_device, text=prompt,
                 text_encoder_sequence_length=config.text_encoder_1_sequence_length,
             )
             if config.cfg_scale != 1.0:

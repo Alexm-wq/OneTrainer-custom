@@ -77,6 +77,16 @@ class BaseSampleFrameView:
                     tooltip="MOSS main DiT block indices (zero-based). Default: 22. Empty disables skipping.",
                 )
                 self.components.entry(bottom_frame, 5, 1, ui_state, "moss_uncond_skip_layers")
+                self.components.label(
+                    bottom_frame, 6, 0, "MOSS layout:",
+                    tooltip="Use the native JSON layout. Boxes scale with the sample resolution; prompt adds scene detail.",
+                )
+                self.components.switch(bottom_frame, 6, 1, ui_state, "moss_layout_enabled")
+                from modules.ui.MOSSLayoutEditor import open_sample_layout
+                self.components.button(
+                    bottom_frame, 7, 0, "Edit MOSS layout",
+                    lambda: open_sample_layout(bottom_frame, self.components, controller.sample, ui_state),
+                )
 
             if controller.model_type.is_flux_3():
                 self.components.label(

@@ -82,6 +82,7 @@ class ConceptImageConfig(BaseConfig):
 
 
 class ConceptTextConfig(BaseConfig):
+    moss_layout_mode: str
     prompt_source: str
     prompt_path: str
     enable_tag_shuffling: bool
@@ -106,6 +107,7 @@ class ConceptTextConfig(BaseConfig):
     def default_values():
         data = []
 
+        data.append(("moss_layout_mode", "auto", str, False))
         data.append(("prompt_source", "sample", str, False))
         data.append(("prompt_path", "", str, False))
         data.append(("enable_tag_shuffling", False, bool, False))
