@@ -5,6 +5,7 @@ from modules.modelLoader.GenericFineTuneModelLoader import make_fine_tune_model_
 from modules.modelLoader.GenericLoRAModelLoader import make_lora_model_loader
 from modules.modelLoader.mixin.HFModelLoaderMixin import HFModelLoaderMixin
 from modules.modelLoader.mixin.LoRALoaderMixin import LoRALoaderMixin
+from modules.module.moss.text_encoder_kernels import configure_moss_text_kernels
 from modules.module.moss.pipeline_moss_image import MOSSImageScheduler, MOSSImageTransformer
 from modules.util.enum.ModelType import ModelType
 
@@ -65,6 +66,7 @@ class MOSSImageModelLoader(HFModelLoaderMixin):
         model.text_encoder = self._convert_transformers_sub_module_to_dtype(
             text_encoder, weight_dtypes.text_encoder, weight_dtypes.fallback_train_dtype,
         )
+        configure_moss_text_kernels(model.text_encoder)
         model.vae = AutoencoderKLFlux2.from_pretrained(
             model_names.vae_model or base, subfolder=None if model_names.vae_model else "vae",
             torch_dtype=torch.float32,
