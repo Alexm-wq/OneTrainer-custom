@@ -135,6 +135,22 @@ class BaseConceptWindowView:
                         "Training transforms the boxes together with the bucketed image.",
             )
 
+        self.components.label(
+            frame,
+            14,
+            0,
+            "Streamed DPO (Low VRAM)",
+            tooltip=(
+                "Runs chosen and rejected reference forwards sequentially and "
+                "recomputes one policy branch at a time during backward. This greatly "
+                "reduces DPO activation memory for high-resolution concepts, "
+                "at the cost of extra recomputation during backward. It only "
+                "affects paired DPO samples from this concept."
+            ),
+            wide_tooltip=True,
+        )
+        self.components.switch(frame, 14, 1, ui_state, "dpo_streamed")
+
     def build_image_augmentation_tab(self, frame, controller, image_ui_state):
         # header
         self.components.label(frame, 0, 1, "Random",

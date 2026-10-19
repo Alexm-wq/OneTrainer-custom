@@ -106,7 +106,7 @@ def validate_path(
 
     if io_type == PathIOType.INPUT:
         if not os.path.exists(os.path.abspath(trimmed)):
-            return "Input path does not exist"
+            return f"Input path does not exist on this machine (resolved: {os.path.abspath(trimmed)!r})"
 
     if io_type in (PathIOType.OUTPUT, PathIOType.MODEL):
         if not os.path.isdir(os.path.dirname(os.path.abspath(trimmed))):
@@ -202,6 +202,7 @@ class BaseFieldValidator(ABC):
 
     def validate(self, value: str) -> str | None:
         """Return an error string if *value* is invalid, else None."""
+        self._last_validated_value = value
         meta = self.ui_state.get_field_metadata(self.var_name)
         declared_type = meta.type
         nullable = meta.nullable
@@ -245,6 +246,20 @@ class BaseFieldValidator(ABC):
 
         return None
 
+    def describe_error(self, error: str) -> str:
+        obj = getattr(self.ui_state, "obj", None)
+        scope = type(obj).__name__.removesuffix("Config") if obj is not None else ""
+        name = getattr(obj, "name", "") if obj is not None else ""
+        if name:
+            scope += f" {name!r}"
+        field = f"{scope}.{self.var_name}" if scope else self.var_name
+        # Show what the user actually typed, even when failed validation did not
+        # commit that edit into the underlying configuration variable.
+        if hasattr(self, "io_type") or self.var_name == "path":
+            value = getattr(self, "_last_validated_value", "")
+            field += f" = {value!r}"
+        return f"{field}: {error}"
+
     def _validate_and_style(self, value: str) -> bool:
         error = self.validate(value)
         if error is None:
@@ -263,7 +278,7 @@ def flush_and_validate_all() -> list[str]:
     for v in list(_active_validators):
         error = v.flush()
         if error is not None:
-            invalid.append(f"{v.var_name}: {error}")
+            invalid.append(v.describe_error(error))
     return invalid
 
 

@@ -342,6 +342,9 @@ class DataLoaderText2ImageMixin(metaclass=ABCMeta):
             ('concept.type', 'concept_type'),
         ]
 
+        if config.rlhf_enabled:
+            output_names.append(('concept.dpo_streamed', 'dpo_streamed'))
+
         if config.validation:
             output_names.append(('concept.name', 'concept_name'))
             output_names.append(('concept.path', 'concept_path'))

@@ -23,6 +23,23 @@ def is_validation_pair(pair_key: str, percentage: float, seed: int) -> bool:
 def validate_rlhf_config(config):
     if not config.rlhf_enabled:
         return
+    # Multiple backward calls must accumulate before any fused optimizer/reduce
+    # hook runs. Validate this before loading model weights.
+    concepts = config.concepts
+    if concepts is None and os.path.isfile(config.concept_file_name):
+        with open(config.concept_file_name, encoding="utf-8") as handle:
+            concepts = json.load(handle)
+    def field(concept, name, default=None):
+        return concept.get(name, default) if isinstance(concept, dict) else getattr(concept, name, default)
+    streamed = any(
+        field(c, "enabled", True) and field(c, "dpo_streamed", False)
+        and field(c, "dpo_chosen_pattern") and field(c, "dpo_rejected_pattern")
+        for c in (concepts or [])
+    )
+    if streamed and config.optimizer.optimizer.supports_fused_back_pass() and config.optimizer.fused_back_pass:
+        raise ValueError("Streamed DPO requires Fused Back Pass disabled; gradient accumulation remains supported")
+    if streamed and config.multi_gpu and config.fused_gradient_reduce:
+        raise ValueError("Streamed DPO requires Fused Gradient Reduce disabled")
     for name in ("rlhf_normal_weight", "rlhf_dpo_weight", "rlhf_chosen_weight"):
         value = getattr(config, name)
         if not math.isfinite(value) or value < 0:

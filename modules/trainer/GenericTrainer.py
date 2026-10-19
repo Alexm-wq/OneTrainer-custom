@@ -621,7 +621,7 @@ class GenericTrainer(BaseTrainer):
                     for draw in range(self.config.rlhf_dpo_validation_samples):
                         self.model_setup.calculate_dpo_loss(
                             self.model, batch, self.config, train_progress,
-                            validation=True,
+                            validation=True, streamed=self.__dpo_streamed_at(batch, 0),
                             validation_seed=preference_seed(pair_key, self.config.rlhf_dpo_validation_seed, draw),
                         )
                         for name, value in self.model_setup.get_last_dpo_metrics().items():
@@ -1127,17 +1127,72 @@ class GenericTrainer(BaseTrainer):
 
         return self.model_setup.calculate_loss(self.model, batch, model_output_data, self.config)
 
+    @staticmethod
+    def __dpo_streamed_at(batch: dict, index: int) -> bool:
+        value = batch.get("dpo_streamed", False)
+        if isinstance(value, Tensor):
+            value = value.detach().reshape(-1)
+            value = value[index if value.numel() > 1 else 0].item() if value.numel() else False
+        elif isinstance(value, (list, tuple)):
+            value = value[index]
+        return value.lower() in ("true", "1") if isinstance(value, str) else bool(value)
+
+    def __calculate_streamed_mixed_loss(self, batch, train_progress, dpo_indices, backward):
+        normal_indices = self.__normal_indices(batch)
+        total = len(dpo_indices) + len(normal_indices)
+        groups = {}
+        for index in dpo_indices:
+            groups.setdefault(self.__dpo_streamed_at(batch, index), []).append(index)
+        loss_sum = None
+
+        def finish(loss, count):
+            nonlocal loss_sum
+            component = loss * (count / total)
+            backward(component)
+            value = component.detach()
+            loss_sum = value if loss_sum is None else loss_sum + value
+
+        # Finish each graph before another reference swap or offload forward.
+        # The callback scales for AMP/accumulation; optimizer stepping stays in
+        # the ordinary trainer loop, once per accumulation window.
+        for streamed, indices in groups.items():
+            subbatch = self.__subbatch(batch, indices)
+            self.__assert_dpo_resolution_homogeneous(subbatch)
+            loss = self.model_setup.calculate_dpo_loss(
+                self.model, subbatch, self.config, train_progress, streamed=streamed,
+            )
+            finish(loss, len(indices))
+            self.__accumulate_dpo_metrics(self.model_setup.get_last_dpo_metrics(), len(indices))
+            del loss
+
+        if normal_indices:
+            subbatch = self.__subbatch(batch, normal_indices)
+            loss = self.__calculate_standard_only_training_loss(subbatch, train_progress)
+            finish(self.config.rlhf_normal_weight * loss, len(normal_indices))
+            if hasattr(self, "tensorboard"):
+                self.tensorboard.add_scalar("rlhf/normal_loss", float(loss.detach()), train_progress.global_step)
+
+        self._rlhf_backward_done = True
+        return loss_sum
+
     def __calculate_mixed_rlhf_training_loss(
             self,
             batch: dict,
             train_progress: TrainProgress,
+        *, backward=None,
     ) -> Tensor:
+        self._rlhf_backward_done = False
         if not self.config.rlhf_enabled:
             return self.__calculate_standard_only_training_loss(batch, train_progress)
 
         dpo_indices = self.__rlhf_dpo_indices(batch)
         if not dpo_indices:
             return self.config.rlhf_normal_weight * self.__calculate_standard_only_training_loss(batch, train_progress)
+
+        if any(self.__dpo_streamed_at(batch, index) for index in dpo_indices):
+            if backward is None:
+                raise RuntimeError("Mixed Streamed DPO requires the trainer backward callback")
+            return self.__calculate_streamed_mixed_loss(batch, train_progress, dpo_indices, backward)
 
         normal_indices = self.__normal_indices(batch)
 
@@ -1580,18 +1635,29 @@ class GenericTrainer(BaseTrainer):
                     )
                     with dropout_context:
                         self.__ot_write_batch_breadcrumb(batch, train_progress)
+                        def backward_component(component):
+                            self._gradient_accumulation_dirty = True
+                            component = component / self.config.gradient_accumulation_steps
+                            if scaler:
+                                scaler.scale(component).backward()
+                            else:
+                                component.backward()
+
                         try:
-                            loss = self.__calculate_mixed_rlhf_training_loss(batch, train_progress)
+                            loss = self.__calculate_mixed_rlhf_training_loss(
+                                batch, train_progress, backward=backward_component,
+                            )
                         except Exception as e:
                             self.__ot_write_crash_dump(e, batch, train_progress)
                             raise
 
                         loss = loss / self.config.gradient_accumulation_steps
                         self._gradient_accumulation_dirty = True
-                        if scaler:
-                            scaler.scale(loss).backward()
-                        else:
-                            loss.backward()
+                        if not self._rlhf_backward_done:
+                            if scaler:
+                                scaler.scale(loss).backward()
+                            else:
+                                loss.backward()
 
                     has_gradient = True
                     detached_loss = loss.detach()

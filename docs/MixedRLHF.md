@@ -64,6 +64,43 @@ comparison while its explicit multiplicative gradient factor is canceled.
 DPO Weight then controls the outer preference strength. Beta still affects
 saturation and hence which pairs receive gradient.
 
+## Streamed DPO (Low VRAM)
+
+In the paired concept's General tab, enable **Streamed DPO (Low VRAM)**.
+The setting is per concept, defaults to off, and is saved in concept files and
+training backups. For example, use Path `/workspace/train/1440`, Include
+Subdirectories on, Chosen Pattern `winner/{}`, Rejected Pattern `loser/{}`.
+Patterns are relative to the concept root and must not start with a slash.
+
+This ports preview's sequential reference forwards and policy replay/backward.
+Each expensive model call processes B images rather than a combined 2B pair
+batch. Policy value forwards retain no transformer activation graph; backward
+recomputes and differentiates one branch at a time. It trades extra forwards
+for lower activation memory. Native flow losses, the independent Normal/DPO/
+Chosen weights, beta decoupling, anchors, validation and gradient accumulation
+keep their existing semantics. Random state is restored during replay. Switching
+the execution mode may change the random draws compared with a 2B forward, but
+chosen/rejected and reference/policy within a pair share their draws.
+
+Mixed batches can contain ordinary, batched-DPO and streamed-DPO concepts.
+Each group's backward completes before the next reference swap/offload forward.
+The optimizer still steps once per accumulation window. For MOSS, ordinary
+captions and layout JSON use the same final cached conditioning on both sides;
+the flag is read from the current concept and does not change cache identities.
+
+**Fused Back Pass must be off.** On multiple GPUs, Fused Gradient Reduce must
+also be off: reducing/updating inside individual branch backward calls would
+act on incomplete gradients. Regular accumulation and end-of-step reduction
+remain supported. Preview's restriction on combining multi-GPU streamed DPO
+with layer/activation offloading is retained. Single-GPU reentrant checkpointing
+uses direct gradient accumulation.
+
+Focused CPU tests compare loss values and LoRA gradients across all existing
+objectives/references, mixed group weights, accumulation, checkpoint replay,
+validation, concept persistence and path diagnostics. A mocked multi-GPU route
+checks its vector-Jacobian computation; this is not a real distributed/GPU
+memory or performance benchmark.
+
 ## Correctness and validation
 
 Concept weights and batch/accumulation loss scaling are applied outside the
