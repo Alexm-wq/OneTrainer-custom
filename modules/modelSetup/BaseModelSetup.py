@@ -1708,6 +1708,10 @@ class BaseModelSetup(
                 "restart from this adapter; this is not an exact continuation "
                 "of the old DPO objective."
             )
+            # Curriculum margins are relative to the old reference, so they
+            # cannot be reused after re-anchoring to the resumed adapter.
+            self._dpo_curriculum_state.clear()
+            self._dpo_curriculum_pending.clear()
         if snapshot_path and os.path.isfile(snapshot_path):
             try:
                 payload = torch.load(

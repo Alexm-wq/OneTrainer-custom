@@ -159,7 +159,9 @@ and initializes only that part of RLHF: beta/validation tracking starts fresh,
 missing curriculum statistics start empty, and a missing Existing Adapter
 reference is captured from the resumed adapter before the first training step.
 That last fallback changes the preference anchor and is explicitly reported;
-the unavailable original reference cannot be reconstructed. New Adapter mode
+the unavailable original reference cannot be reconstructed. Beta, validation and
+curriculum statistics also restart when re-anchoring because they depend on the
+old reference. New Adapter mode
 continues to use the base model and does not need a reference snapshot.
 
 Existing sidecars are restored, so missing trainer JSON never replaces an

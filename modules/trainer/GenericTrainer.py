@@ -376,6 +376,15 @@ class GenericTrainer(BaseTrainer):
                 "progress are still restored from the backup."
             )
             return
+        if (
+            str(self.config.effective_dpo_ref_mode()) == "EXISTING_ADAPTER"
+            and not os.path.isfile(os.path.join(backup_path, "onetrainer_dpo_reference.pt"))
+        ):
+            print(
+                "[OT-RLHF] backup has no fixed DPO reference; adaptive-beta "
+                "and validation tracking start fresh for the new reference."
+            )
+            return
         if self._dpo_beta_controller and payload.get("beta_controller"):
             self._dpo_beta_controller.load_state_dict(payload["beta_controller"])
             self.model_setup.set_dpo_runtime_beta(payload.get("runtime_beta"))

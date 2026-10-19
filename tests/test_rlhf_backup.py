@@ -218,6 +218,32 @@ class RLHFBackupTest(unittest.TestCase):
         again = self.restore(path)
         self.assertEqual(again.model_setup._dpo_curriculum_state, restored.model_setup._dpo_curriculum_state)
 
+    def test_missing_reference_resets_statistics_that_depend_on_the_old_anchor(self):
+        for objective in (DPOObjective.SIGMOID, DPOObjective.ANCHORED_REJECT):
+            with self.subTest(objective=objective):
+                self.setUp()
+                self.config.rlhf_dpo_objective = objective
+                self.config.rlhf_dpo_adaptive_beta = objective == DPOObjective.SIGMOID
+                self.config.rlhf_dpo_hard_pair_curriculum = objective == DPOObjective.ANCHORED_REJECT
+                self.trainer = self.make_trainer(self.model, self.setup)
+                if self.trainer._dpo_beta_controller:
+                    self.setup.set_dpo_runtime_beta(self.trainer._dpo_beta_controller.update(0.4))
+                self.gradient(self.trainer)
+                self.model.optimizer.step()
+                self.setup.commit_dpo_curriculum_state()
+                self.trainer._dpo_best_validation = 0.2
+                self.trainer._dpo_validation_bad_steps = 5
+                path = self.backup()
+                (path / "onetrainer_dpo_reference.pt").unlink()
+                restored = self.restore(path)
+                self.assertIsNone(restored._dpo_best_validation)
+                self.assertEqual(restored._dpo_validation_bad_steps, 0)
+                self.assertIsNone(restored.model_setup._dpo_runtime_beta)
+                self.assertEqual(restored.model_setup._dpo_curriculum_state, {})
+                if restored._dpo_beta_controller:
+                    self.assertEqual(restored._dpo_beta_controller.state_dict()["_steps"], 0)
+                self.assertTrue(torch.isfinite(self.gradient(restored, streamed=True)[0]))
+
     def test_base_reference_needs_no_snapshot_and_rlhf_disabled_needs_no_sidecar(self):
         self.config.rlhf_dpo_ref_mode = DPORefMode.NEW_ADAPTER
         self.setup._dpo_ref_params = None
@@ -237,6 +263,7 @@ class RLHFBackupTest(unittest.TestCase):
         state["_steps"] = 4
         path = Path(self.directory.name) / "onetrainer_rlhf_state.json"
         path.write_text(json.dumps({"beta_controller": state}), encoding="utf-8")
+        self.setup.save_dpo_reference(str(Path(self.directory.name) / "onetrainer_dpo_reference.pt"))
         self.trainer._GenericTrainer__load_rlhf_state(self.directory.name)
         self.assertEqual(self.trainer._dpo_beta_controller.state_dict()["_steps"], 4)
         self.assertIsNone(self.setup._dpo_runtime_beta)
