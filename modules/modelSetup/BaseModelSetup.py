@@ -4,9 +4,11 @@ import json
 import os
 from abc import ABCMeta, abstractmethod
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import modules.util.multi_gpu_util as multi
 from modules.model.BaseModel import BaseModel
+from modules.modelSetup.mixin.ModelSetupStreamedDPOMixin import ModelSetupStreamedDPOMixin
 from modules.util.config.TrainConfig import TrainConfig, TrainEmbeddingConfig, TrainModelPartConfig
 from modules.util.enum.AttentionMechanism import AttentionMechanism
 from modules.util.enum.DPOObjective import DPOObjective
@@ -26,6 +28,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 class BaseModelSetup(
     TimedActionMixin,
+    ModelSetupStreamedDPOMixin,
     metaclass=ABCMeta,
 ):
     def __init__(
@@ -42,6 +45,7 @@ class BaseModelSetup(
         self._dpo_ref_params = None
         self._last_dpo_metrics = None
         self._dpo_paired_half = None
+        self._dpo_stream_active = ContextVar(f"ot_dpo_stream_active_{id(self)}", default=False)
         self._dpo_runtime_beta = None
         self._dpo_validation_seed = None
         self._dpo_is_validation = False
@@ -609,7 +613,7 @@ class BaseModelSetup(
         ).pow(2).mean(dim=list(range(1, predicted.ndim)), dtype=torch.float32)
 
     @staticmethod
-    def _validate_rlhf_logp_per_sample(logp: Tensor, chosen_b: int, name: str) -> Tensor:
+    def _validate_rlhf_logp_per_sample(logp: Tensor, chosen_b: int, name: str, *, paired: bool = True) -> Tensor:
         # DPO requires exactly one scalar logp proxy per chosen/rejected sample.
         # A scalar mean loss or unreduced spatial tensor would silently corrupt
         # the preference objective, so fail hard.
@@ -619,7 +623,7 @@ class BaseModelSetup(
                 f"got {type(logp).__name__}"
             )
 
-        expected_b = 2 * int(chosen_b)
+        expected_b = (2 if paired else 1) * int(chosen_b)
         if logp.ndim != 1 or int(logp.shape[0]) != expected_b:
             raise RuntimeError(
                 f"{name} rlhf_logp_per_sample must return shape "
@@ -1215,7 +1219,7 @@ class BaseModelSetup(
 
     def calculate_dpo_loss(
             self, model, batch, config, train_progress, *,
-            validation: bool = False, validation_seed: int = 0,
+            validation: bool = False, validation_seed: int = 0, streamed: bool = False,
     ) -> Tensor:
         previous_seed = self._dpo_validation_seed
         previous_validation = self._dpo_is_validation
@@ -1228,7 +1232,7 @@ class BaseModelSetup(
                     # Model setups using progress-based seeds also get fixed draws.
                     train_progress = copy.copy(train_progress)
                     train_progress.global_step = validation_seed
-                return self._calculate_dpo_loss(model, batch, config, train_progress)
+                return self._calculate_dpo_loss(model, batch, config, train_progress, streamed=streamed)
         finally:
             self._dpo_validation_seed = previous_seed
             self._dpo_is_validation = previous_validation
@@ -1239,6 +1243,7 @@ class BaseModelSetup(
         batch: dict,
         config: TrainConfig,
         train_progress: TrainProgress,
+        *, streamed: bool = False,
     ) -> Tensor:
         if "latent_image_rejected" not in batch:
             raise RuntimeError(
@@ -1250,37 +1255,43 @@ class BaseModelSetup(
         beta = config.rlhf_dpo_beta if self._dpo_is_validation or self._dpo_runtime_beta is None else self._dpo_runtime_beta
         supervised_loss = None
 
-        # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
-        # [chosen; rejected] batch. Both halves share per-pair timestep+noise via
-        # _dpo_paired_half, and ref/policy share them too because predict()
-        # seeds its generator from global_step. Note for torch.compile users:
-        # supervised/validation batches are B-sized while DPO batches are
-        # 2B-sized, so mixing them in one session compiles two graphs.
-        batched_input, chosen_b = self._create_dpo_batched_batch(batch)
+        if streamed:
+            (chosen_b, ref_chosen_logp, ref_rejected_logp, policy_chosen_logp,
+             policy_rejected_logp, supervised_loss, policy_timestep) = self._streamed_dpo_scores(
+                model, batch, config, train_progress,
+            )
+        else:
+            # 2 forwards: 1 batched ref (no_grad) + 1 batched policy, each over the
+            # [chosen; rejected] batch. Both halves share per-pair timestep+noise via
+            # _dpo_paired_half, and ref/policy share them too because predict()
+            # seeds its generator from global_step. Note for torch.compile users:
+            # supervised/validation batches are B-sized while DPO batches are
+            # 2B-sized, so mixing them in one session compiles two graphs.
+            batched_input, chosen_b = self._create_dpo_batched_batch(batch)
 
-        self._dpo_paired_half = chosen_b
-        try:
-            with torch.no_grad(), self.reference_model(model, config):
-                ref_output = self.predict(model, batched_input, config, train_progress)
-                ref_logp = self.rlhf_logp_per_sample(model, batched_input, ref_output, config)
-                ref_logp = self._validate_rlhf_logp_per_sample(ref_logp, chosen_b, "reference")
-                ref_chosen_logp = ref_logp[:chosen_b]
-                ref_rejected_logp = ref_logp[chosen_b:]
-                del ref_output, ref_logp
+            self._dpo_paired_half = chosen_b
+            try:
+                with torch.no_grad(), self.reference_model(model, config):
+                    ref_output = self.predict(model, batched_input, config, train_progress)
+                    ref_logp = self.rlhf_logp_per_sample(model, batched_input, ref_output, config)
+                    ref_logp = self._validate_rlhf_logp_per_sample(ref_logp, chosen_b, "reference")
+                    ref_chosen_logp = ref_logp[:chosen_b]
+                    ref_rejected_logp = ref_logp[chosen_b:]
+                    del ref_output, ref_logp
 
-            policy_output = self.predict(model, batched_input, config, train_progress)
-        finally:
-            self._dpo_paired_half = None
-        policy_timestep = policy_output.get("timestep")
-        policy_logp = self.rlhf_logp_per_sample(model, batched_input, policy_output, config)
-        policy_logp = self._validate_rlhf_logp_per_sample(policy_logp, chosen_b, "policy")
-        policy_chosen_logp = policy_logp[:chosen_b]
-        policy_rejected_logp = policy_logp[chosen_b:]
-        if config.rlhf_chosen_weight > 0 and not self._dpo_is_validation:
-            chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
-            supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
-            del chosen_output
-        del policy_output, policy_logp
+                policy_output = self.predict(model, batched_input, config, train_progress)
+            finally:
+                self._dpo_paired_half = None
+            policy_timestep = policy_output.get("timestep")
+            policy_logp = self.rlhf_logp_per_sample(model, batched_input, policy_output, config)
+            policy_logp = self._validate_rlhf_logp_per_sample(policy_logp, chosen_b, "policy")
+            policy_chosen_logp = policy_logp[:chosen_b]
+            policy_rejected_logp = policy_logp[chosen_b:]
+            if config.rlhf_chosen_weight > 0 and not self._dpo_is_validation:
+                chosen_output, _ = self._split_dpo_batched_output(policy_output, chosen_b)
+                supervised_loss = self.calculate_loss(model, batch, chosen_output, config)
+                del chosen_output
+            del policy_output, policy_logp
 
         chosen_ratio = policy_chosen_logp - ref_chosen_logp.detach()
         rejected_ratio = policy_rejected_logp - ref_rejected_logp.detach()

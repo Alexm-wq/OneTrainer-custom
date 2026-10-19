@@ -1,0 +1,44 @@
+name: Streamed DPO focused checks
+on:
+  push:
+    branches: [codex/streamed-dpo]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  streamed-dpo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install CPU test dependencies
+        run: |
+          python -m pip install torch==2.12.0 torchvision==0.27.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install . ruff
+      - name: Syntax and lint only changed Python files
+        run: |
+          files=(modules/modelSetup/mixin/ModelSetupStreamedDPOMixin.py modules/modelSetup/{BaseModelSetup,BaseFluxSetup,BaseFlux2Setup,BaseFlux3Setup,BaseKrea2Setup,BaseMOSSImageSetup}.py modules/util/{config/ConceptConfig,rlhf_util,ui/validation}.py modules/ui/BaseConceptWindowView.py modules/dataLoader/mixin/DataLoaderText2ImageMixin.py modules/trainer/GenericTrainer.py tests/test_streamed_dpo.py)
+          python -m compileall -q "${files[@]}"
+          ruff check --fix --select F,I "${files[@]}"
+          if ! git diff --quiet; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -- "${files[@]}"
+            git commit -m "Normalize streamed DPO imports"
+            git push origin HEAD:codex/streamed-dpo
+          fi
+      - name: Test streamed DPO and directly affected old path
+        run: |
+          PYTHONPATH=.:tests python -m unittest test_streamed_dpo test_mixed_rlhf.MixedRLHFTest.test_mixed_snapshot_backward_with_and_without_checkpointing test_mixed_rlhf.MixedRLHFTest.test_three_weights_are_independent_in_values_and_gradients -v
+      - name: Record tested commit
+        if: always()
+        run: git rev-parse HEAD

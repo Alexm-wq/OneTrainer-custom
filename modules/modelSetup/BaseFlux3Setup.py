@@ -93,10 +93,10 @@ class BaseFlux3Setup(BaseFlux2Setup):
                 text_encoder_sequence_length=config.text_encoder_sequence_length,
                 text_encoder_dropout_probability=(
                     config.text_encoder.dropout_probability
-                    if not deterministic and self._dpo_paired_half is None else 0.0
+                    if not deterministic and not self._dpo_conditioning_locked() else 0.0
                 ),
             )
-            if config.cep_gamma > 0 and not deterministic and self._dpo_paired_half is None:
+            if config.cep_gamma > 0 and not deterministic and not self._dpo_conditioning_locked():
                 hidden = self._apply_conditional_embedding_perturbation(hidden, config.cep_gamma, generator)
             clean = model.scale_latents(model.patchify_latents(batch["latent_image"].float()))
             noise = self._create_noise(clean, config, generator)

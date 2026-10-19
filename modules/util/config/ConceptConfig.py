@@ -143,6 +143,7 @@ class ConceptConfig(BaseConfig):
     image: ConceptImageConfig
     text: ConceptTextConfig
 
+    dpo_streamed: bool
     dpo_chosen_pattern: str
     dpo_rejected_pattern: str
     def __init__(self, data: list[(str, Any, type, bool)]):
@@ -201,6 +202,7 @@ class ConceptConfig(BaseConfig):
         data.append(("loss_weight", 1.0, float, False))
         data.append(("concept_stats", {}, dict, False))
 
+        data.append(("dpo_streamed", False, bool, False))
         data.append(("dpo_chosen_pattern", "", str, False))
         data.append(("dpo_rejected_pattern", "", str, False))
         return ConceptConfig(data)
