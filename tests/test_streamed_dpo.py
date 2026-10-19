@@ -58,11 +58,11 @@ class StreamedDPOTest(unittest.TestCase):
     def backward(self, loss):
         (loss / self.config.gradient_accumulation_steps).backward()
 
-    def run_pair(self, streamed, scale=1):
+    def run_pair(self, streamed, scale=1, batch=None):
         self.model.optimizer.zero_grad(set_to_none=True)
         self.setup.calls.clear()
         loss = self.setup.calculate_dpo_loss(
-            self.model, self.pair_batch(), self.config, self.progress, streamed=streamed,
+            self.model, self.pair_batch() if batch is None else batch, self.config, self.progress, streamed=streamed,
         )
         (loss * scale).backward()
         gradients = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).flatten() for p in self.params])
@@ -110,9 +110,21 @@ class StreamedDPOTest(unittest.TestCase):
         batch = self.trainer._GenericTrainer__subbatch(self.batch, [0, 1, 1])
         batch["dpo_streamed"] = [False, False, False]
         self.model.optimizer.zero_grad(set_to_none=True)
+        # Compare identical dispatch/RNG shapes. A single two-pair forward
+        # consumes different random draws than two one-pair dispatch groups.
+        expected = torch.zeros(())
         with self.setup.preference_dropout_disabled(self.model):
-            expected = self.trainer._GenericTrainer__calculate_mixed_rlhf_training_loss(batch, self.progress)
-            self.backward(expected)
+            for index in (1, 2):
+                subbatch = self.trainer._GenericTrainer__subbatch(batch, [index])
+                loss = self.setup.calculate_dpo_loss(self.model, subbatch, self.config, self.progress) / 3
+                self.backward(loss)
+                expected += loss.detach()
+            normal = self.trainer._GenericTrainer__subbatch(batch, [0])
+            loss = self.config.rlhf_normal_weight * self.trainer._GenericTrainer__calculate_standard_only_training_loss(
+                normal, self.progress,
+            ) / 3
+            self.backward(loss)
+            expected += loss.detach()
         gradients = [p.grad.clone() for p in self.params]
         batch["dpo_streamed"][-1] = True
         for p in self.params:
@@ -148,6 +160,14 @@ class StreamedDPOTest(unittest.TestCase):
         with patch("modules.util.multi_gpu_util.world_size", return_value=2):
             actual = self.run_pair(True)
         torch.testing.assert_close(actual[1], expected[1], atol=2e-5, rtol=2e-4)
+
+    def test_multiple_pairs_remain_b_sized_and_match_batched_gradients(self):
+        batch = self.trainer._GenericTrainer__subbatch(self.batch, [1, 1])
+        expected = self.run_pair(False, batch=batch)
+        actual = self.run_pair(True, batch=batch)
+        torch.testing.assert_close(actual[0], expected[0])
+        torch.testing.assert_close(actual[1], expected[1], atol=2e-5, rtol=2e-4)
+        self.assertTrue(all(call["size"] == 2 for call in self.setup.calls))
 
     def test_replay_preserves_rng_state(self):
         loss = self.setup.calculate_dpo_loss(
