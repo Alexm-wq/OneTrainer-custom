@@ -6,9 +6,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-import test_mixed_rlhf as fixtures
-from test_mixed_rlhf import TinySetup
-
 from modules.dataLoader.moss.MOSSLayout import MOSSRestoreConcept
 from modules.ui.BaseConceptWindowView import BaseConceptWindowView
 from modules.util.config.ConceptConfig import ConceptConfig
@@ -19,6 +16,9 @@ from modules.util.ui.validation import BaseFieldValidator, validate_path
 
 import torch
 from torch.utils.checkpoint import checkpoint
+
+import test_mixed_rlhf as fixtures
+from test_mixed_rlhf import TinySetup
 
 
 class ReplaySetup(TinySetup):
