@@ -389,10 +389,11 @@ class BaseModelSetup(
         if not self._dpo_hard_pair_curriculum_enabled(config):
             return
         if not os.path.isfile(path):
-            raise RuntimeError(
-                "Hard-Pair Curriculum is enabled, but the resume backup is "
-                f"missing its state file: {path}"
+            print(
+                "[OT-DPO-CURRICULUM] backup has no curriculum state: "
+                f"{path}. Continuing with fresh per-pair statistics."
             )
+            return
 
         with open(path, "r", encoding="utf-8") as handle:
             payload = json.load(handle)
@@ -1700,11 +1701,17 @@ class BaseModelSetup(
         loaded_groups = None
 
         if snapshot_path and not os.path.isfile(snapshot_path):
-            raise RuntimeError(
-                "[DPO] resume backup is missing its fixed reference: "
-                f"{snapshot_path}. Refusing to replace it with the resumed "
-                "policy because that changes the DPO objective."
+            print(
+                "[OT-RLHF] WARNING: backup has no fixed DPO reference: "
+                f"{snapshot_path}. Capturing the resumed adapter as a new "
+                "fixed reference before training. Preference comparisons "
+                "restart from this adapter; this is not an exact continuation "
+                "of the old DPO objective."
             )
+            # Curriculum margins are relative to the old reference, so they
+            # cannot be reused after re-anchoring to the resumed adapter.
+            self._dpo_curriculum_state.clear()
+            self._dpo_curriculum_pending.clear()
         if snapshot_path and os.path.isfile(snapshot_path):
             try:
                 payload = torch.load(
@@ -1770,12 +1777,6 @@ class BaseModelSetup(
             snapshot_groups.append(group)
 
         self._dpo_ref_params = snapshot_groups
-
-        if snapshot_path and loaded_groups is None:
-            raise RuntimeError(
-                "[DPO] failed to restore the saved fixed reference from "
-                f"{snapshot_path}. Refusing unsafe DPO resume."
-            )
 
         if loaded_groups is not None:
             print(f"[OT-RLHF] restored fixed DPO reference from {snapshot_path}")
