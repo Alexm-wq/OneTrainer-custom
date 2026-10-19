@@ -290,37 +290,8 @@ class GenericTrainer(BaseTrainer):
                 "the loaded global step will be checked against its saved GA."
             )
 
-        ref_mode = str(self.config.effective_dpo_ref_mode())
-        if (
-            self.config.rlhf_enabled
-            and ref_mode == "EXISTING_ADAPTER"
-        ):
-            reference_path = os.path.join(
-                backup_path,
-                "onetrainer_dpo_reference.pt",
-            )
-            if not os.path.isfile(reference_path):
-                raise RuntimeError(
-                    "[OT-RESUME] DPO backup is missing its fixed reference: "
-                    f"{reference_path}"
-                )
-
-        if (
-            self.config.rlhf_enabled
-            and self.model_setup._dpo_hard_pair_curriculum_enabled(
-                self.config
-            )
-        ):
-            curriculum_path = os.path.join(
-                backup_path,
-                "onetrainer_dpo_hard_pair_curriculum.json",
-            )
-            if not os.path.isfile(curriculum_path):
-                raise RuntimeError(
-                    "[OT-RESUME] Hard-Pair Curriculum is enabled, but the "
-                    "backup is missing its exact per-pair EMA state: "
-                    f"{curriculum_path}"
-                )
+        # RLHF sidecars may be absent in legacy or previously supervised
+        # backups. Their loaders report and initialize only the missing state.
 
     def __validate_loaded_resume_progress(self, backup_path: str):
         global_step = int(self.model.train_progress.global_step)
@@ -372,25 +343,45 @@ class GenericTrainer(BaseTrainer):
         if not self.config.rlhf_enabled:
             return
         payload = {
+            "version": 1,
             "beta_controller": self._dpo_beta_controller.state_dict() if self._dpo_beta_controller else None,
             "runtime_beta": self.model_setup._dpo_runtime_beta,
             "best_validation": self._dpo_best_validation,
             "validation_bad_steps": self._dpo_validation_bad_steps,
         }
-        with open(os.path.join(backup_path, "onetrainer_rlhf_state.json"), "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, allow_nan=False)
+        os.makedirs(backup_path, exist_ok=True)
+        path = os.path.join(backup_path, "onetrainer_rlhf_state.json")
+        temp_path = f"{path}.tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8", newline="\n") as handle:
+                json.dump(payload, handle, indent=2, allow_nan=False)
+                handle.write("\n")
+            os.replace(temp_path, path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(temp_path)
 
     def __load_rlhf_state(self, backup_path):
         if not self.config.rlhf_enabled:
             return
         path = os.path.join(backup_path, "onetrainer_rlhf_state.json")
-        with open(path, "r", encoding="utf-8") as handle:
-            payload = json.load(handle)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except FileNotFoundError:
+            print(
+                f"[OT-RLHF] backup has no RLHF trainer state: {path}. "
+                "Continuing with fresh adaptive-beta and validation tracking "
+                "from the current settings. Model, optimizer and training "
+                "progress are still restored from the backup."
+            )
+            return
         if self._dpo_beta_controller and payload.get("beta_controller"):
             self._dpo_beta_controller.load_state_dict(payload["beta_controller"])
-            self.model_setup.set_dpo_runtime_beta(payload["runtime_beta"])
+            self.model_setup.set_dpo_runtime_beta(payload.get("runtime_beta"))
         self._dpo_best_validation = payload.get("best_validation")
         self._dpo_validation_bad_steps = int(payload.get("validation_bad_steps", 0))
+        print(f"[OT-RLHF] restored trainer state from {path}")
 
     def __save_config_to_workspace(self):
         path = path_util.canonical_join(self.config.workspace_dir, "config")

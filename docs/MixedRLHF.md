@@ -22,8 +22,8 @@ Zero disables that component's contribution. With RLHF disabled, normal training
 retains its existing behavior.
 
 Set the three new weights explicitly or use the new preset. The removed
-Supervised Mix field is not imported. Start a fresh RLHF run when updating from
-the previous implementation; old RLHF state formats are not supported.
+Supervised Mix field is not imported. Internal backups can be resumed even
+when optional RLHF state files are absent; see Backups and resume below.
 
 ## Starting settings
 
@@ -140,6 +140,33 @@ progress are included in internal backups.
 The cache namespace changes to avoid reusing legacy pair IDs or stale split
 membership. Training and DPO validation use separate cache directories. Existing
 cache files are not deleted automatically.
+
+## Backups and resume
+
+Internal backups save model/adapter weights, optimizer and training progress
+together with these RLHF sidecars:
+
+- `onetrainer_rlhf_state.json`: adaptive-beta controller, runtime beta,
+  best validation score and patience counter. The JSON is written atomically.
+- `onetrainer_dpo_reference.pt`: the original frozen reference for Existing
+  Adapter mode, rather than the current trained policy.
+- `onetrainer_dpo_hard_pair_curriculum.json`: per-pair statistics when
+  Hard-Pair Curriculum is active.
+
+A missing sidecar does not abort resume. This also allows enabling RLHF when
+continuing an older or supervised backup. The trainer logs the missing path
+and initializes only that part of RLHF: beta/validation tracking starts fresh,
+missing curriculum statistics start empty, and a missing Existing Adapter
+reference is captured from the resumed adapter before the first training step.
+That last fallback changes the preference anchor and is explicitly reported;
+the unavailable original reference cannot be reconstructed. New Adapter mode
+continues to use the base model and does not need a reference snapshot.
+
+Existing sidecars are restored, so missing trainer JSON never replaces an
+available fixed reference. Subsequent backups include the newly initialized
+state. Model weights, optimizer state and training progress are not reset by
+these fallbacks. Corrupt/incompatible files that are present still report
+their errors rather than being silently discarded.
 
 ## Regression coverage
 
