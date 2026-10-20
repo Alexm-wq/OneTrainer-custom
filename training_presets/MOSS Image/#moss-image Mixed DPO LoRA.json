@@ -28,6 +28,8 @@
     "train_dtype": "BFLOAT_16",
     "output_dtype": "BFLOAT_16",
     "timestep_distribution": "LOGIT_NORMAL",
+    "noising_weight": 0.0,
+    "noising_bias": 1.09,
     "layer_filter": "layers.",
     "layer_filter_preset": "attn-mlp",
     "quantization": {

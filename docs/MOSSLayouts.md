@@ -37,6 +37,9 @@ actual bucket, resize, crop, flip and rotation have been chosen. Boxes follow
 those exact transforms, including mask-driven rotate/crop. Polygons are clipped
 to the visible canvas; completely removed objects are removed from `items`.
 The final axis-aligned box encloses the remaining polygon.
+The prompt sent to the model uses the official layout compiler's serialization:
+compact JSON with integer pixel edges (minima floored, maxima ceiled). Items
+narrower or shorter than one pixel after cropping are dropped.
 
 The authored scene description and item text are retained verbatim. Avoid
 absolute direction words such as “on the left” if random horizontal flips are

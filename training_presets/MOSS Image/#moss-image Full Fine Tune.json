@@ -36,6 +36,8 @@
     "layer_filter_preset": "full",
     "dropout_probability": 0,
     "timestep_distribution": "LOGIT_NORMAL",
+    "noising_weight": 0.0,
+    "noising_bias": 1.09,
     "timestep_shift": 1,
     "dynamic_timestep_shifting": false
 }

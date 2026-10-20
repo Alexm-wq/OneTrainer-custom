@@ -130,8 +130,11 @@ class LinearW8A8(
             else:
                 y = LinearFp8Function.apply(x, self.weight, self.scale, self.bias, self.compute_dtype)
         else:
-            w = dequantize(self.weight.detach(), self.scale)
-            y = torch.nn.functional.linear(x, w, self.bias)
+            # Match the quantized path's output dtype, with or without an enclosing autocast.
+            dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype
+            w = dequantize(self.weight.detach(), self.scale).to(dtype)
+            bias = self.bias.to(dtype) if self.bias is not None else None
+            y = torch.nn.functional.linear(x.to(dtype), w, bias)
 
         return y.reshape(x_orig.shape[:-1] + (y.shape[-1], ))
 

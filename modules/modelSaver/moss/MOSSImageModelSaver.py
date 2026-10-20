@@ -8,7 +8,6 @@ from modules.modelSaver.mixin.DtypeModelSaverMixin import DtypeModelSaverMixin
 from modules.module.moss import pipeline_moss_image
 from modules.module.quantized.LinearA8 import LinearA8
 from modules.module.quantized.mixin.QuantizedLinearMixin import QuantizedLinearMixin
-from modules.util.convert_util import convert
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.quantization_util import get_unquantized_weight
 
@@ -66,7 +65,10 @@ class MOSSImageModelSaver(
         text_encoder.save_pretrained(os.path.join(destination, "text_encoder"))
         model.tokenizer.save_pretrained(os.path.join(destination, "tokenizer"))
         model.vae.save_pretrained(os.path.join(destination, "vae"))
-        shutil.copyfile(pipeline_moss_image.__file__, os.path.join(destination, "pipeline_moss_image.py"))
+        # Diffusers resolves custom components from their own subfolder, so the
+        # transformer and scheduler need a copy next to their configs.
+        for folder in ("", "transformer", "scheduler"):
+            shutil.copyfile(pipeline_moss_image.__file__, os.path.join(destination, folder, "pipeline_moss_image.py"))
         shutil.copyfile(
             os.path.join(os.path.dirname(pipeline_moss_image.__file__), "LICENSE"),
             os.path.join(destination, "MOSS-LICENSE"),
@@ -93,8 +95,8 @@ class MOSSImageModelSaver(
             dtype: torch.dtype | None,
     ):
         model.transformer_to(torch.device("cpu"))
+        # MOSS ships its native training keys in Diffusers too; there is no key conversion.
         state_dict = self._plain_state_dict(model.transformer, dtype)
-        state_dict = convert(state_dict, model.checkpoint_diffusers_to_original())
 
         save_state_dict = self._convert_state_dict_dtype(state_dict, dtype)
         self._convert_state_dict_to_contiguous(save_state_dict)

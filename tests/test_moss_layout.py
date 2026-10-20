@@ -110,6 +110,16 @@ class GeometryTests(unittest.TestCase):
         self.assertNotIn("canvas_width", prompt)
         self.assertNotIn("_polygon", prompt["items"][0])
 
+    def test_prompt_uses_official_integer_compact_format(self):
+        value = annotation(box=[-32.5, -64.25, 31.2, 0.0])
+        value["items"].append({"label": "object", "caption": "sliver", "bbox": [10, -20, 10.5, 20]})
+        self.assertEqual(
+            layout_prompt(parse_layout(value)),
+            '{"summary":{"meta":[],"canvas":"single","caption":"a red object on a white background"},'
+            '"items":[{"label":"object","caption":"a red object","bbox":[-33,-65,32,0]}],'
+            '"bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}',
+        )
+
     def test_flip_and_positive_rotation_use_image_coordinates(self):
         layout = parse_layout(annotation(100, 100, box=[-40, -30, -10, -10]))
         flipped = transform_layout(layout, 100, 100, flip=True)

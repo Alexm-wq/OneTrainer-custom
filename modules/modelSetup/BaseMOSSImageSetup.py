@@ -44,6 +44,10 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
         model.text_encoder_autocast_context, model.text_encoder_train_dtype = disable_fp16_autocast_context(
             self.train_device, config.train_dtype, config.fallback_train_dtype, config.enable_autocast_cache,
         )
+        if config.text_encoder.weight_dtype.is_quantized():
+            # The loader stores a quantized encoder's remaining tensors in the fallback dtype.
+            # Encoding runs outside the DiT autocast, so its projections must return that dtype too.
+            model.text_encoder_train_dtype = config.fallback_train_dtype
         model.vae.to(dtype=torch.float32)
         model.vae_autocast_context = torch.autocast(self.train_device.type, enabled=False)
         quantize_layers(model.text_encoder, self.train_device, model.text_encoder_train_dtype, config)

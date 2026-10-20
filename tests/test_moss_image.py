@@ -1,6 +1,9 @@
 """CPU tests use randomly initialized tiny models; no model weights are downloaded."""
 import copy
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +11,9 @@ from random import Random
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from modules.dataLoader.moss.MOSSConditioningCache import MOSSConditioningCache
+from modules.dataLoader.moss.MOSSImageCache import MOSSImageCache
+from modules.dataLoader.moss.MOSSLayout import MOSSLayoutInventory
 from modules.dataLoader.MOSSImageBaseDataLoader import MOSSImageBaseDataLoader
 from modules.model.MOSSImageModel import MOSSImageModel
 from modules.modelLoader.MOSSImageModelLoader import MOSSImageLoRALoader, MOSSImageModelLoader
@@ -26,6 +32,7 @@ from modules.util.enum.DataType import DataType
 from modules.util.enum.DPORefMode import DPORefMode
 from modules.util.enum.ModelFormat import ModelFormat
 from modules.util.enum.ModelType import ModelType
+from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModelNames import ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
@@ -68,6 +75,10 @@ class TinyVAE(nn.Module):
     @property
     def dtype(self):
         return self.anchor.dtype
+
+    @property
+    def device(self):
+        return self.anchor.device
 
     def decode(self, latent, return_dict=False):
         assert latent.dtype == torch.float32
@@ -243,6 +254,9 @@ class MOSSImageTest(unittest.TestCase):
             prefix = "modules.modelLoader.MOSSImageModelLoader."
             with patch(prefix + "Qwen2Tokenizer.from_pretrained"), \
                     patch(prefix + "Qwen3_5Model.from_pretrained"), \
+                    patch.object(MOSSImageModelLoader, "_convert_transformers_sub_module_to_dtype",
+                                 side_effect=lambda module, *args: module), \
+                    patch(prefix + "configure_moss_text_kernels"), \
                     patch(prefix + "MOSSImageScheduler.from_pretrained"), \
                     patch(prefix + "AutoencoderKLFlux2.from_pretrained") as vae:
                 loaded = MOSSImageModel(ModelType.MOSS_IMAGE)
@@ -312,19 +326,35 @@ class MOSSImageTest(unittest.TestCase):
             preset = TrainConfig.default_values().from_dict(json.loads(path.read_text()), migrate=False)
             self.assertEqual(preset.model_type, ModelType.MOSS_IMAGE)
             self.assertEqual(preset.vae.weight_dtype, DataType.FLOAT_32)
+            self.assertEqual(
+                (preset.timestep_distribution, preset.noising_bias, preset.noising_weight,
+                 preset.timestep_shift, preset.dynamic_timestep_shifting),
+                (TimestepDistribution.LOGIT_NORMAL, 1.09, 0.0, 1.0, False),
+            )
+
+    def test_preset_timesteps_follow_final_pretraining_noise_level(self):
+        # Technical report Table 6: sigma = sigmoid(N(1.09, 0.95)), median about 0.75.
+        self.config.timestep_distribution = TimestepDistribution.LOGIT_NORMAL
+        self.config.noising_bias, self.config.noising_weight = 1.09, 0.0
+        generator = torch.Generator().manual_seed(0)
+        index = self.setup._get_timestep_discrete(1000, False, generator, 20000, self.config, shift=1.0)
+        sigma = (index.float() + 1) / 1000
+        self.assertAlmostEqual(sigma.median().item(), 0.748, delta=0.01)
 
     def test_dataloader_uses_fp32_vae_and_multires_cache(self):
         loader = object.__new__(MOSSImageBaseDataLoader)
-        loader.train_device = torch.device("cpu")
+        loader.train_device = loader.temp_device = torch.device("cpu")
+        loader.layout_inventory = MOSSLayoutInventory()
         self.model.tokenizer = Mock()
         modules = loader._preparation_modules(self.config, self.model)
         encoder = next(m for m in modules if type(m).__name__ == "EncodeVAE")
         self.assertEqual(encoder.dtype, torch.float32)
         self.assertIs(encoder.autocast_contexts[0], self.model.vae_autocast_context)
-        with patch.object(loader, "_cache_modules_from_names", return_value=[]) as cache:
-            loader._cache_modules(self.config, self.model, self.setup)
-            self.assertIn("tokens_mask", cache.call_args.kwargs["text_split_names"])
-            self.assertIn("latent_image", cache.call_args.kwargs["image_split_names"])
+        self.config.image_caching = self.config.text_caching = True
+        modules = loader._cache_modules(self.config, self.model, self.setup)
+        image_cache = next(m for m in modules if isinstance(m, MOSSImageCache))
+        self.assertIn("latent_image", image_cache.split_names)
+        self.assertTrue(any(isinstance(m, MOSSConditioningCache) and m.enabled for m in modules))
 
 
     def real_components(self):
@@ -394,6 +424,45 @@ class MOSSImageTest(unittest.TestCase):
             hidden, mask = loaded.encode_text("cpu", text="abc", text_encoder_sequence_length=8)
             self.assertTrue(torch.isfinite(hidden).all())
             self.assertGreater(mask.sum(), 0)
+            # The documented external loading must work without OneTrainer or the export on sys.path.
+            with tempfile.TemporaryDirectory() as unrelated:
+                script = (
+                    "import sys; from diffusers import DiffusionPipeline; "
+                    "pipe = DiffusionPipeline.from_pretrained(sys.argv[1], "
+                    "custom_pipeline=sys.argv[1] + '/pipeline_moss_image.py', trust_remote_code=True); "
+                    "print(type(pipe.transformer).__name__, type(pipe.scheduler).__name__)"
+                )
+                env = {**os.environ, "HF_HUB_OFFLINE": "1", "HF_MODULES_CACHE": str(Path(unrelated) / "modules")}
+                result = subprocess.run(
+                    [sys.executable, "-I", "-c", script, root], cwd=unrelated, env=env,
+                    capture_output=True, text=True, timeout=600,
+                )
+                self.assertEqual(result.stdout.split()[-2:], ["MOSSImageTransformer", "MOSSImageScheduler"], result.stderr)
+
+    def test_transformer_only_export_uses_native_keys(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / "transformer.safetensors")
+            MOSSImageModelSaver().save(self.model, ModelFormat.ORIGINAL_TRANSFORMER, path, torch.bfloat16)
+            state = load_file(path)
+        self.assertEqual(state["layers.0.proj.q.weight"].dtype, torch.bfloat16)
+        restored = MOSSImageTransformer.from_config(self.model.transformer.config)
+        restored.load_state_dict(state, strict=True)
+
+    def test_quantized_text_encoder_encodes_outside_dit_autocast(self):
+        tokens, mask = torch.tensor([[1, 2, 3, 0]]), torch.tensor([[1, 1, 1, 0]])
+        # FP8 projections used to return fp32 next to bf16 tensors; W8A8 short prompts fp32 weights.
+        for text_dtype, train_dtype in ((DataType.FLOAT_8, DataType.FLOAT_32), (DataType.INT_W8A8, DataType.BFLOAT_16)):
+            with self.subTest(text_dtype=text_dtype, train_dtype=train_dtype):
+                self.real_components()
+                self.model.text_encoder = MOSSImageModelLoader()._convert_transformers_sub_module_to_dtype(
+                    self.model.text_encoder, text_dtype, DataType.BFLOAT_16,
+                )
+                self.config.text_encoder.weight_dtype = text_dtype
+                self.config.train_dtype, self.config.fallback_train_dtype = train_dtype, DataType.BFLOAT_16
+                self.setup.setup_optimizations(self.model, self.config)
+                hidden, _ = self.model.encode_text("cpu", tokens=tokens, tokens_mask=mask)
+                self.assertEqual(hidden.dtype, torch.bfloat16)
+                self.assertTrue(torch.isfinite(hidden).all())
 
     def test_real_dataloader_cache_restart_and_multiple_resolutions(self):
         self.real_components()
@@ -438,9 +507,10 @@ class MOSSImageTest(unittest.TestCase):
         self.setup.setup_train_device(self.model, self.config)
         self.model.prepare_empty_text.assert_called_once_with(self.config.text_encoder_sequence_length)
 
-    def test_unsupported_offload_rejected_before_training(self):
+    def test_trained_offload_without_checkpointing_rejected_before_training(self):
         self.config.transformer.offload_fraction = .5
-        with self.assertRaisesRegex(ValueError, "per-sample"):
+        self.config.transformer.gradient_checkpointing = False
+        with self.assertRaisesRegex(NotImplementedError, "requires gradient checkpointing"):
             self.setup.setup_optimizations(self.model, self.config)
 
 

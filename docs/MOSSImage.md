@@ -20,6 +20,9 @@ The bundled integration uses the upstream model implementation from Hugging Face
   before each Qwen3.5 forward; the returned mask is preserved through caching.
 - The training time is 1..1000, matching sigma exactly. The fixed training shift is
   1 by default; inference shift 5 is a separate upstream scheduler setting.
+- Presets sample logit-normal timesteps with noising bias 1.09 and weight 0 (standard
+  deviation 1), close to the final pretraining interval (sigma = sigmoid(N(1.09, 0.95)),
+  median about 0.75). Its 0.95 cutoff and 1% uniform mixture are not reproduced.
 - The mixed DPO preset uses Normal=1, DPO=1, Chosen=0.1 and learning rate 1e-5.
   These are starting values, not a measured optimum for MOSS.
 - INT8, NF4, FP8 weights, W8A8/A8 and SVDQuant use OneTrainer's shared quantizers.

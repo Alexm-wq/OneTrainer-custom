@@ -138,14 +138,31 @@ def layout_document(layout):
 
 
 def layout_prompt(layout, extra_caption=""):
+    """Serialize like the official layout compiler: integer pixel edges and compact JSON."""
+    width, height = layout["canvas_width"], layout["canvas_height"]
     result = layout_document(layout)
     result.pop("canvas_width", None)
     result.pop("canvas_height", None)
+    items = []
+    for source, item in zip(layout["items"], result["items"], strict=True):
+        y0, x0, y1, x1 = (float(v) for v in source["bbox"])
+        # Crops can leave slivers narrower than a pixel; they show no object.
+        if y1 - y0 < 1 or x1 - x0 < 1:
+            continue
+        # Floor the minima and ceil the maxima in top-left pixels, then recenter.
+        item["bbox"] = [
+            math.floor(round(y0 + height / 2, 9)) - height // 2,
+            math.floor(round(x0 + width / 2, 9)) - width // 2,
+            math.ceil(round(y1 + height / 2, 9)) - height // 2,
+            math.ceil(round(x1 + width / 2, 9)) - width // 2,
+        ]
+        items.append(item)
+    result["items"] = items
     if extra_caption.strip():
         caption = result["summary"]["caption"]
         if extra_caption.strip() != caption.strip():
             result["summary"]["caption"] = (caption + "\n" + extra_caption).strip()
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def read_layout_source(image_path, mode="auto", prompt_source="sample"):

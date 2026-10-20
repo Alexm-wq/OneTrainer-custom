@@ -5,6 +5,7 @@ on:
     branches: [main, codex/moss-image-base]
     paths:
       - "modules/**"
+      - "tests/test_moss_image.py"
       - "tests/test_moss_features.py"
       - "tests/test_moss_offloading.py"
       - "tests/test_moss_training_ui.py"
@@ -60,6 +61,9 @@ jobs:
           PYTHONPATH=tests:. xvfb-run -a python -m unittest -v \
             test_moss_training_ui.CtkTrainingUITest.test_new_moss_quantization_and_offload_controls \
             test_moss_training_ui.PySide6TrainingUITest.test_new_moss_quantization_and_offload_controls
+      - name: Focused MOSS integration tests
+        if: ${{ !cancelled() }}
+        run: python -m unittest discover -s tests -p test_moss_image.py -v
       - name: Focused MOSS feature tests
         if: ${{ !cancelled() }}
         run: python -m unittest discover -s tests -p test_moss_features.py -v
