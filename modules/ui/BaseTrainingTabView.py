@@ -54,9 +54,7 @@ class BaseTrainingTabView(ABC):
             self.__setup_anima_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_krea2():
             self.__setup_krea2_ui(column_0, column_1, column_2, controller, ui_state)
-        elif model_type.is_flux_3():
-            self.__setup_moss_image_ui(column_0, column_1, column_2, controller, ui_state)
-        elif model_type.is_moss_image():
+        elif model_type.is_flux_3() or model_type.is_moss_image():
             self.__setup_moss_image_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_sana():
             self.__setup_sana_ui(column_0, column_1, column_2, controller, ui_state)
