@@ -43,6 +43,7 @@ class CtkSampleWindowView(BaseSampleWindowView, ctk.CTkToplevel):
         self.grid_rowconfigure(1, weight=1)
         self.grid_rowconfigure(2, weight=0)
         self.grid_rowconfigure(3, weight=0)
+        self.grid_rowconfigure(4, weight=0)
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
 
@@ -62,7 +63,9 @@ class CtkSampleWindowView(BaseSampleWindowView, ctk.CTkToplevel):
         image_label.grid(row=1, column=1, rowspan=3, sticky="nsew")
 
         self.progress = self.components.progress(self, 2, 0)
-        self.components.button(self, 3, 0, "sample",
+        if controller.supports_ema_choice():
+            self.components.switch(self, 3, 0, self.ui_state, "use_ema", text="sample with EMA weights")
+        self.components.button(self, 4, 0, "sample",
                                lambda: controller.do_sample(self.__update_preview, self.__update_progress))
 
         self.wait_visibility()

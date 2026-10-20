@@ -52,6 +52,10 @@ class SampleWindowController:
     def get_model_type(self):
         return self.current_train_config.model_type
 
+    def supports_ema_choice(self) -> bool:
+        # only a running training has EMA weights; standalone sampling loads without EMA
+        return self.use_external_model and self.current_train_config.ema != EMAMode.OFF
+
     def load_model(self) -> BaseModel:
         model_loader = create.create_model_loader(
             model_type=self.initial_train_config.model_type,

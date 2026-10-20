@@ -5,4 +5,4 @@
 
 class BaseSampleWindowView:
     def __init__(self, components):
-        pass
+        self.components = components

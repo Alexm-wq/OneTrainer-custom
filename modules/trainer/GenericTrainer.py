@@ -537,7 +537,13 @@ class GenericTrainer(BaseTrainer):
                 print("Error during loading the sample definition file, proceeding without sampling")
                 sample_params_list = []
 
-        if self.model.ema:
+        # manual samples can opt out of the EMA weights to show the current training state
+        ema_sample_params_list, no_ema_sample_params_list = sample_params_list, []
+        if is_custom_sample and self.config.ema != EMAMode.OFF:
+            ema_sample_params_list = [sample for sample in sample_params_list if sample.use_ema]
+            no_ema_sample_params_list = [sample for sample in sample_params_list if not sample.use_ema]
+
+        if self.model.ema and ema_sample_params_list:
             #the EMA model only exists in the master process, so EMA sampling is done on one GPU only
             #non-EMA sampling is done on all GPUs
             assert multi.is_master() and self.config.ema != EMAMode.OFF
@@ -546,13 +552,22 @@ class GenericTrainer(BaseTrainer):
         self.__sample_loop(
             train_progress=train_progress,
             train_device=train_device,
-            sample_config_list=sample_params_list,
+            sample_config_list=ema_sample_params_list,
             is_custom_sample=is_custom_sample,
             ema_applied = self.config.ema != EMAMode.OFF
         )
 
-        if self.model.ema:
+        if self.model.ema and ema_sample_params_list:
             self.model.ema.copy_temp_to(self.parameters)
+
+        if no_ema_sample_params_list:
+            self.__sample_loop(
+                train_progress=train_progress,
+                train_device=train_device,
+                sample_config_list=no_ema_sample_params_list,
+                is_custom_sample=True,
+                ema_applied=False,
+            )
 
         # ema-less sampling, if ema is enabled:
         if self.config.ema != EMAMode.OFF and not is_custom_sample and self.config.non_ema_sampling:

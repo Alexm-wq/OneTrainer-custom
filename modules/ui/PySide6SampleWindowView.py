@@ -54,6 +54,9 @@ class PySide6SampleWindowView(BaseSampleWindowView, QDialog):
         self._progress.setRange(0, 1000)
         outer.addWidget(self._progress, 2, 0)
 
+        if controller.supports_ema_choice():
+            self.components.switch(self, 3, 0, self.ui_state, "use_ema", text="sample with EMA weights")
+
         sample_btn = QPushButton("sample", self)
         def _on_sample():
             # With an external model (manual sample during training) do_sample
@@ -76,7 +79,7 @@ class PySide6SampleWindowView(BaseSampleWindowView, QDialog):
 
             threading.Thread(target=_run, daemon=True).start()
         sample_btn.clicked.connect(_on_sample)
-        outer.addWidget(sample_btn, 3, 0)
+        outer.addWidget(sample_btn, 4, 0)
 
 
     def schedule_on_main_thread(self, fn):

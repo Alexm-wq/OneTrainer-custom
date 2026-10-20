@@ -183,6 +183,8 @@ class SampleConfig(BaseConfig):
     diffusion_steps: int
     cfg_scale: float
     noise_scheduler: NoiseScheduler
+    # manual samples only: False samples the current weights instead of the EMA weights
+    use_ema: bool
 
     text_encoder_1_layer_skip: int
     text_encoder_1_sequence_length: int | None
@@ -232,6 +234,7 @@ class SampleConfig(BaseConfig):
         data.append(("diffusion_steps", defaults["diffusion_steps"], int, False))
         data.append(("cfg_scale", defaults["cfg_scale"], float, False))
         data.append(("noise_scheduler", defaults["noise_scheduler"], NoiseScheduler, False))
+        data.append(("use_ema", True, bool, False))
 
         data.append(("text_encoder_1_layer_skip", 0, int, False))
         data.append(("text_encoder_1_sequence_length", None, int, True))
