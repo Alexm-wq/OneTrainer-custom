@@ -281,6 +281,27 @@ class RLHFBackupTest(unittest.TestCase):
         self.assertEqual(path.read_bytes(), original)
         self.assertFalse(Path(str(path) + ".tmp").exists())
 
+    def test_backup_inside_accumulation_window_discards_unapplied_gradients(self):
+        # end() backs up and saves even when train() stopped or failed mid-window.
+        self.gradient(self.trainer)
+        self.model.optimizer.step()
+        self.gradient(self.trainer)  # accumulated, never applied
+        self.trainer._gradient_accumulation_dirty = True
+        self.trainer._dpo_metric_sums = {"loss": 1.0}
+        self.trainer._dpo_metric_weight = 1.0
+        stepped = [p.detach().clone() for p in self.params]
+        output = io.StringIO()
+        with redirect_stdout(output):
+            path = self.backup()
+        self.assertIn("discarded an incomplete gradient-accumulation window", output.getvalue())
+        self.assertFalse(self.trainer._gradient_accumulation_dirty)
+        self.assertEqual((self.trainer._dpo_metric_sums, self.trainer._dpo_metric_weight), ({}, 0.0))
+        self.assertTrue(all(p.grad is None for p in self.params))
+        restored = self.restore(path)
+        restored_params = [p for a in restored.model.adapters() for p in a.parameters() if p.requires_grad]
+        for old, new in zip(stepped, restored_params, strict=True):
+            torch.testing.assert_close(old, new)
+
     def test_present_corrupt_files_and_missing_optimizer_remain_visible(self):
         path = self.backup()
         (path / "onetrainer_rlhf_state.json").write_text("{broken", encoding="utf-8")

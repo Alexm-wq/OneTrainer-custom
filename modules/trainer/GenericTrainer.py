@@ -717,12 +717,23 @@ class GenericTrainer(BaseTrainer):
         if os.path.isfile(self.config.sample_definition_file_name):
             shutil.copy2(self.config.sample_definition_file_name, samples_path)
 
+    def __discard_incomplete_accumulation_window(self):
+        # The optimizer never applied these gradients. Backups and saves keep the last completed
+        # optimizer step, e.g. when end() runs after train() stopped or failed mid-window.
+        if not self._gradient_accumulation_dirty:
+            return
+        self.model.optimizer.zero_grad(set_to_none=True)
+        self._gradient_accumulation_dirty = False
+        self._dpo_metric_sums.clear()
+        self._dpo_metric_weight = 0.0
+        self.model_setup.discard_dpo_curriculum_pending()
+        print(
+            "[OT-TRAIN] discarded an incomplete gradient-accumulation window; "
+            "backups and saves use the last completed optimizer step."
+        )
+
     def __backup(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
-        if self._gradient_accumulation_dirty:
-            raise RuntimeError(
-                "[OT-RESUME] refusing to write a backup inside an unfinished "
-                "gradient-accumulation window."
-            )
+        self.__discard_incomplete_accumulation_window()
 
         torch_gc()
 
@@ -786,11 +797,7 @@ class GenericTrainer(BaseTrainer):
         torch_gc()
 
     def __save(self, train_progress: TrainProgress, print_msg: bool = True, print_cb: Callable[[str], None] = print):
-        if self._gradient_accumulation_dirty:
-            raise RuntimeError(
-                "[OT-TRAIN] refusing to save inside an unfinished "
-                "gradient-accumulation window."
-            )
+        self.__discard_incomplete_accumulation_window()
 
         torch_gc()
 
@@ -1766,20 +1773,13 @@ class GenericTrainer(BaseTrainer):
             ):
                 return
 
-        if self._gradient_accumulation_dirty:
-            self.model.optimizer.zero_grad(set_to_none=True)
-            self._gradient_accumulation_dirty = False
-            self._dpo_metric_sums.clear()
-            self._dpo_metric_weight = 0.0
-            self.model_setup.discard_dpo_curriculum_pending()
-            print(
-                "[OT-TRAIN] discarded an incomplete final gradient-"
-                "accumulation window; no resumable backup was written for it."
-            )
+        self.__discard_incomplete_accumulation_window()
 
     def end(self):
         if self.one_step_trained:
             self.model.to(self.temp_device)
+            # train() can end mid-window through an exception; the final save must still happen.
+            self.__discard_incomplete_accumulation_window()
 
             if self.config.backup_before_save and multi.is_master():
                 self.__backup(self.model.train_progress)
