@@ -1076,6 +1076,10 @@ def create_optimizer(
                 eps=optimizer_config.eps if optimizer_config.eps is not None else 1e-3,
             )
 
+    if optimizer is not None and config.optimizer.optimizer.is_adv:
+        from modules.util.optimizer.adv_optm_compile import fix_compiled_step_guards
+        fix_compiled_step_guards(optimizer)
+
     if state_dict is not None and optimizer is not None:
         if 'param_group_mapping' not in state_dict:
             # Old method of loading the optimizer state. This only works if the param groups did not change.

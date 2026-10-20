@@ -5,6 +5,8 @@ on:
     branches: [codex/adv-optm-update]
     paths:
       - "tests/test_adv_optm_upgrade.py"
+      - "tests/test_adv_optm_compile.py"
+      - "modules/util/optimizer/adv_optm_compile.py"
       - ".github/workflows/adv-optm-upgrade.yml"
       - "pyproject.toml"
       - "modules/util/optimizer/adv_optm_util.py"
@@ -39,3 +41,5 @@ jobs:
         run: |
           python -m pip install --no-deps adv-optm==2.5.16
           python -m unittest discover -s tests -p test_adv_optm_upgrade.py -v
+      - name: Compiled optimizer steps compile once
+        run: python -m unittest discover -s tests -p test_adv_optm_compile.py -v
