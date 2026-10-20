@@ -92,10 +92,20 @@ class CtkSampleWindowView(BaseSampleWindowView, ctk.CTkToplevel):
             if hasattr(self, "_icon_image_ref"):
                 del self._icon_image_ref
 
-            # Remove any pending after callbacks
-            for after_id in self.tk.call('after', 'info'):
+            # Remove pending after callbacks of this window and its widgets. "after info" lists
+            # the callbacks of the whole interpreter, including the main window's UI updates.
+            # Cancel through the registering widget, so it also forgets the deleted command.
+            owners = {}
+            widgets = [self]
+            while widgets:
+                widget = widgets.pop()
+                owners.update(dict.fromkeys(getattr(widget, "_tclCommands", None) or [], widget))
+                widgets.extend(widget.winfo_children())
+            for after_id in self.tk.splitlist(self.tk.call('after', 'info')):
                 with contextlib.suppress(tk.TclError, RuntimeError):
-                    self.after_cancel(after_id)
+                    script = self.tk.splitlist(self.tk.call('after', 'info', after_id))[0]
+                    if script in owners:
+                        owners[script].after_cancel(after_id)
 
             super().destroy()
         except (tk.TclError, RuntimeError) as e:
