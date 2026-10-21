@@ -287,6 +287,12 @@ class FaceLandmarkPairingTest(test_moss_pairing.MOSSPairingTest):
         detector.start()
         self.addCleanup(detector.stop)
 
+    def test_latent_and_text_conditioning_belong_to_the_same_image(self):
+        super().test_latent_and_text_conditioning_belong_to_the_same_image()
+        # Enabling the reward re-caches images with landmarks, but keeps the text cache.
+        caches = sorted(path.name for path in self.root.glob("cache-True-True/moss-layout-*/*"))
+        self.assertEqual(caches, ["image-faces-yunet", "text"])
+
     def check_row(self, batch, row):
         identity = super().check_row(batch, row)
         red = test_moss_pairing.color(*identity)[0]

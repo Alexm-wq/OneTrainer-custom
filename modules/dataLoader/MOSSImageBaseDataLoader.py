@@ -116,15 +116,17 @@ class MOSSImageBaseDataLoader(
             "encoder_revision": getattr(getattr(model.text_encoder, "config", None), "_commit_hash", None),
             "sequence_length": config.text_encoder_sequence_length or 4096,
         }
-        if config.identity_reward:
-            identity["face_detector"] = os.path.basename(config.identity_reward_detector_path)
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
         config.cache_dir = os.path.join(config.cache_dir, "moss-layout-" + key)
         image_split = ["latent_image", "original_resolution", "crop_offset"]
         if config.masked_training or config.model_type.has_mask_input():
             image_split.append("latent_mask")
+        image_cache_name = "image"
         if config.identity_reward:
             image_split.append("face_landmarks")
+            # Landmarks live next to the latents; the text cache stays valid.
+            detector = os.path.splitext(os.path.basename(config.identity_reward_detector_path))[0]
+            image_cache_name = "image-faces-" + detector
         # Layout and source index belong to the SAME resolution/augmentation as
         # the latent. No separate row-based text cache may select a different one.
         image_aggregate = ["crop_resolution", "image_path", "moss_layout", "moss_source_index", "moss_source_key"]
@@ -151,7 +153,7 @@ class MOSSImageBaseDataLoader(
         if config.image_caching:
             modules = [MOSSImageCache(
                 inventory=self.layout_inventory,
-                cache_dir=os.path.join(config.cache_dir, "image"),
+                cache_dir=os.path.join(config.cache_dir, image_cache_name),
                 split_names=image_split, aggregate_names=image_aggregate,
                 variations_in_name="concept.image_variations",
                 balancing_in_name="concept.balancing", balancing_strategy_in_name="concept.balancing_strategy",
