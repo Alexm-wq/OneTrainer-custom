@@ -9,17 +9,21 @@ from modules.util import create
 
 # isort: split
 from modules.modelSetup.BaseFlux2Setup import BaseFlux2Setup
+from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.identity_reward import (
     ARCFACE_TEMPLATE,
+    KNOWN_HASHES,
+    YUNET_URL,
     IResNet,
     align_face,
     alignment_matrix,
     identity_losses,
     latent_face_box,
     load_arcface,
+    resolve_model_file,
     similarity_transform,
 )
 from modules.util.TrainProgress import TrainProgress
@@ -103,6 +107,28 @@ class ArcFaceLoadTest(unittest.TestCase):
             torch.save({"fc.weight": torch.zeros(4, 4)}, path)
             with self.assertRaises(ValueError):
                 load_arcface(str(path))
+
+
+class ModelFileTest(unittest.TestCase):
+    def test_local_files_hugging_face_links_and_urls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            local = Path(directory, "backbone.pth")
+            local.touch()
+            self.assertEqual(resolve_model_file(str(local)), str(local))
+        with patch("huggingface_hub.hf_hub_download", return_value="/cache/backbone.pth") as download:
+            link = "https://huggingface.co/someone/arcface/resolve/main/r100/backbone.pth?download=true"
+            self.assertEqual(resolve_model_file(link), "/cache/backbone.pth")
+            download.assert_called_once_with("someone/arcface", "r100/backbone.pth", revision="main", repo_type=None)
+            resolve_model_file("https://huggingface.co/datasets/someone/faces/blob/abc123/backbone.pth")
+            download.assert_called_with("someone/faces", "backbone.pth", revision="abc123", repo_type="dataset")
+        with patch("pooch.retrieve", return_value="/cache/yunet.onnx") as retrieve:
+            self.assertEqual(resolve_model_file(YUNET_URL), "/cache/yunet.onnx")
+            args, kwargs = retrieve.call_args
+            self.assertEqual(args[:2], (YUNET_URL, KNOWN_HASHES[YUNET_URL]))
+            self.assertTrue(kwargs["fname"].endswith("-face_detection_yunet_2023mar.onnx"))
+        with self.assertRaises(FileNotFoundError):
+            resolve_model_file("missing/backbone.pth")
+        self.assertEqual(TrainConfig.default_values().identity_reward_detector_path, YUNET_URL)
 
 
 class StreamedLossTest(unittest.TestCase):

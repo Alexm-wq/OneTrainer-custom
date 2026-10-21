@@ -69,10 +69,13 @@ embedding as the face in the training image.
 - TensorBoard shows `loss/identity` (mean `1 - cosine similarity`) and
   `identity/faces`.
 
-Required files, not downloaded by OneTrainer: an insightface `arcface_torch`
-backbone (`backbone.pth` of an IResNet r50/r100, e.g. `ms1mv3_arcface_r100_fp16`)
-and `face_detection_yunet_2023mar.onnx` from the OpenCV model zoo. InsightFace's
-pretrained recognition models are licensed for non-commercial research only.
+Both model fields take a local file, a Hugging Face file link
+(`https://huggingface.co/<repo>/resolve/<revision>/<file>`) or another download URL;
+downloads happen once and are cached. The face detector defaults to
+`face_detection_yunet_2023mar.onnx` from the OpenCV model zoo, pinned to a commit and
+checked by its SHA256. The ArcFace model must be an insightface `arcface_torch`
+backbone (`backbone.pth` of an IResNet r50/r100, e.g. `ms1mv3_arcface_r100_fp16`).
+InsightFace's pretrained recognition models are licensed for non-commercial research only.
 
 ## Sampling
 

@@ -837,11 +837,11 @@ class BaseTrainingTabView(ABC):
         self.components.entry(frame, 5, 1, ui_state, "identity_reward_trigger")
 
         self.components.label(frame, 6, 0, "ArcFace Model",
-                              tooltip="insightface arcface_torch backbone (backbone.pth, IResNet r50/r100).")
+                              tooltip="insightface arcface_torch backbone (backbone.pth, IResNet r50/r100): a local file or a Hugging Face file link, downloaded once.")
         self.components.path_entry(frame, 6, 1, ui_state, "identity_reward_arcface_path", mode="file")
 
         self.components.label(frame, 7, 0, "Face Detector Model",
-                              tooltip="OpenCV YuNet model, face_detection_yunet_2023mar.onnx.")
+                              tooltip="OpenCV YuNet model (face_detection_yunet_2023mar.onnx): a local file or a link. The default downloads it from the OpenCV model zoo once.")
         self.components.path_entry(frame, 7, 1, ui_state, "identity_reward_detector_path", mode="file")
 
     def __create_masked_frame(self, master, row, ui_state):

@@ -8,7 +8,7 @@ from modules.util.dtype_util import create_autocast_context, disable_fp16_autoca
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.DataType import DataType
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.identity_reward import identity_losses, load_arcface
+from modules.util.identity_reward import identity_losses, load_arcface, resolve_model_file
 from modules.util.quantization_util import quantize_layers
 
 import torch
@@ -147,7 +147,7 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
             return
         if not config.identity_reward_arcface_path or not config.identity_reward_detector_path:
             raise ValueError("The identity reward needs an ArcFace backbone and a YuNet face detector model.")
-        self._arcface = load_arcface(config.identity_reward_arcface_path).to(self.train_device)
+        self._arcface = load_arcface(resolve_model_file(config.identity_reward_arcface_path)).to(self.train_device)
         self._identity_metrics = [0.0, 0]
         if getattr(model.vae, "_supports_gradient_checkpointing", False):
             # Only matters for the reward's decode; the VAE runs without gradients everywhere else.

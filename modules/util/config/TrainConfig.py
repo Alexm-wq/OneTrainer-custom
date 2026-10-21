@@ -30,6 +30,7 @@ from modules.util.enum.TimestepDistribution import TimestepDistribution
 from modules.util.enum.TimeUnit import TimeUnit
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.enum.VideoFormat import VideoFormat
+from modules.util.identity_reward import YUNET_URL
 from modules.util.ModelNames import EmbeddingName, ModelNames
 from modules.util.ModelWeightDtypes import ModelWeightDtypes
 from modules.util.torch_util import default_device
@@ -1201,7 +1202,7 @@ class TrainConfig(BaseConfig):
         data.append(("identity_reward_max_crop", 512, int, False))
         data.append(("identity_reward_trigger", "", str, False))
         data.append(("identity_reward_arcface_path", "", str, False))
-        data.append(("identity_reward_detector_path", "", str, False))
+        data.append(("identity_reward_detector_path", YUNET_URL, str, False))
 
 
         # unet

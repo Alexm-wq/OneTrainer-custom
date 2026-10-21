@@ -3,7 +3,11 @@
 The IResNet matches insightface's arcface_torch layout, so its backbone.pth files load as they are.
 Landmarks come from OpenCV's YuNet detector, whose five points share ArcFace's template order.
 """
+import hashlib
+import os
+import re
 import threading
+from urllib.parse import urlparse
 
 import torch
 import torch.nn.functional as F
@@ -19,6 +23,40 @@ ARCFACE_TEMPLATE = (
 LATENT_MARGIN = 2
 # Smaller faces give ArcFace too few pixels to judge identity.
 MIN_EYE_DISTANCE = 20.0
+# YuNet for OpenCV 4.x, pinned to an opencv_zoo commit.
+YUNET_URL = (
+    "https://github.com/opencv/opencv_zoo/raw/48b10fa505aeb51fbd127fc60a5c660040e823b7/"
+    "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+)
+KNOWN_HASHES = {YUNET_URL: "sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"}
+HF_FILE_URL = re.compile(
+    r"https://huggingface\.co/(?:(datasets|spaces)/)?([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/([^?#]+)(?:[?#].*)?"
+)
+
+
+def resolve_model_file(location: str) -> str:
+    """A local file, a Hugging Face file link or another download URL, as a local path.
+
+    Hugging Face files land in its usual cache; other downloads in external/models/identity.
+    """
+    if os.path.isfile(location):
+        return location
+    match = HF_FILE_URL.fullmatch(location)
+    if match:
+        import huggingface_hub
+        repo_type, repo_id, revision, filename = match.groups()
+        return huggingface_hub.hf_hub_download(
+            repo_id, filename, revision=revision, repo_type=repo_type[:-1] if repo_type else None,
+        )
+    if location.startswith(("https://", "http://")):
+        import pooch
+        # The URL hash keeps different files with the same name apart.
+        name = hashlib.sha256(location.encode()).hexdigest()[:8] + "-" + os.path.basename(urlparse(location).path)
+        return pooch.retrieve(
+            location, KNOWN_HASHES.get(location), fname=name,
+            path=os.path.join("external", "models", "identity"), progressbar=True,
+        )
+    raise FileNotFoundError(f"Model file not found: {location!r}")
 
 
 class IBasicBlock(nn.Module):

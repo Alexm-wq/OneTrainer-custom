@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import os
+from urllib.parse import urlparse
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
@@ -25,7 +26,7 @@ from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
-from modules.util.identity_reward import FaceLandmarkDetector
+from modules.util.identity_reward import FaceLandmarkDetector, resolve_model_file
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -53,10 +54,9 @@ class MOSSImageBaseDataLoader(
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(downscale_mask)
         if config.identity_reward:
-            if not os.path.isfile(config.identity_reward_detector_path):
-                raise FileNotFoundError(f"Face detector model not found: {config.identity_reward_detector_path!r}")
+            detector = FaceLandmarkDetector(resolve_model_file(config.identity_reward_detector_path))
             # Detects on the final crop, before the image is rescaled for the VAE.
-            modules.insert(0, MOSSFaceLandmarks(FaceLandmarkDetector(config.identity_reward_detector_path)))
+            modules.insert(0, MOSSFaceLandmarks(detector))
 
         return modules
 
@@ -125,7 +125,7 @@ class MOSSImageBaseDataLoader(
         if config.identity_reward:
             image_split.append("face_landmarks")
             # Landmarks live next to the latents; the text cache stays valid.
-            detector = os.path.splitext(os.path.basename(config.identity_reward_detector_path))[0]
+            detector = os.path.splitext(os.path.basename(urlparse(config.identity_reward_detector_path).path))[0]
             image_cache_name = "image-faces-" + detector
         # Layout and source index belong to the SAME resolution/augmentation as
         # the latent. No separate row-based text cache may select a different one.
