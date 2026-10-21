@@ -141,10 +141,12 @@ class PySide6PathValidator(PySide6FieldValidator):
         io_type: PathIOType = PathIOType.INPUT,
         extra_validate: Callable[[str], str | None] | None = None,
         required: bool = False,
+        allow_urls: bool = False,
     ):
         super().__init__(component, var, ui_state, var_name,
                          extra_validate=extra_validate, required=required)
         self.io_type = io_type
+        self.allow_urls = allow_urls
 
     def validate(self, value: str) -> str | None:
         base_err = super().validate(value)
@@ -152,7 +154,7 @@ class PySide6PathValidator(PySide6FieldValidator):
             return base_err
         if value == "":
             return None
-        return _validate_path_field(self.ui_state, self.io_type, value)
+        return _validate_path_field(self.ui_state, self.io_type, value, self.allow_urls)
 
     def revalidate(self) -> None:
         if self._bound:

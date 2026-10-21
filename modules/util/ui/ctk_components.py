@@ -123,6 +123,7 @@ def path_entry(
         extra_validate: Callable[[str], str | None] | None = None,
         required: bool = False,
         columnspan: int = 1,
+        allow_urls: bool = False,
 ):
     frame = ctk.CTkFrame(master, fg_color="transparent")
     frame.grid(row=row, column=column, padx=0, pady=0, sticky="new", columnspan=columnspan)
@@ -130,7 +131,7 @@ def path_entry(
     frame.grid_columnconfigure(0, weight=1)
 
     def _path_validator_factory(comp, var, state, name, **kw):
-        return PathValidator(comp, var, state, name, io_type=io_type, **kw)
+        return PathValidator(comp, var, state, name, io_type=io_type, allow_urls=allow_urls, **kw)
 
     entry_component = entry(
         frame, row=0, column=0, ui_state=ui_state, var_name=var_name,

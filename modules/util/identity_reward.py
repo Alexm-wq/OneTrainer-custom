@@ -55,6 +55,10 @@ def resolve_model_file(location: str) -> str:
         )
     if location.startswith(("https://", "http://")):
         import pooch
+        parsed = urlparse(location)
+        if parsed.netloc == "github.com" and "/blob/" in parsed.path:
+            # A link copied from GitHub's file view; /raw/ serves the file itself.
+            location = location.replace("/blob/", "/raw/", 1)
         # The URL hash keeps different files with the same name apart.
         name = hashlib.sha256(location.encode()).hexdigest()[:8] + "-" + os.path.basename(urlparse(location).path)
         return pooch.retrieve(

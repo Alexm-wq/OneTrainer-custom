@@ -27,6 +27,7 @@ from modules.util.identity_reward import (
     similarity_transform,
 )
 from modules.util.TrainProgress import TrainProgress
+from modules.util.ui.validation import validate_path
 
 import torch
 from torch.nn import functional as F
@@ -208,6 +209,9 @@ class ModelFileTest(unittest.TestCase):
             args, kwargs = retrieve.call_args
             self.assertEqual(args[:2], (YUNET_URL, KNOWN_HASHES[YUNET_URL]))
             self.assertTrue(kwargs["fname"].endswith("-face_detection_yunet_2023mar.onnx"))
+        with patch("pooch.retrieve", return_value="/cache/yunet.onnx") as retrieve:
+            resolve_model_file(YUNET_URL.replace("/raw/", "/blob/"))
+            self.assertEqual(retrieve.call_args.args[:2], (YUNET_URL, KNOWN_HASHES[YUNET_URL]))
         with self.assertRaises(FileNotFoundError):
             resolve_model_file("missing/backbone.pth")
         self.assertEqual(TrainConfig.default_values().identity_reward_detector_path, YUNET_URL)
@@ -215,6 +219,13 @@ class ModelFileTest(unittest.TestCase):
         with patch("huggingface_hub.hf_hub_download", return_value="/cache/arcface.onnx") as download:
             resolve_model_file(arcface)
         download.assert_called_once_with("FoivosPar/Arc2Face", "arcface.onnx", revision="main", repo_type=None)
+
+    def test_model_fields_accept_download_links(self):
+        self.assertIsNone(validate_path(YUNET_URL, allow_urls=True))
+        self.assertIsNone(validate_path(TrainConfig.default_values().identity_reward_arcface_path, allow_urls=True))
+        # Other path fields keep rejecting arbitrary links, and a link must name a file.
+        self.assertIsNotNone(validate_path(YUNET_URL))
+        self.assertIsNotNone(validate_path("https://github.com/opencv/opencv_zoo", allow_urls=True))
 
 
 class StreamedLossTest(unittest.TestCase):

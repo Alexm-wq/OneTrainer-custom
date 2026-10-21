@@ -838,11 +838,11 @@ class BaseTrainingTabView(ABC):
 
         self.components.label(frame, 6, 0, "ArcFace Model",
                               tooltip="insightface ArcFace model: an ONNX export (antelopev2, buffalo_l, Arc2Face) or an arcface_torch backbone.pth. A local file or a Hugging Face file link, downloaded once. The default is Arc2Face's ArcFace R100.")
-        self.components.path_entry(frame, 6, 1, ui_state, "identity_reward_arcface_path", mode="file")
+        self.components.path_entry(frame, 6, 1, ui_state, "identity_reward_arcface_path", mode="file", allow_urls=True)
 
         self.components.label(frame, 7, 0, "Face Detector Model",
                               tooltip="OpenCV YuNet model (face_detection_yunet_2023mar.onnx): a local file or a link. The default downloads it from the OpenCV model zoo once.")
-        self.components.path_entry(frame, 7, 1, ui_state, "identity_reward_detector_path", mode="file")
+        self.components.path_entry(frame, 7, 1, ui_state, "identity_reward_detector_path", mode="file", allow_urls=True)
 
     def __create_masked_frame(self, master, row, ui_state):
         frame = self.components.section_frame(master, row)

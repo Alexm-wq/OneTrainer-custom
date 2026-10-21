@@ -116,8 +116,13 @@ class TrainingUIAssertions:
         self.assertEqual(self.config.identity_reward_max_sigma, 0.4)
         self.assertEqual(self.config.identity_reward_max_crop, 768)
         self.assertEqual(self.config.identity_reward_trigger, "zx person, zxp")
-        self.assertIn("ArcFace Model", self.labels())
-        self.assertIn("Face Detector Model", self.labels())
+        # Both model fields take download links, not only files on this machine.
+        arcface = "https://huggingface.co/FoivosPar/Arc2Face/blob/main/arcface.onnx"
+        detector = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+        self.edit_path("ArcFace Model", arcface)
+        self.edit_path("Face Detector Model", detector)
+        self.assertEqual(self.config.identity_reward_arcface_path, arcface)
+        self.assertEqual(self.config.identity_reward_detector_path, detector)
         # FLUX.3 shares the MOSS layout but has no identity reward.
         self.state.get_var("model_type").set(str(ModelType.FLUX_3_KLEIN))
         self.view.refresh_ui()
@@ -189,6 +194,11 @@ class PySide6TrainingUITest(TrainingUIAssertions, unittest.TestCase):
     def toggle(self, text):
         self.control(text).click()
 
+    def edit_path(self, text, value):
+        entry = self.control(text).findChild(QLineEdit)
+        entry.setText(value)
+        entry.editingFinished.emit()
+
 
 class CtkTrainingUITest(TrainingUIAssertions, unittest.TestCase):
     @classmethod
@@ -243,6 +253,12 @@ class CtkTrainingUITest(TrainingUIAssertions, unittest.TestCase):
 
     def toggle(self, text):
         self.control(text).toggle()
+
+    def edit_path(self, text, value):
+        entry = next(child for child in self.control(text).winfo_children() if isinstance(child, ctk.CTkEntry))
+        entry.delete(0, "end")
+        entry.insert(0, value)
+        self.assertIsNone(entry._validator.flush())
 
 
 if __name__ == "__main__":

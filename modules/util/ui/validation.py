@@ -59,6 +59,11 @@ def _is_huggingface_repo_or_file(value: str) -> bool:
     return bool(HUGGINGFACE_REPO_RE.match(trimmed))
 
 
+def _is_download_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and bool(ENDS_WITH_EXT.search(parsed.path))
+
+
 def _has_invalid_chars(value: str) -> bool:
     return bool(_INVALID_CHARS.intersection(value))
 
@@ -80,8 +85,12 @@ def validate_path(
     *,
     prevent_overwrites: bool = False,
     output_format: str | None = None,
+    allow_urls: bool = False,
 ) -> str | None:
-    """Return an error string if *value* is an invalid path, else ``None``."""
+    """Return an error string if *value* is an invalid path, else ``None``.
+
+    With *allow_urls*, an input may also be a download link to a file.
+    """
     trimmed = value.strip()
 
     if not trimmed:
@@ -102,6 +111,8 @@ def validate_path(
         return None
 
     if io_type == PathIOType.INPUT and _is_huggingface_repo_or_file(trimmed):
+        return None
+    if io_type == PathIOType.INPUT and allow_urls and _is_download_url(trimmed):
         return None
 
     if io_type == PathIOType.INPUT:
@@ -282,7 +293,7 @@ def flush_and_validate_all() -> list[str]:
     return invalid
 
 
-def _validate_path_field(ui_state: BaseUIState, io_type: PathIOType, value: str) -> str | None:
+def _validate_path_field(ui_state: BaseUIState, io_type: PathIOType, value: str, allow_urls: bool = False) -> str | None:
     try:
         prevent_var = ui_state.get_var("prevent_overwrites")
     except (KeyError, AttributeError):
@@ -296,4 +307,5 @@ def _validate_path_field(ui_state: BaseUIState, io_type: PathIOType, value: str)
         io_type=io_type,
         prevent_overwrites=prevent_var.get() if prevent_var is not None else False,
         output_format=format_var.get() if format_var is not None else None,
+        allow_urls=allow_urls,
     )

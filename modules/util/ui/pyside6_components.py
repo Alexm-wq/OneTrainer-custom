@@ -252,6 +252,7 @@ def path_entry(
         extra_validate: Callable[[str], str | None] | None = None,
         required: bool = False,
         columnspan: int = 1,
+        allow_urls: bool = False,
 ) -> QWidget:
     frame = QWidget(master)
     frame_lo = QGridLayout(frame)
@@ -261,7 +262,7 @@ def path_entry(
     _add(_layout(master), frame, row, column, sticky="new", padx=0, pady=0, colspan=columnspan)
 
     def _path_validator_factory(comp, var, state, name, **kw):
-        return PySide6PathValidator(comp, var, state, name, io_type=io_type, **kw)
+        return PySide6PathValidator(comp, var, state, name, io_type=io_type, allow_urls=allow_urls, **kw)
 
     entry_component = entry(
         frame, 0, 0, ui_state, var_name,

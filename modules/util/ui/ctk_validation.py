@@ -264,9 +264,11 @@ class PathValidator(FieldValidator):
         max_undo: int = DEFAULT_MAX_UNDO,
         extra_validate: Callable[[str], str | None] | None = None,
         required: bool = False,
+        allow_urls: bool = False,
     ):
         super().__init__(component, var, ui_state, var_name, max_undo=max_undo, extra_validate=extra_validate, required=required)
         self.io_type = io_type
+        self.allow_urls = allow_urls
 
     def validate(self, value: str) -> str | None:
         base_err = super().validate(value)
@@ -274,7 +276,7 @@ class PathValidator(FieldValidator):
             return base_err
         if value == "":
             return None
-        return _validate_path_field(self.ui_state, self.io_type, value)
+        return _validate_path_field(self.ui_state, self.io_type, value, self.allow_urls)
 
     def revalidate(self) -> None:
         if self.component.winfo_exists():
