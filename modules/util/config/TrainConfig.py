@@ -507,6 +507,15 @@ class TrainConfig(BaseConfig):
     max_noising_strength: float
     cep_gamma: float
 
+    identity_reward: bool
+    identity_reward_weight: float
+    identity_reward_interval: int
+    identity_reward_max_sigma: float
+    identity_reward_max_crop: int
+    identity_reward_trigger: str
+    identity_reward_arcface_path: str
+    identity_reward_detector_path: str
+
     noising_weight: float
     noising_bias: float
 
@@ -1185,6 +1194,14 @@ class TrainConfig(BaseConfig):
         data.append(("timestep_shift", 1.0, float, False))
         data.append(("dynamic_timestep_shifting", False, bool, False))
         data.append(("cep_gamma", 0.0, float, False))
+        data.append(("identity_reward", False, bool, False))
+        data.append(("identity_reward_weight", 0.05, float, False))
+        data.append(("identity_reward_interval", 4, int, False))
+        data.append(("identity_reward_max_sigma", 0.5, float, False))
+        data.append(("identity_reward_max_crop", 512, int, False))
+        data.append(("identity_reward_trigger", "", str, False))
+        data.append(("identity_reward_arcface_path", "", str, False))
+        data.append(("identity_reward_detector_path", "", str, False))
 
 
         # unet

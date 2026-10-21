@@ -44,6 +44,36 @@ The bundled integration uses the upstream model implementation from Hugging Face
 - The sequence length preset is 512 to reduce cache size; increase it for long
   layout prompts. Sampling uses the training length when invoked during training.
 
+## Identity reward
+
+For character LoRAs of real faces, the Identity Reward section of the training tab
+adds an ArcFace loss next to the diffusion loss. It follows ID-Aligner: the face in
+the one-step clean prediction `x0 = x_t - sigma * v` should have the same ArcFace
+embedding as the face in the training image.
+
+- Landmarks: OpenCV's YuNet detector finds the largest face once per training crop,
+  after crop, flip and rotation. With image caching, the landmarks are cached with
+  the latents; turning the reward on re-caches the images once.
+- Loss: the face region of `x0` is decoded by the VAE, aligned to the 112x112 ArcFace
+  template and compared with the same crop decoded from the training latent. Each
+  face is decoded, embedded and differentiated on its own; only its latent gradient
+  is kept for the shared backward pass, so one face crop is in VRAM at a time.
+- Which samples: every `Identity Interval` steps, rows with noise level at most
+  `Identity Max Sigma` (blurrier predictions say nothing about identity), a detected
+  face, a caption that was not dropped, and a caption containing one of the
+  comma-separated `Identity Trigger` words. Leave the trigger empty to score every
+  face. Prior-prediction concepts, validation and DPO pairs are never scored. In
+  mixed DPO training the reward applies only to the ordinary supervised rows.
+- Faces whose decoded crop exceeds `Identity Max Crop` pixels are skipped. VRAM grows
+  with the square of that size; bf16 training decodes the face in bf16.
+- TensorBoard shows `loss/identity` (mean `1 - cosine similarity`) and
+  `identity/faces`.
+
+Required files, not downloaded by OneTrainer: an insightface `arcface_torch`
+backbone (`backbone.pth` of an IResNet r50/r100, e.g. `ms1mv3_arcface_r100_fp16`)
+and `face_detection_yunet_2023mar.onnx` from the OpenCV model zoo. InsightFace's
+pretrained recognition models are licensed for non-commercial research only.
+
 ## Sampling
 
 The default is 1024, Euler 50 steps, CFG 3, shift 5, with main DiT layer 22 skipped

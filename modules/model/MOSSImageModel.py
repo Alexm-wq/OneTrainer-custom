@@ -92,7 +92,7 @@ class MOSSImageModel(Flux2Model):
     def encode_text(
             self, train_device, batch_size=1, rand: Random | None = None,
             text=None, tokens=None, tokens_mask=None, text_encoder_sequence_length=None,
-            text_encoder_dropout_probability=None, text_encoder_output=None,
+            text_encoder_dropout_probability=None, text_encoder_output=None, return_dropped=False,
     ):
         if text is not None:
             encoded = self.tokenize(text, text_encoder_sequence_length)
@@ -104,6 +104,7 @@ class MOSSImageModel(Flux2Model):
         hidden = text_encoder_output.to(train_device)
         mask = tokens_mask.to(train_device).bool()
         probability = text_encoder_dropout_probability or 0.0
+        dropped = [False] * hidden.shape[0]
         if probability:
             # Do not mutate cached tensors or replace conditioning by an all-zero mask.
             hidden, mask = hidden.clone(), mask.clone()
@@ -114,4 +115,5 @@ class MOSSImageModel(Flux2Model):
                 if rand.random() < probability:
                     hidden[index] = empty[0][0].to(hidden)
                     mask[index] = empty[1][0].to(mask)
-        return hidden, mask
+                    dropped[index] = True
+        return (hidden, mask, dropped) if return_dropped else (hidden, mask)

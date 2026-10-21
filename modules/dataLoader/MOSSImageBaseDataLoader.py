@@ -6,6 +6,7 @@ import os
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
 from modules.dataLoader.mixin.DataLoaderText2ImageMixin import DataLoaderText2ImageMixin
 from modules.dataLoader.moss.MOSSConditioningCache import MOSSConditioningCache
+from modules.dataLoader.moss.MOSSFaceLandmarks import MOSSFaceLandmarks
 from modules.dataLoader.moss.MOSSImageCache import MOSSImageCache
 from modules.dataLoader.moss.MOSSLayout import (
     LoadMOSSLayout,
@@ -24,6 +25,7 @@ from modules.modelSetup.BaseMOSSImageSetup import BaseMOSSImageSetup
 from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
+from modules.util.identity_reward import FaceLandmarkDetector
 from modules.util.TrainProgress import TrainProgress
 
 from mgds.pipelineModules.DecodeTokens import DecodeTokens
@@ -50,6 +52,11 @@ class MOSSImageBaseDataLoader(
         modules = [rescale_image, encode_image, image_sample]
         if config.masked_training or config.model_type.has_mask_input():
             modules.append(downscale_mask)
+        if config.identity_reward:
+            if not os.path.isfile(config.identity_reward_detector_path):
+                raise FileNotFoundError(f"Face detector model not found: {config.identity_reward_detector_path!r}")
+            # Detects on the final crop, before the image is rescaled for the VAE.
+            modules.insert(0, MOSSFaceLandmarks(FaceLandmarkDetector(config.identity_reward_detector_path)))
 
         return modules
 
@@ -109,11 +116,15 @@ class MOSSImageBaseDataLoader(
             "encoder_revision": getattr(getattr(model.text_encoder, "config", None), "_commit_hash", None),
             "sequence_length": config.text_encoder_sequence_length or 4096,
         }
+        if config.identity_reward:
+            identity["face_detector"] = os.path.basename(config.identity_reward_detector_path)
         key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
         config.cache_dir = os.path.join(config.cache_dir, "moss-layout-" + key)
         image_split = ["latent_image", "original_resolution", "crop_offset"]
         if config.masked_training or config.model_type.has_mask_input():
             image_split.append("latent_mask")
+        if config.identity_reward:
+            image_split.append("face_landmarks")
         # Layout and source index belong to the SAME resolution/augmentation as
         # the latent. No separate row-based text cache may select a different one.
         image_aggregate = ["crop_resolution", "image_path", "moss_layout", "moss_source_index", "moss_source_key"]
@@ -182,6 +193,8 @@ class MOSSImageBaseDataLoader(
             output_names.append('latent_mask')
 
         output_names.append('text_encoder_hidden_state')
+        if config.identity_reward:
+            output_names.append('face_landmarks')
 
         return self._output_modules_from_out_names(
             model, model_setup,

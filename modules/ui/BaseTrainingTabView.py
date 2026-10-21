@@ -55,7 +55,9 @@ class BaseTrainingTabView(ABC):
         elif model_type.is_krea2():
             self.__setup_krea2_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_flux_3() or model_type.is_moss_image():
-            self.__setup_moss_image_ui(column_0, column_1, column_2, controller, ui_state)
+            self.__setup_moss_image_ui(
+                column_0, column_1, column_2, controller, ui_state, identity_reward=model_type.is_moss_image(),
+            )
         elif model_type.is_sana():
             self.__setup_sana_ui(column_0, column_1, column_2, controller, ui_state)
         elif model_type.is_hunyuan_video():
@@ -201,7 +203,7 @@ class BaseTrainingTabView(ABC):
         self.__create_loss_frame(column_2, 2, controller, ui_state)
         self.__create_layer_frame(column_2, 3, controller, ui_state)
 
-    def __setup_moss_image_ui(self, column_0, column_1, column_2, controller, ui_state):
+    def __setup_moss_image_ui(self, column_0, column_1, column_2, controller, ui_state, identity_reward=False):
         self.__create_base_frame(column_0, 0, controller, ui_state)
         self.__create_text_encoder_frame(
             column_0, 1, ui_state, supports_clip_skip=False, supports_training=False,
@@ -218,6 +220,8 @@ class BaseTrainingTabView(ABC):
         self.__create_masked_frame(column_2, 1, ui_state)
         self.__create_loss_frame(column_2, 2, controller, ui_state)
         self.__create_layer_frame(column_2, 3, controller, ui_state)
+        if identity_reward:
+            self.__create_identity_reward_frame(column_2, 4, ui_state)
 
     def __setup_krea2_ui(self, column_0, column_1, column_2, controller, ui_state):
         self.__create_base_frame(column_0, 0, controller, ui_state)
@@ -802,6 +806,43 @@ class BaseTrainingTabView(ABC):
                               tooltip="Conditional Embedding Perturbation. Inject a slight noise into the TEs outputs to enhance the quality, diversity, and fidelity of the generated images. Gamma controls perturbation noise magnitude, paper's default is 1.")
         self.components.entry(frame, row, 1, ui_state, "cep_gamma", required=True)
         row += 1
+
+    def __create_identity_reward_frame(self, master, row, ui_state):
+        frame = self.components.section_frame(master, row)
+
+        self.components.label(frame, 0, 0, "Identity Reward",
+                              tooltip="Adds an ArcFace face-identity loss on the predicted clean image, so the trained character keeps its face. Faces are found once per training crop with the YuNet detector. Images with image caching enabled are re-cached once.", wide_tooltip=True)
+        self.components.switch(frame, 0, 1, ui_state, "identity_reward")
+
+        self.components.label(frame, 1, 0, "Identity Weight",
+                              tooltip="Weight of the identity loss (1 - cosine similarity) next to the diffusion loss. Watch loss/identity in TensorBoard.")
+        self.components.entry(frame, 1, 1, ui_state, "identity_reward_weight", required=True)
+
+        self.components.label(frame, 2, 0, "Identity Interval",
+                              tooltip="Computes the identity loss every N training steps only, which keeps the extra time and VRAM low.")
+        self.components.entry(frame, 2, 1, ui_state, "identity_reward_interval", required=True,
+                              extra_validate=check_range(lower=1, message="Identity interval must be at least 1"))
+
+        self.components.label(frame, 3, 0, "Identity Max Sigma",
+                              tooltip="Only scores steps with at most this noise level (0 to 1). At higher noise the predicted image is too blurry for a face model.")
+        self.components.entry(frame, 3, 1, ui_state, "identity_reward_max_sigma", required=True,
+                              extra_validate=check_range(lower=0, upper=1, message="Identity max sigma must be between 0 and 1"))
+
+        self.components.label(frame, 4, 0, "Identity Max Crop",
+                              tooltip="Largest face crop in pixels that is decoded with gradients. Larger faces (close-ups) are skipped; raise it if VRAM allows.")
+        self.components.entry(frame, 4, 1, ui_state, "identity_reward_max_crop", required=True)
+
+        self.components.label(frame, 5, 0, "Identity Trigger",
+                              tooltip="Comma-separated trigger words. Only samples whose caption contains one of them get the identity loss, so regularization images are left alone. Empty: every sample with a face.")
+        self.components.entry(frame, 5, 1, ui_state, "identity_reward_trigger")
+
+        self.components.label(frame, 6, 0, "ArcFace Model",
+                              tooltip="insightface arcface_torch backbone (backbone.pth, IResNet r50/r100).")
+        self.components.path_entry(frame, 6, 1, ui_state, "identity_reward_arcface_path", mode="file")
+
+        self.components.label(frame, 7, 0, "Face Detector Model",
+                              tooltip="OpenCV YuNet model, face_detection_yunet_2023mar.onnx.")
+        self.components.path_entry(frame, 7, 1, ui_state, "identity_reward_detector_path", mode="file")
 
     def __create_masked_frame(self, master, row, ui_state):
         frame = self.components.section_frame(master, row)

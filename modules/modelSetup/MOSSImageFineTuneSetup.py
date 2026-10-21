@@ -72,7 +72,8 @@ class MOSSImageFineTuneSetup(
             model.text_encoder_to(self.train_device)
             model.prepare_empty_text(config.text_encoder_sequence_length)
 
-        vae_on_train_device = not config.image_caching
+        # The identity reward decodes face crops of the x0 prediction every few steps.
+        vae_on_train_device = not config.image_caching or config.identity_reward
         text_encoder_on_train_device = not config.text_caching
 
         model.text_encoder_to(self.train_device if text_encoder_on_train_device else self.temp_device)
@@ -86,6 +87,8 @@ class MOSSImageFineTuneSetup(
             model.transformer.train()
         else:
             model.transformer.eval()
+
+        self._prepare_identity_reward(model, config)
 
     def after_optimizer_step(
             self,

@@ -102,6 +102,27 @@ class TrainingUIAssertions:
                 self.assertEqual(self.config.transformer.gradient_checkpointing, not old_checkpointing)
                 self.assertFalse(self.config.text_encoder.train)
 
+    def test_identity_reward_controls_edit_config(self):
+        self.assertFalse(self.config.identity_reward)
+        self.toggle("Identity Reward")
+        self.assertTrue(self.config.identity_reward)
+        self.edit("Identity Weight", "0.2")
+        self.edit("Identity Interval", "3")
+        self.edit("Identity Max Sigma", "0.4")
+        self.edit("Identity Max Crop", "768")
+        self.edit("Identity Trigger", "zx person, zxp")
+        self.assertEqual(self.config.identity_reward_weight, 0.2)
+        self.assertEqual(self.config.identity_reward_interval, 3)
+        self.assertEqual(self.config.identity_reward_max_sigma, 0.4)
+        self.assertEqual(self.config.identity_reward_max_crop, 768)
+        self.assertEqual(self.config.identity_reward_trigger, "zx person, zxp")
+        self.assertIn("ArcFace Model", self.labels())
+        self.assertIn("Face Detector Model", self.labels())
+        # FLUX.3 shares the MOSS layout but has no identity reward.
+        self.state.get_var("model_type").set(str(ModelType.FLUX_3_KLEIN))
+        self.view.refresh_ui()
+        self.assertNotIn("Identity Reward", self.labels())
+
     def test_switching_existing_models_and_back_preserves_their_controls(self):
         for model_type in (ModelType.KREA_2, ModelType.FLUX_2):
             with self.subTest(model=model_type):

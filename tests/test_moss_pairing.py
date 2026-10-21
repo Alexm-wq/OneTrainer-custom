@@ -79,11 +79,15 @@ class MOSSPairingTest(unittest.TestCase):
             concept_config.balancing = 2.0 if concept else 1.0
             concept_config.image.enable_random_flip = True
             config.concepts.append(concept_config)
+        self.configure(config)
         model = TinyModel()
         setup = SimpleNamespace(prepare_text_caching=lambda model, cfg: None)
         loader = MOSSImageBaseDataLoader(torch.device("cpu"), torch.device("cpu"), config, model, setup, TrainProgress())
         self.addCleanup(loader.get_data_set().loading_pipeline.modules[0]._state.executor.shutdown, wait=True)
         return loader
+
+    def configure(self, config):
+        pass
 
     def check_row(self, batch, row):
         path = Path(batch["image_path"][row])
