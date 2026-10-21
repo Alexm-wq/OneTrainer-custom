@@ -837,7 +837,7 @@ class BaseTrainingTabView(ABC):
         self.components.entry(frame, 5, 1, ui_state, "identity_reward_trigger")
 
         self.components.label(frame, 6, 0, "ArcFace Model",
-                              tooltip="insightface arcface_torch backbone (backbone.pth, IResNet r50/r100): a local file or a Hugging Face file link, downloaded once.")
+                              tooltip="insightface ArcFace model: an ONNX export (antelopev2, buffalo_l, Arc2Face) or an arcface_torch backbone.pth. A local file or a Hugging Face file link, downloaded once. The default is Arc2Face's ArcFace R100.")
         self.components.path_entry(frame, 6, 1, ui_state, "identity_reward_arcface_path", mode="file")
 
         self.components.label(frame, 7, 0, "Face Detector Model",

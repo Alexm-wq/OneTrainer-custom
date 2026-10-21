@@ -73,9 +73,12 @@ Both model fields take a local file, a Hugging Face file link
 (`https://huggingface.co/<repo>/resolve/<revision>/<file>`) or another download URL;
 downloads happen once and are cached. The face detector defaults to
 `face_detection_yunet_2023mar.onnx` from the OpenCV model zoo, pinned to a commit and
-checked by its SHA256. The ArcFace model must be an insightface `arcface_torch`
-backbone (`backbone.pth` of an IResNet r50/r100, e.g. `ms1mv3_arcface_r100_fp16`).
-InsightFace's pretrained recognition models are licensed for non-commercial research only.
+checked by its SHA256. ArcFace defaults to Arc2Face's `arcface.onnx` (an R100 trained
+on WebFace42M). Other insightface ONNX recognition models (antelopev2 `glintr100.onnx`,
+buffalo_l `w600k_r50.onnx`) and `arcface_torch` `backbone.pth` files work as well; ONNX
+models run through a small built-in interpreter, so no ONNX runtime is involved and the
+loss stays differentiable. InsightFace's pretrained recognition models are licensed for
+non-commercial research only.
 
 ## Sampling
 

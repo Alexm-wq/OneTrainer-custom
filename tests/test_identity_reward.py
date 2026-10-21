@@ -109,6 +109,88 @@ class ArcFaceLoadTest(unittest.TestCase):
                 load_arcface(str(path))
 
 
+def varint(value):
+    value &= (1 << 64) - 1
+    out = bytearray()
+    while True:
+        out.append((value & 0x7F) | (0x80 if value > 0x7F else 0))
+        value >>= 7
+        if not value:
+            return bytes(out)
+
+
+def field(number, value):
+    if isinstance(value, int):
+        return varint(number << 3) + varint(value)
+    value = value.encode() if isinstance(value, str) else value
+    return varint(number << 3 | 2) + varint(len(value)) + value
+
+
+def onnx_tensor(name, array):
+    array = np.asarray(array)
+    dtype = {np.dtype(np.float32): 1, np.dtype(np.int64): 7}[array.dtype]
+    return b"".join(field(1, int(d)) for d in array.shape) + field(2, dtype) + field(8, name) + field(9, array.tobytes())
+
+
+def onnx_node(op_type, inputs, outputs, **attributes):
+    data = b"".join(field(1, name) for name in inputs) + b"".join(field(2, name) for name in outputs) + field(4, op_type)
+    for name, value in attributes.items():
+        if isinstance(value, float):
+            attribute = field(1, name) + varint(2 << 3 | 5) + np.float32(value).tobytes() + field(20, 1)
+        elif isinstance(value, int):
+            attribute = field(1, name) + field(3, value) + field(20, 2)
+        elif isinstance(value, np.ndarray):
+            attribute = field(1, name) + field(5, onnx_tensor("", value)) + field(20, 4)
+        else:  # Packed ints.
+            attribute = field(1, name) + field(8, b"".join(varint(v) for v in value)) + field(20, 7)
+        data += field(5, attribute)
+    return data
+
+
+class OnnxArcFaceTest(unittest.TestCase):
+    def test_runs_insightface_style_onnx_graph_with_gradients(self):
+        """Conv/BN/PReLU/Add/Flatten/Gemm as insightface exports them, plus a self-normalizing input."""
+        rng = np.random.default_rng(0)
+        weights = {
+            "w": rng.normal(0, 0.3, (4, 3, 3, 3)).astype(np.float32), "b": rng.normal(0, 0.1, 4).astype(np.float32),
+            "bn_s": rng.uniform(0.5, 1.5, 4).astype(np.float32), "bn_b": rng.normal(0, 0.1, 4).astype(np.float32),
+            "bn_m": rng.normal(0, 0.1, 4).astype(np.float32), "bn_v": rng.uniform(0.5, 1.5, 4).astype(np.float32),
+            "slope": rng.uniform(0, 0.3, (4, 1, 1)).astype(np.float32),
+            "fc_w": rng.normal(0, 0.1, (5, 4 * 56 * 56)).astype(np.float32), "fc_b": rng.normal(0, 0.1, 5).astype(np.float32),
+        }
+        nodes = [
+            onnx_node("Constant", [], ["mean"], value=np.full((1,), 127.5, np.float32)),
+            onnx_node("Sub", ["data", "mean"], ["centered"]),
+            onnx_node("Constant", [], ["scale"], value=np.full((1,), 1 / 127.5, np.float32)),
+            onnx_node("Mul", ["centered", "scale"], ["x"]),
+            onnx_node("Conv", ["x", "w", "b"], ["conv"], kernel_shape=[3, 3], pads=[1, 1, 1, 1], strides=[2, 2], group=1),
+            onnx_node("BatchNormalization", ["conv", "bn_s", "bn_b", "bn_m", "bn_v"], ["bn"], epsilon=1e-5),
+            onnx_node("PRelu", ["bn", "slope"], ["act"]),
+            onnx_node("Add", ["act", "conv"], ["sum"]),
+            onnx_node("Flatten", ["sum"], ["flat"], axis=1),
+            onnx_node("Gemm", ["flat", "fc_w", "fc_b"], ["out"], alpha=1.0, beta=1.0, transB=1),
+        ]
+        graph = b"".join(field(1, node) for node in nodes) + field(2, "tiny")
+        graph += b"".join(field(5, onnx_tensor(name, value)) for name, value in weights.items())
+        graph += field(11, field(1, "data")) + field(12, field(1, "out"))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "arcface.onnx")
+            path.write_bytes(field(1, 6) + field(7, graph))
+            net = load_arcface(str(path))
+        self.assertTrue(net.raw_pixels)  # The graph normalizes 0..255 pixels itself.
+        w = {name: torch.from_numpy(value) for name, value in weights.items()}
+        faces = (torch.rand(2, 3, 112, 112) * 2 - 1).requires_grad_(True)
+        conv = F.conv2d(faces, w["w"], w["b"], stride=2, padding=1)
+        bn = F.batch_norm(conv, w["bn_m"], w["bn_v"], w["bn_s"], w["bn_b"], eps=1e-5)
+        expected = (torch.where(bn >= 0, bn, bn * w["slope"]) + conv).flatten(1) @ w["fc_w"].T + w["fc_b"]
+        actual = net(faces)
+        torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+        (gradient,) = torch.autograd.grad(actual.sum(), faces)
+        (reference,) = torch.autograd.grad(expected.sum(), faces)
+        torch.testing.assert_close(gradient, reference, atol=1e-5, rtol=1e-4)
+        self.assertFalse(any(p.requires_grad for p in net.parameters()))
+
+
 class ModelFileTest(unittest.TestCase):
     def test_local_files_hugging_face_links_and_urls(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,6 +211,10 @@ class ModelFileTest(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             resolve_model_file("missing/backbone.pth")
         self.assertEqual(TrainConfig.default_values().identity_reward_detector_path, YUNET_URL)
+        arcface = TrainConfig.default_values().identity_reward_arcface_path
+        with patch("huggingface_hub.hf_hub_download", return_value="/cache/arcface.onnx") as download:
+            resolve_model_file(arcface)
+        download.assert_called_once_with("FoivosPar/Arc2Face", "arcface.onnx", revision="main", repo_type=None)
 
 
 class StreamedLossTest(unittest.TestCase):

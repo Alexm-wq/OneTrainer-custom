@@ -45,7 +45,7 @@ jobs:
           python -m pip install . ruff==0.15.20 bitsandbytes==0.49.2
       - name: Lint integration
         run: |
-          files=('modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/util/quantization_util.py' 'modules/module/quantized/LinearInt8.py' 'modules/ui/BaseModelTabView.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/util/LayerOffloadConductor.py' 'modules/module/LoRAModule.py' 'tests/test_moss_features.py' 'tests/test_moss_offloading.py' 'tests/test_moss_training_ui.py' 'modules/util/identity_reward.py' 'modules/dataLoader/moss/MOSSFaceLandmarks.py' 'tests/test_identity_reward.py' 'tests/test_moss_pairing.py')
+          files=('modules/modelLoader/MOSSImageModelLoader.py' 'modules/modelSetup/BaseMOSSImageSetup.py' 'modules/util/quantization_util.py' 'modules/module/quantized/LinearInt8.py' 'modules/ui/BaseModelTabView.py' 'modules/ui/BaseTrainingTabView.py' 'modules/ui/TrainingTabController.py' 'modules/modelSaver/moss/MOSSImageModelSaver.py' 'modules/util/LayerOffloadConductor.py' 'modules/module/LoRAModule.py' 'tests/test_moss_features.py' 'tests/test_moss_offloading.py' 'tests/test_moss_training_ui.py' 'modules/util/identity_reward.py' 'modules/util/onnx_torch.py' 'modules/dataLoader/moss/MOSSFaceLandmarks.py' 'tests/test_identity_reward.py' 'tests/test_moss_pairing.py')
           ruff check --fix "${files[@]}"
           if ! git diff --quiet; then
             if [ "$GITHUB_REF" != "refs/heads/codex/moss-image-base" ]; then

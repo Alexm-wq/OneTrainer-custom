@@ -1,6 +1,7 @@
 """Face identity reward: ArcFace on aligned faces decoded from x0 predictions.
 
-The IResNet matches insightface's arcface_torch layout, so its backbone.pth files load as they are.
+The IResNet matches insightface's arcface_torch layout, so its backbone.pth files load as they are;
+insightface's ONNX exports run through a small torch ONNX interpreter, so gradients reach the face.
 Landmarks come from OpenCV's YuNet detector, whose five points share ArcFace's template order.
 """
 import hashlib
@@ -8,6 +9,8 @@ import os
 import re
 import threading
 from urllib.parse import urlparse
+
+from modules.util.onnx_torch import OnnxModule
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +31,8 @@ YUNET_URL = (
     "https://github.com/opencv/opencv_zoo/raw/48b10fa505aeb51fbd127fc60a5c660040e823b7/"
     "models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
 )
+# ArcFace R100 trained on WebFace42M, as Arc2Face distributes it.
+ARCFACE_URL = "https://huggingface.co/FoivosPar/Arc2Face/resolve/main/arcface.onnx"
 KNOWN_HASHES = {YUNET_URL: "sha256:8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4"}
 HF_FILE_URL = re.compile(
     r"https://huggingface\.co/(?:(datasets|spaces)/)?([^/]+/[^/]+)/(?:resolve|blob)/([^/]+)/([^?#]+)(?:[?#].*)?"
@@ -101,8 +106,24 @@ class IResNet(nn.Module):
         return self.features(self.fc(torch.flatten(x, 1)))
 
 
-def load_arcface(path: str) -> IResNet:
-    """Load an insightface arcface_torch backbone (r18 to r200) from .pth or .safetensors."""
+class OnnxArcFace(nn.Module):
+    """An insightface ArcFace ONNX model (e.g. antelopev2, buffalo_l, Arc2Face), taking IResNet's input."""
+
+    def __init__(self, path: str):
+        super().__init__()
+        self.net = OnnxModule(path)
+        # As insightface: graphs that start by normalizing themselves (MXNet exports) get 0..255 pixels.
+        first = [node[0] for node in self.net.nodes[:8]]
+        self.raw_pixels = "Sub" in first and "Mul" in first
+
+    def forward(self, x):
+        return self.net((x + 1) * 127.5 if self.raw_pixels else x)
+
+
+def load_arcface(path: str) -> nn.Module:
+    """Load an insightface ArcFace model: an arcface_torch backbone (.pth/.safetensors) or an ONNX export."""
+    if path.endswith(".onnx"):
+        return OnnxArcFace(path).eval().requires_grad_(False)
     if path.endswith(".safetensors"):
         from safetensors.torch import load_file
         state = load_file(path)
