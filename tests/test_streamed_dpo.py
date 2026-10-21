@@ -1,6 +1,7 @@
 """Focused checks for streamed DPO and actionable path diagnostics."""
 import copy
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -168,6 +169,36 @@ class StreamedDPOTest(unittest.TestCase):
         torch.testing.assert_close(actual[0], expected[0])
         torch.testing.assert_close(actual[1], expected[1], atol=2e-5, rtol=2e-4)
         self.assertTrue(all(call["size"] == 2 for call in self.setup.calls))
+
+    def test_backward_replay_raises_the_recompile_limit_in_its_thread(self):
+        # torch 2.12 keeps dynamo config per thread. CUDA runs this replay in an autograd worker
+        # thread, where compiled MOSS blocks hit the default limit of 8 under fullgraph=True.
+        limits = []
+        predict = self.setup.predict
+
+        def record(*args, **kwargs):
+            limits.append((torch.is_grad_enabled(), torch._dynamo.config.cache_size_limit))
+            return predict(*args, **kwargs)
+
+        self.setup.predict = record
+        loss = self.setup.calculate_dpo_loss(
+            self.model, self.pair_batch(), self.config, self.progress, streamed=True,
+        )
+        errors = []
+
+        def run_backward():
+            try:
+                loss.backward()
+            except Exception as error:  # a thread would only print it
+                errors.append(error)
+
+        worker = threading.Thread(target=run_backward)
+        worker.start()
+        worker.join()
+        self.assertEqual(errors, [])
+        replay = [limit for grad, limit in limits if grad]
+        self.assertTrue(replay)
+        self.assertEqual(set(replay), {8192})
 
     def test_replay_preserves_rng_state(self):
         loss = self.setup.calculate_dpo_loss(

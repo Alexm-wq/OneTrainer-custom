@@ -3,6 +3,7 @@ import copy
 from contextlib import contextmanager
 
 import modules.util.multi_gpu_util as multi
+from modules.util.compile_util import init_compile
 
 import torch
 from torch import Tensor
@@ -193,6 +194,8 @@ class ModelSetupStreamedDPOMixin:
 
                 @staticmethod
                 def backward(ctx, grad_logp, grad_supervised):
+                    # The replay forward runs in the autograd thread and may compile new shapes.
+                    init_compile()  # workaround for https://github.com/pytorch/pytorch/issues/186537
                     (latent,) = ctx.saved_tensors
                     devices = [] if ctx.cuda_device is None else [ctx.cuda_device]
                     with (
