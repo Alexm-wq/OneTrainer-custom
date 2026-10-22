@@ -2,6 +2,8 @@ import os
 import re
 
 from modules.dataLoader.BaseDataLoader import BaseDataLoader
+from modules.dataLoader.cache.AspectBucketing import AspectBucketing
+from modules.dataLoader.cache.SingleAspectCalculation import SingleAspectCalculation
 from modules.model.StableDiffusionModel import StableDiffusionModel
 from modules.modelSetup.BaseModelSetup import BaseModelSetup
 from modules.util import factory, path_util
@@ -13,7 +15,6 @@ from modules.util.TrainProgress import TrainProgress
 
 from mgds.OutputPipelineModule import OutputPipelineModule
 from mgds.pipelineModules.AspectBatchSorting import AspectBatchSorting
-from mgds.pipelineModules.AspectBucketing import AspectBucketing
 from mgds.pipelineModules.CalcAspect import CalcAspect
 from mgds.pipelineModules.CollectPaths import CollectPaths
 from mgds.pipelineModules.DecodeVAE import DecodeVAE
@@ -33,7 +34,6 @@ from mgds.pipelineModules.SampleVAEDistribution import SampleVAEDistribution
 from mgds.pipelineModules.SaveImage import SaveImage
 from mgds.pipelineModules.ScaleCropImage import ScaleCropImage
 from mgds.pipelineModules.ScaleImage import ScaleImage
-from mgds.pipelineModules.SingleAspectCalculation import SingleAspectCalculation
 from mgds.pipelineModules.VariationSorting import VariationSorting
 
 import torch

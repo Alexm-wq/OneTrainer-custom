@@ -6,6 +6,8 @@ on:
     paths:
       - "modules/dataLoader/**"
       - "tests/test_multi_resolution_cache.py"
+      - "tests/test_bucket_table.py"
+      - "modules/util/concept_stats.py"
       - "tests/test_krea2_multires_integration.py"
       - "tests/test_krea2_checkpoint.py"
       - ".github/workflows/multi-resolution-cache.yml"
@@ -50,6 +52,7 @@ jobs:
       - name: Test multi-resolution cache and Krea integration
         run: |
           python -m unittest discover -s tests -p test_multi_resolution_cache.py -v
+          python -m unittest discover -s tests -p test_bucket_table.py -v
           python -m unittest discover -s tests -p test_krea2_multires_integration.py -v
           python -m unittest discover -s tests -p test_krea2_checkpoint.py -v
           python -m unittest discover -s tests -p test_mixed_rlhf.py -v

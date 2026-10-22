@@ -3,11 +3,10 @@ import os
 import threading
 import time
 
+from modules.dataLoader.cache.AspectBucketing import AspectBucketing
 from modules.util import path_util
 from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.image_util import load_image
-
-from mgds.pipelineModules.AspectBucketing import AspectBucketing
 
 import cv2
 import imagesize
