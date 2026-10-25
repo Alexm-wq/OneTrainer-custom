@@ -172,7 +172,7 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
         if saved is not None and saved.get("projector") is not None:
             model.self_flow_projector.load_state_dict(saved["projector"], strict=True)
 
-    def _create_self_flow_ema(self, model, config, parameters):
+    def _create_self_flow_ema(self, model, config, parameters, layer_groups=None):
         if not config.self_flow_enabled:
             return
         saved = model.self_flow_state_dict
@@ -182,12 +182,15 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
         if config.training_method == TrainingMethod.FINE_TUNE:
             count = sum(parameter.numel() for parameter in parameters)
             print(f"[Self-Flow] the EMA teacher keeps an fp32 copy of {count / 1e9:.2f}B parameters in CPU RAM.")
-        model.self_flow_ema = SelfFlowEMA(parameters, config.self_flow_ema_decay, saved_ema)
+        model.self_flow_ema = SelfFlowEMA(parameters, config.self_flow_ema_decay, saved_ema, layer_groups)
         model.self_flow_state_dict = None
 
     def _record_self_flow_metric(self, name, value):
+        # Device tensors are summed on the device and read once per report, so logging never syncs a step.
+        if isinstance(value, torch.Tensor):
+            value = value.detach().float().mean()
         total, count = self._self_flow_metrics.get(name, (0.0, 0))
-        self._self_flow_metrics[name] = (total + float(value), count + 1)
+        self._self_flow_metrics[name] = (total + value, count + 1)
 
     def _predict_self_flow(self, model, batch, config, train_progress):
         """Dual-timestep training forward (Self-Flow, Black Forest Labs).
@@ -231,12 +234,13 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
             clean_sigma = ((clean_index.float() + 1) / total).view(batch_size, 1, 1, 1)
 
             teacher_start = self._self_flow_timer()
-            with model.self_flow_ema.ema_weights(model.self_flow_adapter_modules()), torch.no_grad():
+            ema = model.self_flow_ema
+            with ema.teacher_weights(model.self_flow_adapter_modules()), torch.no_grad():
                 teacher_feature = moss_self_flow_forward(
                     model.transformer, (clean * (1 - clean_sigma) + noise * clean_sigma).to(dtype),
                     image_timestep=clean_index.float() + 1, text_timestep=clean_index.float() + 1,
                     encoder_hidden_states=hidden, encoder_attention_mask=mask,
-                    stop_at_layer=model.self_flow_teacher_layer,
+                    stop_at_layer=model.self_flow_teacher_layer, layer_weights=ema.layer_weights,
                 ).feature
             self._record_self_flow_time("performance/self_flow_teacher_ms", teacher_start)
             if config.self_flow_teacher_target_offload:
@@ -268,10 +272,10 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
             # Weight every patch token by its own sigma, in the unpatchified latent layout.
             output["element_loss_weight"] = token_sigma.repeat_interleave(2, -2).repeat_interleave(2, -1)
 
-        self._record_self_flow_metric("self_flow/t_mean", (index.float().mean().item() + 1) / total)
-        self._record_self_flow_metric("self_flow/s_mean", (second_index.float().mean().item() + 1) / total)
-        self._record_self_flow_metric("self_flow/clean_t_mean", (clean_index.float().mean().item() + 1) / total)
-        self._record_self_flow_metric("self_flow/mask_ratio_actual", token_mask.float().mean().item())
+        self._record_self_flow_metric("self_flow/t_mean", (index.float() + 1) / total)
+        self._record_self_flow_metric("self_flow/s_mean", (second_index.float() + 1) / total)
+        self._record_self_flow_metric("self_flow/clean_t_mean", (clean_index.float() + 1) / total)
+        self._record_self_flow_metric("self_flow/mask_ratio_actual", token_mask)
 
         if config.identity_reward:
             rows = self._identity_reward_rows(batch, config, train_progress, token_sigma.flatten(1), dropped)
@@ -295,11 +299,11 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
         scale = config.loss_scaler.get_scale(config.batch_size, config.gradient_accumulation_steps)
         loss = scale * (per_sample * weights).mean()
 
-        self._record_self_flow_metric("loss/generation", generation_loss.detach().item())
-        self._record_self_flow_metric("loss/self_flow_rep", representation.detach().mean().item())
-        self._record_self_flow_metric("self_flow/cosine_similarity", 1.0 - representation.detach().mean().item())
+        self._record_self_flow_metric("loss/generation", generation_loss)
+        self._record_self_flow_metric("loss/self_flow_rep", representation)
+        self._record_self_flow_metric("self_flow/cosine_similarity", 1.0 - representation.detach())
         if structural is not None:
-            self._record_self_flow_metric("loss/self_flow_structural", structural.detach().mean().item())
+            self._record_self_flow_metric("loss/self_flow_structural", structural)
         return loss
 
     def _self_flow_timer(self):
@@ -327,7 +331,7 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
         self._self_flow_pending_timers.clear()
         step = model.train_progress.global_step
         for name, (total, count) in self._self_flow_metrics.items():
-            tensorboard.add_scalar(name, total / count, step)
+            tensorboard.add_scalar(name, float(total) / count, step)
         self._self_flow_metrics.clear()
         if self.train_device.type == "cuda":
             tensorboard.add_scalar(

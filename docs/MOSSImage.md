@@ -63,13 +63,20 @@ a few thousand steps would barely move from the starting weights.
   (`Representation Weight`). `Structural Alignment` also matches the pairwise token
   similarities of `Structural Tokens` tokens spread over the image. `-1` selects blocks
   14 and 34 of 42.
-- The EMA teacher is kept in fp32 on the CPU and swapped into the trained weights only
-  for the teacher forward. With LoRA it covers the LoRA weights. With full fine-tuning
-  it covers all trained DiT weights: about 4 bytes of RAM per parameter, plus a copy of
-  the weights for the duration of each swap, and a slower step. Full fine-tuning with
-  Self-Flow does not support layer offloading; activation offloading works.
-- Each step adds one teacher forward up to the teacher block, without gradients.
-  `Offload Teacher Target` keeps the teacher feature in RAM while the student runs.
+- The EMA teacher is kept in fp32 in CPU RAM. For the teacher forward, the trained
+  parameters point at a GPU copy of their EMA values and back afterwards; the student
+  weights are never copied. The EMA update after each optimizer step runs on the GPU.
+  With LoRA the EMA covers the LoRA weights and goes to the GPU as a whole (page-locked
+  memory, a few hundred MB at rank 32). With full fine-tuning it covers all trained DiT
+  weights, about 4 bytes of RAM per parameter. Each block's EMA is then moved to the GPU
+  just for that block, which costs one host-to-GPU transfer of the whole fp32 EMA per
+  step. Full fine-tuning with Self-Flow does not support layer offloading; activation
+  offloading works.
+- Expected cost: each step adds one teacher forward up to the teacher block (34 of 42
+  by default), without gradients. With gradient checkpointing that is roughly 20% more
+  compute than an ordinary step, and with layer offloading roughly 40% more transfers.
+  A lower `Teacher Block` makes the teacher cheaper. `Offload Teacher Target` keeps the
+  teacher feature in RAM while the student runs.
 - Sigma loss weighting weights every token by its own sigma. The identity reward
   reconstructs `x0` with the per-token sigma as well.
 - Self-Flow applies to ordinary supervised rows. DPO preference scores (policy,

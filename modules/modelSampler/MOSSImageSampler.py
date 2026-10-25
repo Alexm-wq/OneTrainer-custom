@@ -28,7 +28,7 @@ class MOSSImageSampler(BaseModelSampler):
         if self.model.self_flow_ema is None:
             print("[Self-Flow] EMA sampling requested, but no Self-Flow training is running; sampling the trained weights.")
             return nullcontext()
-        return self.model.self_flow_ema.ema_weights(self.model.self_flow_adapter_modules())
+        return self.model.self_flow_ema.sampling_weights(self.model.self_flow_adapter_modules())
 
     @torch.no_grad()
     def sample(

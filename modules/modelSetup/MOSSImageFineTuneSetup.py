@@ -66,7 +66,15 @@ class MOSSImageFineTuneSetup(
         self._create_self_flow_projector(model, config, torch.float32)
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
-        self._create_self_flow_ema(model, config, [p for p in model.transformer.parameters() if p.requires_grad])
+        if config.self_flow_enabled:
+            trained = [p for p in model.transformer.parameters() if p.requires_grad]
+            # The teacher swaps each DiT block's EMA in just around that block.
+            position = {id(p): index for index, p in enumerate(trained)}
+            layer_groups = [
+                [position[id(p)] for p in layer.parameters() if id(p) in position]
+                for layer in model.transformer.layers
+            ]
+            self._create_self_flow_ema(model, config, trained, layer_groups)
         init_model_parameters(model, params, self.train_device)
 
     def setup_train_device(

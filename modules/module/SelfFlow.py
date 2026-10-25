@@ -5,7 +5,7 @@ model integration supplies a forward with per-image-token timesteps that can ret
 an intermediate image-token feature; everything else lives here.
 """
 from collections.abc import Iterable
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -29,24 +29,30 @@ class SelfFlowProjector(nn.Module):
 
 
 class SelfFlowEMA:
-    """CPU float32 EMA of the trained parameters, used as the Self-Flow teacher.
+    """fp32 EMA of the trained parameters in CPU memory, used as the Self-Flow teacher.
 
-    Parameter objects are never replaced, so optimizer references stay valid. A swap
-    writes the EMA values into the existing storage and restores a snapshot of the
-    active values afterwards. The snapshot is taken at swap time in the parameter's
-    own dtype: the restore is exact, and nothing that changed the weights since the
-    last optimizer step (DPO reference setup, resume) is overwritten.
+    The teacher forward runs with the EMA weights by pointing each ``Parameter.data`` at
+    a device copy of its EMA value and back afterwards: the student weights are neither
+    copied nor rewritten, Parameter objects (optimizer references) stay the same, and the
+    autograd version counter is untouched, so a graph that is still alive (mixed RLHF)
+    stays valid. Only the EMA travels to the device, one transfer per tensor from pinned
+    memory, and the update after each optimizer step runs on the device.
 
-    Writes go through ``Parameter.data``, which does not bump the autograd version
-    counter. A swap always restores identical values before any backward, so a graph
-    that is still alive (mixed RLHF batches) stays valid.
+    ``layer_groups`` lists parameter indices per DiT block. Those are swapped in only
+    around their own block (``layer_weights``), so a full fine-tune never holds a second
+    copy of the whole model on the GPU. All other parameters swap for the whole teacher
+    forward (``teacher_weights``).
     """
+
+    # Page-locking much more host memory than this can starve the rest of the system.
+    PIN_LIMIT_BYTES = 4 * 1024 ** 3
 
     def __init__(
             self,
             parameters: Iterable[nn.Parameter],
             decay: float,
             state_dict: dict | None = None,
+            layer_groups: list[list[int]] | None = None,
     ):
         self.parameters = list(parameters)
         if not self.parameters:
@@ -56,57 +62,95 @@ class SelfFlowEMA:
 
         self.decay = float(decay)
         self.optimization_steps = 0
-        self._swapped = False
-        self.ema_parameters = [self._cpu_float(parameter) for parameter in self.parameters]
+        self._swapped: set[int] = set()
+        self.layer_groups = [list(group) for group in layer_groups or []]
+        in_layers = {index for group in self.layer_groups for index in group}
+        self.global_group = [index for index in range(len(self.parameters)) if index not in in_layers]
+        total_bytes = 4 * sum(parameter.numel() for parameter in self.parameters)
+        self._pin = torch.cuda.is_available() and total_bytes <= self.PIN_LIMIT_BYTES
+        self.ema_parameters = [self._host_float(parameter) for parameter in self.parameters]
 
         if state_dict is not None:
             self.load_state_dict(state_dict)
 
-    @staticmethod
-    def _cpu_float(parameter: nn.Parameter) -> Tensor:
-        return parameter.detach().to(device="cpu", dtype=torch.float32).clone()
-
-    @torch.no_grad()
-    def _copy_to_parameters(self, source: list[Tensor]):
-        for index, (stored, parameter) in enumerate(zip(source, self.parameters, strict=True)):
-            if stored.shape != parameter.shape:
-                raise RuntimeError(
-                    f"Self-Flow EMA parameter shape mismatch at index {index}: "
-                    f"stored={tuple(stored.shape)}, active={tuple(parameter.shape)}"
-                )
-            parameter.data.copy_(stored)
+    def _host_float(self, tensor: Tensor) -> Tensor:
+        host = torch.empty(tensor.shape, dtype=torch.float32, pin_memory=self._pin)
+        host.copy_(tensor.detach())
+        return host
 
     @contextmanager
-    def ema_weights(self, modules: Iterable[nn.Module] = ()):
-        """Temporarily run with the EMA weights; ``modules`` are put in eval mode (LoRA dropout)."""
-        if self._swapped:
+    def _swap(self, indices: list[int]):
+        if self._swapped.intersection(indices):
             raise RuntimeError("Nested Self-Flow EMA swaps are not supported.")
-
-        modules = list(modules)
-        training_states = [module.training for module in modules]
-        active = [parameter.detach().to(device="cpu", copy=True) for parameter in self.parameters]
-        self._swapped = True
+        parameters = [self.parameters[index] for index in indices]
+        originals = [parameter.data for parameter in parameters]
+        self._swapped.update(indices)
         try:
-            self._copy_to_parameters(self.ema_parameters)
-            for module in modules:
-                module.eval()
+            for index, parameter in zip(indices, parameters, strict=True):
+                parameter.data = self.ema_parameters[index].to(
+                    device=parameter.device, dtype=parameter.dtype, non_blocking=True,
+                )
             yield
         finally:
-            try:
-                self._copy_to_parameters(active)
-            finally:
-                for module, was_training in zip(modules, training_states, strict=True):
-                    module.train(was_training)
-                self._swapped = False
+            for parameter, original in zip(parameters, originals, strict=True):
+                parameter.data = original
+            self._swapped.difference_update(indices)
+
+    @contextmanager
+    def teacher_weights(self, modules: Iterable[nn.Module] = ()):
+        """EMA weights for every parameter outside ``layer_groups``; ``modules`` run in eval mode (LoRA dropout)."""
+        modules = list(modules)
+        training_states = [module.training for module in modules]
+        try:
+            for module in modules:
+                module.eval()
+            with self._swap(self.global_group):
+                yield
+        finally:
+            for module, was_training in zip(modules, training_states, strict=True):
+                module.train(was_training)
+
+    def layer_weights(self, layer_index: int):
+        if not self.layer_groups:
+            return nullcontext()
+        return self._swap(self.layer_groups[layer_index])
+
+    @contextmanager
+    def sampling_weights(self, modules: Iterable[nn.Module] = ()):
+        """All EMA weights at once, for a native forward that has no per-block hook."""
+        if not self.layer_groups:
+            with self.teacher_weights(modules):
+                yield
+            return
+        # A full fine-tune would need a second model copy on the GPU for a pointer swap.
+        # Sampling is rare, so copy the EMA into the weights in place instead.
+        active = [parameter.detach().to("cpu", copy=True) for parameter in self.parameters]
+        try:
+            with torch.no_grad():
+                for parameter, ema in zip(self.parameters, self.ema_parameters, strict=True):
+                    parameter.data.copy_(ema)
+            yield
+        finally:
+            with torch.no_grad():
+                for parameter, value in zip(self.parameters, active, strict=True):
+                    parameter.data.copy_(value)
 
     @torch.no_grad()
     def update(self):
         if self._swapped:
             raise RuntimeError("Cannot update the Self-Flow EMA while its weights are swapped in.")
 
-        one_minus_decay = 1.0 - self.decay
-        for ema_parameter, parameter in zip(self.ema_parameters, self.parameters, strict=True):
-            ema_parameter.mul_(self.decay).add_(self._cpu_float(parameter), alpha=one_minus_decay)
+        weight = 1.0 - self.decay
+        for group in [*self.layer_groups, self.global_group]:
+            for index in group:
+                parameter = self.parameters[index]
+                ema = self.ema_parameters[index].to(parameter.device, non_blocking=True)
+                ema.lerp_(parameter.detach().float(), weight)
+                if ema is not self.ema_parameters[index]:
+                    self.ema_parameters[index].copy_(ema, non_blocking=True)
+        if self._pin:
+            # Device-to-pinned copies are asynchronous; the host reads the EMA on save.
+            torch.cuda.synchronize()
         self.optimization_steps += 1
 
     def state_dict(self) -> dict:
@@ -133,7 +177,7 @@ class SelfFlowEMA:
                     f"Self-Flow EMA parameter shape mismatch at index {index}: "
                     f"backup={tuple(stored.shape)}, active={tuple(parameter.shape)}"
                 )
-            loaded_parameters.append(stored.detach().to(device="cpu", dtype=torch.float32).clone())
+            loaded_parameters.append(self._host_float(stored))
 
         # The configured decay wins over the stored one, so it can be changed on resume.
         self.optimization_steps = int(state_dict.get("optimization_steps", 0))

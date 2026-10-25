@@ -5,6 +5,8 @@ This forward reproduces it, but conditions every image token on its own timestep
 (text tokens keep the sample's base timestep) and can return the image-token
 hidden state after a given main DiT block, or stop there for the EMA teacher.
 """
+from collections.abc import Callable
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 
 from modules.module.moss.pipeline_moss_image import MOSSImageTransformer, _linear_input
@@ -45,8 +47,13 @@ def moss_self_flow_forward(
         encoder_attention_mask: Tensor,
         capture_layer: int | None = None,
         stop_at_layer: int | None = None,
+        layer_weights: Callable[[int], AbstractContextManager] | None = None,
 ) -> MOSSSelfFlowOutput:
-    """``image_timestep`` is [B] or [B, H*W] and ``text_timestep`` is [B], both raw times 1..1000."""
+    """``image_timestep`` is [B] or [B, H*W] and ``text_timestep`` is [B], both raw times 1..1000.
+
+    ``layer_weights(i)`` is entered around main block ``i``; the EMA teacher of a full
+    fine-tune uses it to swap in one block's weights at a time.
+    """
     if hidden_states.ndim != 4 or hidden_states.shape[1] != transformer.config.latent_channels:
         raise ValueError("hidden_states must be [B, latent_channels, H, W].")
     batch, _, height, width = hidden_states.shape
@@ -106,7 +113,8 @@ def moss_self_flow_forward(
 
     feature = None
     for layer_index, layer in enumerate(transformer.layers):
-        x = layer(x, rope, block_mod, joint_lengths)
+        with layer_weights(layer_index) if layer_weights is not None else nullcontext():
+            x = layer(x, rope, block_mod, joint_lengths)
         if layer_index == capture_layer:
             feature = x[:, :image_tokens]
         if layer_index == stop_at_layer:

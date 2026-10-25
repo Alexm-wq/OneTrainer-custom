@@ -41,25 +41,53 @@ class SelfFlowEMATest(unittest.TestCase):
         # A weight change after the last update (e.g. a DPO reference setup) must survive the swap.
         with torch.no_grad():
             parameter.add_(1.0)
-        version = parameter._version
+        storage, version = parameter.data_ptr(), parameter._version
         module = nn.Dropout()
-        with ema.ema_weights([module]):
+        with ema.teacher_weights([module]):
             torch.testing.assert_close(parameter.detach(), torch.tensor([2.0, 3.0]))
             self.assertFalse(module.training)
         torch.testing.assert_close(parameter.detach(), torch.tensor([4.0, 5.0]), rtol=0, atol=0)
         self.assertTrue(module.training)
-        # Live autograd graphs stay valid: the swap does not bump the version counter.
-        self.assertEqual(parameter._version, version)
+        # The student weights are never copied: the swap only repoints the parameter.
+        self.assertEqual((parameter.data_ptr(), parameter._version), (storage, version))
 
         restored = SelfFlowEMA([parameter], decay=0.9, state_dict=ema.state_dict())
         torch.testing.assert_close(restored.ema_parameters[0], ema.ema_parameters[0])
         self.assertEqual(restored.optimization_steps, 1)
         self.assertEqual(restored.decay, 0.9)
 
+    def test_swap_keeps_a_live_graph_valid(self):
+        weight = nn.Parameter(torch.randn(4, 4))
+        ema = SelfFlowEMA([weight], decay=0.5)
+        with torch.no_grad():
+            ema.ema_parameters[0].zero_()
+        x = torch.randn(2, 4, requires_grad=True)
+        loss = (x @ weight).square().sum()
+        expected = torch.autograd.grad(loss, (x, weight), retain_graph=True)
+        with ema.teacher_weights(), torch.no_grad():
+            self.assertEqual((x @ weight).abs().sum().item(), 0.0)
+        for actual, reference in zip(torch.autograd.grad(loss, (x, weight)), expected, strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+
+    def test_layer_groups_swap_one_block_at_a_time(self):
+        first, second, other = (nn.Parameter(torch.ones(2)) for _ in range(3))
+        ema = SelfFlowEMA([first, second, other], decay=0.5, layer_groups=[[0], [1]])
+        for value in ema.ema_parameters:
+            value.zero_()
+        with ema.teacher_weights():
+            self.assertEqual([p.sum().item() for p in (first, second, other)], [2, 2, 0])
+            with ema.layer_weights(1):
+                self.assertEqual([p.sum().item() for p in (first, second, other)], [2, 0, 0])
+        with ema.sampling_weights():
+            self.assertEqual([p.sum().item() for p in (first, second, other)], [0, 0, 0])
+        self.assertEqual([p.sum().item() for p in (first, second, other)], [2, 2, 2])
+        ema.update()
+        torch.testing.assert_close(torch.stack(ema.ema_parameters), torch.full((3, 2), 0.5))
+
     def test_update_refused_during_swap(self):
         parameter = nn.Parameter(torch.ones(1))
         ema = SelfFlowEMA([parameter], decay=0.5)
-        with ema.ema_weights(), self.assertRaisesRegex(RuntimeError, "swapped"):
+        with ema.teacher_weights(), self.assertRaisesRegex(RuntimeError, "swapped"):
             ema.update()
 
     def test_layers_and_structural_loss(self):
@@ -315,9 +343,31 @@ class MOSSSelfFlowTrainingTest(unittest.TestCase):
         setup.setup_optimizations(self.model, self.config)
         setup.setup_model(self.model, self.config)
         trained = [p for p in self.model.transformer.parameters() if p.requires_grad]
-        self.assertEqual(len(self.model.self_flow_ema.parameters), len(trained))
+        ema = self.model.self_flow_ema
+        self.assertEqual(len(ema.parameters), len(trained))
+        self.assertEqual(len(ema.layer_groups), len(self.model.transformer.layers))
+        with torch.no_grad():
+            for value in ema.ema_parameters:
+                value.add_(0.01 * torch.randn_like(value))
+
+        # Swapping block by block must give exactly the teacher of a model holding all EMA weights.
+        calls = []
+        original = moss_self_flow.moss_self_flow_forward
+
+        def spy(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append((args, kwargs, result))
+            return result
+
         batch = self.batch()
-        output = setup.predict(self.model, batch, self.config, TrainProgress())
+        with patch("modules.modelSetup.BaseMOSSImageSetup.moss_self_flow_forward", side_effect=spy):
+            output = setup.predict(self.model, batch, self.config, TrainProgress())
+        args, kwargs, teacher = calls[0]
+        with ema.sampling_weights(), torch.no_grad():
+            kwargs = {**kwargs, "layer_weights": None}
+            expected = original(*args, **kwargs).feature
+        torch.testing.assert_close(teacher.feature, expected, rtol=0, atol=0)
+
         setup.calculate_loss(self.model, batch, output, self.config).backward()
         self.assertTrue(any(p.grad is not None for p in trained))
 
