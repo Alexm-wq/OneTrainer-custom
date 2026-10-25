@@ -47,10 +47,16 @@ class CtkSampleWindowView(BaseSampleWindowView, ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
 
-        prompt_frame = CtkSampleFrameView(self, SampleFrameController(controller.sample, model_type), self.ui_state, include_settings=False)
+        frame_controller = SampleFrameController(
+            controller.sample, model_type,
+            # only a running training has the EMA teacher
+            self_flow_ema_sampling=controller.use_external_model
+            and controller.current_train_config.supports_self_flow_ema_sampling(),
+        )
+        prompt_frame = CtkSampleFrameView(self, frame_controller, self.ui_state, include_settings=False)
         prompt_frame.grid(row=0, column=0, columnspan=2, padx=0, pady=0, sticky="nsew")
 
-        settings_frame = CtkSampleFrameView(self, SampleFrameController(controller.sample, model_type), self.ui_state, include_prompt=False)
+        settings_frame = CtkSampleFrameView(self, frame_controller, self.ui_state, include_prompt=False)
         settings_frame.grid(row=1, column=0, padx=0, pady=0, sticky="nsew")
 
         # image

@@ -3,6 +3,7 @@ from modules.util.enum.ModelType import ModelType
 
 
 class SampleParamsWindowController:
-    def __init__(self, sample: SampleConfig, model_type: ModelType | None = None):
+    def __init__(self, sample: SampleConfig, model_type: ModelType | None = None, self_flow_ema_sampling: bool = False):
         self.sample = sample
         self.model_type = model_type
+        self.self_flow_ema_sampling = self_flow_ema_sampling

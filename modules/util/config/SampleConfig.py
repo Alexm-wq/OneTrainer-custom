@@ -185,6 +185,8 @@ class SampleConfig(BaseConfig):
     noise_scheduler: NoiseScheduler
     # manual samples only: False samples the current weights instead of the EMA weights
     use_ema: bool
+    # manual and training samples: sample with the Self-Flow EMA teacher instead of the trained weights
+    self_flow_ema: bool
 
     text_encoder_1_layer_skip: int
     text_encoder_1_sequence_length: int | None
@@ -235,6 +237,7 @@ class SampleConfig(BaseConfig):
         data.append(("cfg_scale", defaults["cfg_scale"], float, False))
         data.append(("noise_scheduler", defaults["noise_scheduler"], NoiseScheduler, False))
         data.append(("use_ema", True, bool, False))
+        data.append(("self_flow_ema", False, bool, False))
 
         data.append(("text_encoder_1_layer_skip", 0, int, False))
         data.append(("text_encoder_1_sequence_length", None, int, True))

@@ -517,6 +517,18 @@ class TrainConfig(BaseConfig):
     identity_reward_arcface_path: str
     identity_reward_detector_path: str
 
+    # Self-Flow (dual-timestep self-supervised flow matching, MOSS-Image)
+    self_flow_enabled: bool
+    self_flow_mask_ratio: float
+    self_flow_rep_weight: float
+    self_flow_structural_enabled: bool
+    self_flow_structural_weight: float
+    self_flow_structural_tokens: int
+    self_flow_ema_decay: float
+    self_flow_student_layer: int
+    self_flow_teacher_layer: int
+    self_flow_teacher_target_offload: bool
+
     noising_weight: float
     noising_bias: float
 
@@ -980,6 +992,10 @@ class TrainConfig(BaseConfig):
             self.embedding_weight_dtype,
         )
 
+    def supports_self_flow_ema_sampling(self) -> bool:
+        # The Self-Flow EMA teacher only exists while a MOSS-Image Self-Flow training runs.
+        return bool(self.self_flow_enabled and self.model_type.is_moss_image())
+
     def model_names(self) -> ModelNames:
         return ModelNames(
             base_model=self.base_model_name,
@@ -1203,6 +1219,18 @@ class TrainConfig(BaseConfig):
         data.append(("identity_reward_trigger", "", str, False))
         data.append(("identity_reward_arcface_path", ARCFACE_URL, str, False))
         data.append(("identity_reward_detector_path", YUNET_URL, str, False))
+
+        # Self-Flow
+        data.append(("self_flow_enabled", False, bool, False))
+        data.append(("self_flow_mask_ratio", 0.25, float, False))
+        data.append(("self_flow_rep_weight", 1.0, float, False))
+        data.append(("self_flow_structural_enabled", False, bool, False))
+        data.append(("self_flow_structural_weight", 0.25, float, False))
+        data.append(("self_flow_structural_tokens", 256, int, False))
+        data.append(("self_flow_ema_decay", 0.9999, float, False))
+        data.append(("self_flow_student_layer", -1, int, False))
+        data.append(("self_flow_teacher_layer", -1, int, False))
+        data.append(("self_flow_teacher_target_offload", False, bool, False))
 
 
         # unet

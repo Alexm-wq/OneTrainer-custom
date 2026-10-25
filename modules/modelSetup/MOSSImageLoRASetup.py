@@ -6,7 +6,7 @@ from modules.util import factory
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.TrainProgress import TrainProgress
 
@@ -37,6 +37,12 @@ class MOSSImageLoRASetup(
         parameter_group_collection = NamedParameterGroupCollection()
 
         self._create_model_part_parameters(parameter_group_collection, "transformer", model.transformer_lora, config.transformer)
+        if model.self_flow_projector is not None:
+            parameter_group_collection.add_group(NamedParameterGroup(
+                unique_name="self_flow_projector",
+                parameters=model.self_flow_projector.parameters(),
+                learning_rate=config.transformer.learning_rate,
+            ))
         return parameter_group_collection
 
     def __setup_requires_grad(
@@ -49,12 +55,16 @@ class MOSSImageLoRASetup(
         model.vae.requires_grad_(False)
 
         self._setup_model_part_requires_grad("transformer", model.transformer_lora, config.transformer, model.train_progress)
+        if model.self_flow_projector is not None:
+            model.self_flow_projector.requires_grad_(True)
 
     def setup_model(
             self,
             model: MOSSImageModel,
             config: TrainConfig,
     ):
+        self._validate_self_flow(model, config)
+
         model.transformer_lora = LoRAModuleWrapper(
             model.transformer, "transformer", config, config.layer_filter.split(","),
             fusion_spec=model.fusion_groups(), fuse=config.output_model_format.needs_qkv_fusion(),
@@ -68,8 +78,10 @@ class MOSSImageLoRASetup(
         model.transformer_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
         model.transformer_lora.hook_to_module()
 
+        self._create_self_flow_projector(model, config, config.lora_weight_dtype.torch_dtype())
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
+        self._create_self_flow_ema(model, config, model.transformer_lora.parameters())
         init_model_parameters(model, params, self.train_device)
 
     def setup_train_device(
@@ -100,6 +112,8 @@ class MOSSImageLoRASetup(
             model.transformer.train()
         else:
             model.transformer.eval()
+        if model.self_flow_projector is not None:
+            model.self_flow_projector.train()
 
         self._prepare_identity_reward(model, config)
 
@@ -110,3 +124,5 @@ class MOSSImageLoRASetup(
             train_progress: TrainProgress
     ):
         self.__setup_requires_grad(model, config)
+        if model.self_flow_ema is not None:
+            model.self_flow_ema.update()

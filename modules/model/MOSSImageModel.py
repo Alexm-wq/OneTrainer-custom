@@ -3,6 +3,7 @@ from random import Random
 
 from modules.model.Flux2Model import Flux2Model
 from modules.module.moss.pipeline_moss_image import MOSSImagePipeline
+from modules.module.SelfFlow import SelfFlowEMA, SelfFlowProjector
 from modules.util.enum.DataType import DataType
 from modules.util.moss_layout import is_layout
 
@@ -12,11 +13,48 @@ import torch
 class MOSSImageModel(Flux2Model):
     """Reuse only FLUX.2's component moves and 2x2 latent/BN transforms."""
 
+    self_flow_projector: SelfFlowProjector | None
+    self_flow_ema: SelfFlowEMA | None
+    self_flow_state_dict: dict | None
+    self_flow_student_layer: int | None
+    self_flow_teacher_layer: int | None
+
     def __init__(self, model_type):
         super().__init__(model_type)
         self.vae_train_dtype = DataType.FLOAT_32
         self.vae_autocast_context = torch.autocast("cpu", enabled=False)
         self.empty_text = {}
+        # Self-Flow training state: projector and EMA teacher exist only while training with Self-Flow.
+        self.self_flow_projector = None
+        self.self_flow_ema = None
+        self.self_flow_state_dict = None
+        self.self_flow_student_layer = None
+        self.self_flow_teacher_layer = None
+
+    def transformer_to(self, device):
+        super().transformer_to(device)
+        if self.self_flow_projector is not None:
+            self.self_flow_projector.to(device=device)
+
+    def eval(self):
+        super().eval()
+        if self.self_flow_projector is not None:
+            self.self_flow_projector.eval()
+
+    def self_flow_adapter_modules(self) -> list[torch.nn.Module]:
+        """Modules switched to eval for the EMA teacher, so LoRA dropout stays off."""
+        if self.transformer_lora is None:
+            return []
+        return list(self.transformer_lora.lora_modules.values())
+
+    def get_self_flow_state_dict(self) -> dict | None:
+        if self.self_flow_projector is None or self.self_flow_ema is None:
+            return None
+        return {
+            "version": 1,
+            "projector": self.self_flow_projector.state_dict(),
+            "ema": self.self_flow_ema.state_dict(),
+        }
 
     def fusion_groups(self):
         return None

@@ -87,6 +87,12 @@ class BaseSampleFrameView:
                     bottom_frame, 7, 0, "Edit MOSS layout",
                     lambda: open_sample_layout(bottom_frame, self.components, controller.sample, ui_state),
                 )
+                if controller.supports_self_flow_ema_sampling():
+                    self.components.label(
+                        bottom_frame, 5, 2, "Self-Flow EMA:",
+                        tooltip="Sample with the Self-Flow EMA teacher weights instead of the trained weights.",
+                    )
+                    self.components.switch(bottom_frame, 5, 3, ui_state, "self_flow_ema")
 
             if controller.model_type.is_flux_3():
                 self.components.label(

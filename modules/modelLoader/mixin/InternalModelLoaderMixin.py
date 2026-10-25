@@ -38,5 +38,12 @@ class InternalModelLoaderMixin(metaclass=ABCMeta):
             with contextlib.suppress(FileNotFoundError):
                 model.ema_state_dict = torch.load(os.path.join(model_name, "ema", "ema.pt"), weights_only=True)
 
+            # Self-Flow projector and EMA teacher; backups without Self-Flow have no such directory
+            if hasattr(model, "self_flow_state_dict"):
+                with contextlib.suppress(FileNotFoundError):
+                    model.self_flow_state_dict = torch.load(
+                        os.path.join(model_name, "self_flow", "self_flow.pt"), weights_only=True,
+                    )
+
             # meta
             model.train_progress = train_progress

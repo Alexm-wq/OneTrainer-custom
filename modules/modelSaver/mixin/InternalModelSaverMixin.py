@@ -30,6 +30,13 @@ class InternalModelSaverMixin(metaclass=ABCMeta):
             os.makedirs(os.path.join(destination, "ema"), exist_ok=True)
             torch.save(model.ema.state_dict(), os.path.join(destination, "ema", "ema.pt"))
 
+        # Self-Flow projector and EMA teacher are training-only and stay out of exported models.
+        get_self_flow_state_dict = getattr(model, "get_self_flow_state_dict", None)
+        self_flow_state_dict = get_self_flow_state_dict() if callable(get_self_flow_state_dict) else None
+        if self_flow_state_dict is not None:
+            os.makedirs(os.path.join(destination, "self_flow"), exist_ok=True)
+            torch.save(self_flow_state_dict, os.path.join(destination, "self_flow", "self_flow.pt"))
+
         # meta
         with open(os.path.join(destination, "meta.json"), "w") as meta_file:
             json.dump({

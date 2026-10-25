@@ -44,6 +44,45 @@ The bundled integration uses the upstream model implementation from Hugging Face
 - The sequence length preset is 512 to reduce cache size; increase it for long
   layout prompts. Sampling uses the training length when invoked during training.
 
+## Self-Flow
+
+The Self-Flow section of the training tab enables dual-timestep training from Black
+Forest Labs' Self-Flow (self-supervised flow matching). It is the same method as on the
+FLUX.2 and Mage-Flow branches, adapted to MOSS's single-stream DiT. The
+**moss-image Self-Flow LoRA** preset enables it on top of the LoRA preset, with EMA decay
+0.999: the paper's 0.9999 suits long pretraining runs, while the teacher of a LoRA run of
+a few thousand steps would barely move from the starting weights.
+
+- Each step samples two timesteps per image. `Token Mask Ratio` of the 2x2 patch tokens
+  get the second one, the rest the first; text tokens keep the first. The DiT conditions
+  every token on its own timestep through the shared block and output-head modulation.
+  The velocity target is unchanged.
+- An EMA teacher sees all tokens at the cleaner of the two timesteps. Its forward stops
+  after `Teacher Block`. The student's output after `Student Block` passes through a
+  small trained projector and is aligned to the teacher feature by cosine loss
+  (`Representation Weight`). `Structural Alignment` also matches the pairwise token
+  similarities of `Structural Tokens` tokens spread over the image. `-1` selects blocks
+  14 and 34 of 42.
+- The EMA teacher is kept in fp32 on the CPU and swapped into the trained weights only
+  for the teacher forward. With LoRA it covers the LoRA weights. With full fine-tuning
+  it covers all trained DiT weights: about 4 bytes of RAM per parameter, plus a copy of
+  the weights for the duration of each swap, and a slower step. Full fine-tuning with
+  Self-Flow does not support layer offloading; activation offloading works.
+- Each step adds one teacher forward up to the teacher block, without gradients.
+  `Offload Teacher Target` keeps the teacher feature in RAM while the student runs.
+- Sigma loss weighting weights every token by its own sigma. The identity reward
+  reconstructs `x0` with the per-token sigma as well.
+- Self-Flow applies to ordinary supervised rows. DPO preference scores (policy,
+  reference and streamed replay) and validation keep the native single-timestep
+  forward, so preference likelihoods and validation losses stay comparable. Prior
+  prediction concepts, masked prior preservation and multi-GPU are not supported
+  with Self-Flow.
+- The projector and EMA teacher are saved in backups (`self_flow/self_flow.pt`) and
+  restored on resume. Exported models contain only the trained weights. The sample
+  settings show a `Self-Flow EMA` switch to sample with the EMA teacher during training.
+- TensorBoard: `loss/self_flow_rep`, `loss/self_flow_structural`, `loss/generation`,
+  `self_flow/cosine_similarity`, the mean timesteps and `performance/self_flow_teacher_ms`.
+
 ## Identity reward
 
 For character LoRAs of real faces, the Identity Reward section of the training tab

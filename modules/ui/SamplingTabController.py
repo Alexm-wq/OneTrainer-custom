@@ -11,4 +11,7 @@ class SamplingTabController:
         return SampleConfig.default_values(self.train_config.model_type)
 
     def open_element_window(self, parent, sample_config, ui_state, view_cls):
-        return view_cls(parent, SampleParamsWindowController(sample_config, model_type=self.train_config.model_type), ui_state)
+        return view_cls(parent, SampleParamsWindowController(
+            sample_config, model_type=self.train_config.model_type,
+            self_flow_ema_sampling=self.train_config.supports_self_flow_ema_sampling(),
+        ), ui_state)

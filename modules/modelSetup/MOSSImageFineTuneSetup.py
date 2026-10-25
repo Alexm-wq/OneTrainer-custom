@@ -6,7 +6,7 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ModelType import ModelType
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.ModuleFilter import ModuleFilter
-from modules.util.NamedParameterGroup import NamedParameterGroupCollection
+from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.optimizer_util import init_model_parameters
 from modules.util.TrainProgress import TrainProgress
 
@@ -38,6 +38,12 @@ class MOSSImageFineTuneSetup(
 
         self._create_model_part_parameters(parameter_group_collection, "transformer", model.transformer, config.transformer,
                                            freeze=ModuleFilter.create(config), debug=config.debug_mode)
+        if model.self_flow_projector is not None:
+            parameter_group_collection.add_group(NamedParameterGroup(
+                unique_name="self_flow_projector",
+                parameters=model.self_flow_projector.parameters(),
+                learning_rate=config.transformer.learning_rate,
+            ))
         return parameter_group_collection
 
     def __setup_requires_grad(
@@ -48,15 +54,19 @@ class MOSSImageFineTuneSetup(
         self._setup_model_part_requires_grad("transformer", model.transformer, config.transformer, model.train_progress)
         model.vae.requires_grad_(False)
         model.text_encoder.requires_grad_(False)
-
+        if model.self_flow_projector is not None:
+            model.self_flow_projector.requires_grad_(True)
 
     def setup_model(
             self,
             model: MOSSImageModel,
             config: TrainConfig,
     ):
+        self._validate_self_flow(model, config)
+        self._create_self_flow_projector(model, config, torch.float32)
         params = self.create_parameters(model, config)
         self.__setup_requires_grad(model, config)
+        self._create_self_flow_ema(model, config, [p for p in model.transformer.parameters() if p.requires_grad])
         init_model_parameters(model, params, self.train_device)
 
     def setup_train_device(
@@ -87,6 +97,8 @@ class MOSSImageFineTuneSetup(
             model.transformer.train()
         else:
             model.transformer.eval()
+        if model.self_flow_projector is not None:
+            model.self_flow_projector.train()
 
         self._prepare_identity_reward(model, config)
 
@@ -97,3 +109,5 @@ class MOSSImageFineTuneSetup(
             train_progress: TrainProgress
     ):
         self.__setup_requires_grad(model, config)
+        if model.self_flow_ema is not None:
+            model.self_flow_ema.update()

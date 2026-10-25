@@ -167,16 +167,20 @@ class _Block(nn.Module):
         self.proj['ffn_down'] = nn.Linear(ffn_dim, dim, bias=False)
 
     def forward(self, x, rope, modulation, lengths=None):
-        shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(1)
-        y = self.norm1(x) * (1 + scale_a[:, None]) + shift_a[:, None]
+        # [B, 6, D] is the native per-sample timestep; Self-Flow training passes [B, L, 6, D] per token.
+        if modulation.ndim == 4:
+            shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = modulation.unbind(2)
+        else:
+            shift_a, scale_a, gate_a, shift_f, scale_f, gate_f = (m[:, None] for m in modulation.unbind(1))
+        y = self.norm1(x) * (1 + scale_a) + shift_a
         q = self.q_norm(self.proj['q'](_linear_input(y, self.proj['q'])).unflatten(-1, (self.heads, -1))).flatten(2)
         k = self.k_norm(self.proj['k'](_linear_input(y, self.proj['k'])).unflatten(-1, (self.heads, -1))).flatten(2)
         v = self.proj['v'](_linear_input(y, self.proj['v']))
         attention = _attention(q, k, v, rope, self.heads, lengths, self.attention_backend)
-        x = x + self.proj['o'](_linear_input(attention, self.proj['o'])) * gate_a[:, None]
-        y = self.norm2(x) * (1 + scale_f[:, None]) + shift_f[:, None]
+        x = x + self.proj['o'](_linear_input(attention, self.proj['o'])) * gate_a
+        y = self.norm2(x) * (1 + scale_f) + shift_f
         hidden, gate = self.proj['ffn_up_gate'](_linear_input(y, self.proj['ffn_up_gate'])).chunk(2, -1)
-        return x + self.proj['ffn_down'](_linear_input(_situ(hidden, gate), self.proj['ffn_down'])) * gate_f[:, None]
+        return x + self.proj['ffn_down'](_linear_input(_situ(hidden, gate), self.proj['ffn_down'])) * gate_f
 
 
 class _RoPE(nn.Module):

@@ -216,6 +216,8 @@ class BaseTrainingTabView(ABC):
             supports_layer_offloading=True, supports_activation_offloading=True,
         )
         self.__create_noise_frame(column_1, 2, ui_state)
+        if identity_reward:
+            self.__create_self_flow_frame(column_1, 3, ui_state)
 
         self.__create_masked_frame(column_2, 1, ui_state)
         self.__create_loss_frame(column_2, 2, controller, ui_state)
@@ -843,6 +845,54 @@ class BaseTrainingTabView(ABC):
         self.components.label(frame, 7, 0, "Face Detector Model",
                               tooltip="OpenCV YuNet model (face_detection_yunet_2023mar.onnx): a local file or a link. The default downloads it from the OpenCV model zoo once.")
         self.components.path_entry(frame, 7, 1, ui_state, "identity_reward_detector_path", mode="file", allow_urls=True)
+
+    def __create_self_flow_frame(self, master, row, ui_state):
+        frame = self.components.section_frame(master, row)
+
+        self.components.label(frame, 0, 0, "Self-Flow",
+                              tooltip="Self-Flow (Black Forest Labs): dual-timestep training with an EMA teacher. Each image token is noised to one of two timesteps, and an intermediate student feature is aligned to a deeper feature of the EMA teacher, which sees the cleaner view. Adds one partial teacher forward per step. Sampling, validation and DPO preference scores keep the normal forward.", wide_tooltip=True)
+        self.components.switch(frame, 0, 1, ui_state, "self_flow_enabled")
+
+        self.components.label(frame, 1, 0, "Token Mask Ratio",
+                              tooltip="Fraction of image tokens that get the second timestep. The paper allows at most 0.5; 0.25 is its default.")
+        self.components.entry(frame, 1, 1, ui_state, "self_flow_mask_ratio", required=True,
+                              extra_validate=check_range(lower=0, upper=0.5, message="Self-Flow mask ratio must be between 0 and 0.5"))
+
+        self.components.label(frame, 2, 0, "Representation Weight",
+                              tooltip="Weight of the cosine loss between the projected student feature and the EMA teacher feature. Watch loss/self_flow_rep and self_flow/cosine_similarity in TensorBoard.")
+        self.components.entry(frame, 2, 1, ui_state, "self_flow_rep_weight", required=True,
+                              extra_validate=check_range(lower=0, message="Self-Flow representation weight must be non-negative"))
+
+        self.components.label(frame, 3, 0, "Structural Alignment",
+                              tooltip="Also match the pairwise similarities between sampled student and teacher image tokens (spatial structure). Needs no extra transformer forward.", wide_tooltip=True)
+        self.components.switch(frame, 3, 1, ui_state, "self_flow_structural_enabled")
+
+        self.components.label(frame, 4, 0, "Structural Weight",
+                              tooltip="Weight of the structural alignment loss. 0.25 is a conservative default.")
+        self.components.entry(frame, 4, 1, ui_state, "self_flow_structural_weight", required=True,
+                              extra_validate=check_range(lower=0, message="Structural Self-Flow weight must be non-negative"))
+
+        self.components.label(frame, 5, 0, "Structural Tokens",
+                              tooltip="Number of image tokens, spread over the whole image, used for structural alignment. The cost grows quadratically.")
+        self.components.entry(frame, 5, 1, ui_state, "self_flow_structural_tokens", required=True,
+                              extra_validate=check_range(lower=2, upper=2048, message="Structural Self-Flow tokens must be between 2 and 2048"))
+
+        self.components.label(frame, 6, 0, "Teacher EMA Decay",
+                              tooltip="Decay of the EMA teacher, kept in fp32 on the CPU. With LoRA it covers the LoRA weights; with full fine-tuning all trained transformer weights, which needs 4 bytes of CPU RAM per parameter.", wide_tooltip=True)
+        self.components.entry(frame, 6, 1, ui_state, "self_flow_ema_decay", required=True,
+                              extra_validate=check_range(lower=0, upper=1, upper_inclusive=False, message="Self-Flow EMA decay must be in [0, 1)"))
+
+        self.components.label(frame, 7, 0, "Student Block",
+                              tooltip="Zero-based MOSS main DiT block whose output is the student feature. -1: about one third of the depth (block 14 of 42).", wide_tooltip=True)
+        self.components.entry(frame, 7, 1, ui_state, "self_flow_student_layer", required=True)
+
+        self.components.label(frame, 8, 0, "Teacher Block",
+                              tooltip="Deeper zero-based block whose output is the EMA teacher target. The teacher forward stops there. -1: about five sixths of the depth (block 34 of 42).", wide_tooltip=True)
+        self.components.entry(frame, 8, 1, ui_state, "self_flow_teacher_layer", required=True)
+
+        self.components.label(frame, 9, 0, "Offload Teacher Target",
+                              tooltip="Keeps the teacher feature in CPU RAM while the student runs. Slower; saves VRAM at high resolution.")
+        self.components.switch(frame, 9, 1, ui_state, "self_flow_teacher_target_offload")
 
     def __create_masked_frame(self, master, row, ui_state):
         frame = self.components.section_frame(master, row)

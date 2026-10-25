@@ -21,7 +21,9 @@ class CtkSampleParamsWindowView(BaseSampleParamsWindowView, ctk.CTkToplevel):
         self.grid_rowconfigure(1, weight=0)
         self.grid_columnconfigure(0, weight=1)
 
-        frame = CtkSampleFrameView(self, SampleFrameController(controller.sample, controller.model_type), ui_state)
+        frame = CtkSampleFrameView(self, SampleFrameController(
+            controller.sample, controller.model_type, self_flow_ema_sampling=controller.self_flow_ema_sampling,
+        ), ui_state)
         frame.grid(row=0, column=0, padx=0, pady=0, sticky="nsew")
 
         self.components.button(self, 1, 0, "ok", self.destroy)

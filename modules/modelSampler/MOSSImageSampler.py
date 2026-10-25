@@ -1,4 +1,5 @@
 import copy
+from contextlib import nullcontext
 
 from modules.modelSampler.BaseModelSampler import BaseModelSampler, ModelSamplerOutput
 from modules.module.moss.pipeline_moss_image import _validate_skip_layers
@@ -20,6 +21,14 @@ class MOSSImageSampler(BaseModelSampler):
         self.model = model
         self.model_type = model_type
         self.pipeline = model.create_pipeline()
+
+    def _self_flow_weights(self, use_ema: bool):
+        if not use_ema:
+            return nullcontext()
+        if self.model.self_flow_ema is None:
+            print("[Self-Flow] EMA sampling requested, but no Self-Flow training is running; sampling the trained weights.")
+            return nullcontext()
+        return self.model.self_flow_ema.ema_weights(self.model.self_flow_adapter_modules())
 
     @torch.no_grad()
     def sample(
@@ -60,21 +69,22 @@ class MOSSImageSampler(BaseModelSampler):
         scheduler.set_timesteps(config.diffusion_steps, device=self.train_device)
         model.transformer_to(self.train_device)
         try:
-            for i, timestep in enumerate(tqdm(scheduler.timesteps, desc="sampling")):
-                with model.autocast_context:
-                    inputs = latents.to(model.train_dtype.torch_dtype())
-                    cond = model.transformer(
-                        inputs, timestep, positive.to(model.train_dtype.torch_dtype()), positive_mask,
-                    ).sample.float()
-                    if config.cfg_scale != 1.0:
-                        uncond = model.transformer(
-                            inputs, timestep, negative.to(model.train_dtype.torch_dtype()), negative_mask,
-                            skip_layers=skip,
+            with self._self_flow_weights(config.self_flow_ema):
+                for i, timestep in enumerate(tqdm(scheduler.timesteps, desc="sampling")):
+                    with model.autocast_context:
+                        inputs = latents.to(model.train_dtype.torch_dtype())
+                        cond = model.transformer(
+                            inputs, timestep, positive.to(model.train_dtype.torch_dtype()), positive_mask,
                         ).sample.float()
-                        cond = uncond + config.cfg_scale * (cond - uncond)
-                # Keep CFG and integration in fp32, as in the upstream pipeline.
-                latents = scheduler.step(cond, timestep, latents, return_dict=False)[0].float()
-                on_update_progress(i + 1, len(scheduler.timesteps))
+                        if config.cfg_scale != 1.0:
+                            uncond = model.transformer(
+                                inputs, timestep, negative.to(model.train_dtype.torch_dtype()), negative_mask,
+                                skip_layers=skip,
+                            ).sample.float()
+                            cond = uncond + config.cfg_scale * (cond - uncond)
+                    # Keep CFG and integration in fp32, as in the upstream pipeline.
+                    latents = scheduler.step(cond, timestep, latents, return_dict=False)[0].float()
+                    on_update_progress(i + 1, len(scheduler.timesteps))
         finally:
             model.transformer_to(self.temp_device)
             torch_gc()

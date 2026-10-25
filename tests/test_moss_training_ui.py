@@ -128,6 +128,33 @@ class TrainingUIAssertions:
         self.view.refresh_ui()
         self.assertNotIn("Identity Reward", self.labels())
 
+    def test_self_flow_controls_edit_config(self):
+        self.assertFalse(self.config.self_flow_enabled)
+        self.toggle("Self-Flow")
+        self.toggle("Structural Alignment")
+        self.toggle("Offload Teacher Target")
+        self.edit("Token Mask Ratio", "0.3")
+        self.edit("Representation Weight", "0.5")
+        self.edit("Structural Weight", "0.1")
+        self.edit("Structural Tokens", "128")
+        self.edit("Teacher EMA Decay", "0.995")
+        self.edit("Student Block", "10")
+        self.edit("Teacher Block", "30")
+        self.assertTrue(self.config.self_flow_enabled)
+        self.assertTrue(self.config.self_flow_structural_enabled)
+        self.assertTrue(self.config.self_flow_teacher_target_offload)
+        self.assertEqual(
+            (self.config.self_flow_mask_ratio, self.config.self_flow_rep_weight,
+             self.config.self_flow_structural_weight, self.config.self_flow_structural_tokens,
+             self.config.self_flow_ema_decay, self.config.self_flow_student_layer,
+             self.config.self_flow_teacher_layer),
+            (0.3, 0.5, 0.1, 128, 0.995, 10, 30),
+        )
+        # Self-Flow is wired for MOSS only; FLUX.3 shares the layout without it.
+        self.state.get_var("model_type").set(str(ModelType.FLUX_3_KLEIN))
+        self.view.refresh_ui()
+        self.assertNotIn("Self-Flow", self.labels())
+
     def test_switching_existing_models_and_back_preserves_their_controls(self):
         for model_type in (ModelType.KREA_2, ModelType.FLUX_2):
             with self.subTest(model=model_type):
