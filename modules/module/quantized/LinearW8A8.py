@@ -63,6 +63,20 @@ def _(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, comp
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=compute_dtype)
 
 
+# The backward is traced with symbolic shapes when compiled, but mm_8bit's Triton autotuner needs
+# concrete ones, so the input-gradient matmul is an opaque op of its own as well.
+@torch.library.custom_op("onetrainer::linear_w8a8_backward", mutates_args=())
+def linear_w8a8_backward(output: Tensor, weight: Tensor, weight_scale: Tensor) -> Tensor:
+    if weight.dtype == torch.int8:
+        return int8_backward_axiswise(output, weight, weight_scale)
+    return fp8_backward_axiswise(output, weight, weight_scale)
+
+
+@linear_w8a8_backward.register_fake
+def _(output: Tensor, weight: Tensor, weight_scale: Tensor) -> Tensor:
+    return output.new_empty((output.shape[0], weight.shape[1]))
+
+
 def _linear_w8a8_setup_context(ctx, inputs, output):
     _, weight, weight_scale, _, _ = inputs
     ctx.save_for_backward(weight, weight_scale)
@@ -72,8 +86,7 @@ def _linear_w8a8_backward(ctx, output: Tensor):
     if any(ctx.needs_input_grad[1:]):
         raise NotImplementedError("A8W8 cannot be used for full finetuning")
     weight, weight_scale = ctx.saved_tensors
-    backward = int8_backward_axiswise if weight.dtype == torch.int8 else fp8_backward_axiswise
-    return backward(output, weight, weight_scale), None, None, None, None
+    return linear_w8a8_backward(output, weight, weight_scale), None, None, None, None
 
 
 linear_w8a8.register_autograd(_linear_w8a8_backward, setup_context=_linear_w8a8_setup_context)

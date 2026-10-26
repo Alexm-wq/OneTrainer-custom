@@ -18,7 +18,9 @@ from test_moss_image import tiny_model, train_config
 
 
 def _cpu_mm_8bit(a, b):
-    # The Triton backward kernel needs a GPU.
+    # The Triton backward kernel needs a GPU. Like its autotuner, which keys a cache on the
+    # shapes, this stand-in only accepts concrete sizes, so it cannot be traced symbolically.
+    hash((a.shape, b.shape))
     return torch._int_mm(a, b)
 
 
@@ -61,12 +63,13 @@ class W8A8CompileTest(unittest.TestCase):
         setup.setup_optimizations(model, config)
         setup.setup_model(model, config)
         setup.setup_train_device(model, config)
-        batch = {
-            "latent_image": torch.randn(1, 32, 32, 32), "tokens": torch.ones(1, 8, dtype=torch.long),
-            "tokens_mask": torch.ones(1, 8), "text_encoder_hidden_state": torch.randn(1, 8, 8),
-            "loss_weight": torch.ones(1), "concept_type": ["STANDARD"],
-        }
-        for step in range(2):
+        # A second resolution recompiles with symbolic shapes, as multi-resolution buckets do.
+        for step, size in enumerate((32, 48, 40)):
+            batch = {
+                "latent_image": torch.randn(1, 32, size, size), "tokens": torch.ones(1, 8, dtype=torch.long),
+                "tokens_mask": torch.ones(1, 8), "text_encoder_hidden_state": torch.randn(1, 8, 8),
+                "loss_weight": torch.ones(1), "concept_type": ["STANDARD"],
+            }
             model.optimizer.zero_grad()
             saved = []
 
