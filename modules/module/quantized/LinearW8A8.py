@@ -47,46 +47,84 @@ def fp8_backward_axiswise(output: Tensor, weight: Tensor, weight_scale: Tensor) 
     return mm_res.float().mul_(weight_scale * output_scale).to(output.dtype)
 
 
-# A custom op rather than an autograd.Function: compiled inside a checkpointed block, torch 2.11
+def _quantize_rows(x: Tensor, int8: bool) -> tuple[Tensor, Tensor]:
+    return quantize_int8_axiswise(x, dim=-1) if int8 else quantize_fp8_axiswise(x, dim=-1)
+
+
+def _dequantize_rows(res: Tensor, scale: Tensor, bias: Tensor | None, dtype: torch.dtype) -> Tensor:
+    res_scaled = res.float().mul_(scale).to(dtype)
+    if bias is not None:
+        res_scaled.add_(bias)
+    return res_scaled
+
+
+_compiled_kernels = {}
+
+
+def _kernel(fn, compiled: bool):
+    """The pointwise (de)quantization around the 8-bit matmuls, fused by torch.compile when training compiles.
+
+    The ops below are opaque to the compiled block, so it cannot fuse these itself. The matmuls stay
+    outside: the Triton kernel's autotuner needs concrete shapes.
+    """
+    if not compiled:
+        return fn
+    if fn not in _compiled_kernels:
+        _compiled_kernels[fn] = torch.compile(fn, dynamic=True, fullgraph=True)
+    return _compiled_kernels[fn]
+
+
+# Custom ops rather than an autograd.Function: compiled inside a checkpointed block, torch 2.11
 # saves the int32/fp32 matmul results of an autograd.Function's forward for the backward pass
 # instead of recomputing them (0.5 GiB per MOSS block at 1536px). As one opaque op that returns
 # compute_dtype, the block is recomputed like in eager mode on every torch version.
 @torch.library.custom_op("onetrainer::linear_w8a8", mutates_args=())
-def linear_w8a8(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
-    if weight.dtype == torch.int8:
-        return int8_forward_tokenwise(x, weight, weight_scale, bias, compute_dtype)
-    return fp8_forward_tokenwise(x, weight, weight_scale, bias, compute_dtype)
+def linear_w8a8(
+        x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype, compiled: bool,
+) -> Tensor:
+    int8 = weight.dtype == torch.int8
+    x_8, x_scale = _kernel(_quantize_rows, compiled)(x, int8)
+    if int8:
+        res = torch._int_mm(x_8, weight.T)
+        scale = weight_scale * x_scale
+    else:
+        one = torch.tensor(1.0, device=x.device)
+        res = torch._scaled_mm(x_8, weight.T, scale_a=one, scale_b=weight_scale.float(), out_dtype=torch.float)
+        scale = x_scale
+    return _kernel(_dequantize_rows, compiled)(res, scale, bias, compute_dtype)
 
 
 @linear_w8a8.register_fake
-def _(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+def _(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype, compiled: bool) -> Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]), dtype=compute_dtype)
 
 
 # The backward is traced with symbolic shapes when compiled, but mm_8bit's Triton autotuner needs
 # concrete ones, so the input-gradient matmul is an opaque op of its own as well.
 @torch.library.custom_op("onetrainer::linear_w8a8_backward", mutates_args=())
-def linear_w8a8_backward(output: Tensor, weight: Tensor, weight_scale: Tensor) -> Tensor:
-    if weight.dtype == torch.int8:
-        return int8_backward_axiswise(output, weight, weight_scale)
-    return fp8_backward_axiswise(output, weight, weight_scale)
+def linear_w8a8_backward(output: Tensor, weight: Tensor, weight_scale: Tensor, compiled: bool) -> Tensor:
+    output_8, output_scale = _kernel(_quantize_rows, compiled)(output, weight.dtype == torch.int8)
+    # almost always, grad outputs are already contiguous and this is a no-op. But there are some grad outputs from SDXL that are non-contiguous:
+    mm_res = mm_8bit(output_8.contiguous(), weight)
+    return _kernel(_dequantize_rows, compiled)(mm_res, weight_scale * output_scale, None, output.dtype)
 
 
 @linear_w8a8_backward.register_fake
-def _(output: Tensor, weight: Tensor, weight_scale: Tensor) -> Tensor:
+def _(output: Tensor, weight: Tensor, weight_scale: Tensor, compiled: bool) -> Tensor:
     return output.new_empty((output.shape[0], weight.shape[1]))
 
 
 def _linear_w8a8_setup_context(ctx, inputs, output):
-    _, weight, weight_scale, _, _ = inputs
+    _, weight, weight_scale, _, _, compiled = inputs
     ctx.save_for_backward(weight, weight_scale)
+    ctx.compiled = compiled
 
 
 def _linear_w8a8_backward(ctx, output: Tensor):
     if any(ctx.needs_input_grad[1:]):
         raise NotImplementedError("A8W8 cannot be used for full finetuning")
     weight, weight_scale = ctx.saved_tensors
-    return linear_w8a8_backward(output, weight, weight_scale), None, None, None, None
+    return linear_w8a8_backward(output, weight, weight_scale, ctx.compiled), None, None, None, None, None
 
 
 linear_w8a8.register_autograd(_linear_w8a8_backward, setup_context=_linear_w8a8_setup_context)
@@ -105,6 +143,8 @@ class LinearW8A8(
 
         self.__is_quantized = False
         self.compute_dtype = None
+        # set when training compiles: fuse the (de)quantization around the 8-bit matmuls as well
+        self.compiled_kernels = False
         self.register_buffer("scale", torch.tensor(1.0, dtype=torch.float32))
 
     def original_weight_shape(self) -> tuple[int, ...]:
@@ -143,7 +183,7 @@ class LinearW8A8(
 
         if x.shape[0] > 16:
             compute_dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype
-            y = linear_w8a8(x, self.weight, self.scale, self.bias, compute_dtype)
+            y = linear_w8a8(x, self.weight, self.scale, self.bias, compute_dtype, self.compiled_kernels)
         else:
             # Match the quantized path's output dtype, with or without an enclosing autocast.
             dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype

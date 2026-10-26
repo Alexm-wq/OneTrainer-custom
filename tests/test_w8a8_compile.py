@@ -33,19 +33,44 @@ class W8A8CompileTest(unittest.TestCase):
     def tearDown(self):
         self.mm.stop()
 
-    def test_matches_reference_math(self):
+    def _layer(self, dtype=torch.int8):
         linear = nn.Linear(64, 96)
-        layer = w8a8.LinearW8A8(torch.int8, 64, 96)
+        layer = w8a8.LinearW8A8(dtype, 64, 96)
         layer.load_state_dict(linear.state_dict(), strict=False)
         layer.compute_dtype = torch.bfloat16
         layer.quantize()
-        x = torch.randn(40, 64, dtype=torch.bfloat16, requires_grad=True)
+        return layer
+
+    def _run(self, layer, x, grad_output=None):
+        x = x.clone().requires_grad_(True)
         y = layer(x)
-        y.float().square().sum().backward()
-        expected = w8a8.int8_forward_tokenwise(x.detach(), layer.weight, layer.scale, layer.bias, torch.bfloat16)
+        if grad_output is None:
+            y.float().square().sum().backward()
+        else:
+            y.backward(grad_output)
+        return y.detach(), x.grad
+
+    def test_matches_reference_math(self):
+        layer = self._layer()
+        x = torch.randn(40, 64, dtype=torch.bfloat16)
+        y, grad = self._run(layer, x)
+        expected = w8a8.int8_forward_tokenwise(x, layer.weight, layer.scale, layer.bias, torch.bfloat16)
         torch.testing.assert_close(y, expected, rtol=0, atol=0)
         expected_grad = w8a8.int8_backward_axiswise((2 * y.float()).to(torch.bfloat16), layer.weight, layer.scale)
-        torch.testing.assert_close(x.grad, expected_grad, rtol=0, atol=0)
+        torch.testing.assert_close(grad, expected_grad, rtol=0, atol=0)
+
+    def test_compiled_kernels_match_eager_for_changing_shapes(self):
+        layer = self._layer()
+        for rows in (40, 72, 56):
+            x = torch.randn(rows, 64, dtype=torch.bfloat16)
+            grad_output = torch.randn(rows, 96, dtype=torch.bfloat16)
+            layer.compiled_kernels = False
+            eager = self._run(layer, x, grad_output)
+            layer.compiled_kernels = True
+            compiled = self._run(layer, x, grad_output)
+            # The fused bias add skips one intermediate bf16 rounding: at most one bf16 step apart.
+            torch.testing.assert_close(compiled[0], eager[0], rtol=2 ** -7, atol=2 ** -7)
+            torch.testing.assert_close(compiled[1], eager[1], rtol=0, atol=0)
 
     def test_compiled_lora_blocks_keep_no_matmul_results_for_backward(self):
         # torch 2.11 saved the int32 results of an autograd.Function forward in a compiled,
@@ -81,6 +106,8 @@ class W8A8CompileTest(unittest.TestCase):
                 output = setup.predict(model, batch, config, TrainProgress(global_step=step))
                 loss = setup.calculate_loss(model, batch, output, config)
             loss.backward()
+        self.assertTrue(all(layer.compiled_kernels for layer in model.transformer.modules()
+                            if isinstance(layer, w8a8.LinearW8A8)))
         self.assertFalse([tuple(t.shape) for t in saved if t.dtype == torch.int32])
         grads = [p.grad for p in model.transformer_lora.parameters()]
         self.assertTrue(all(g is not None and torch.isfinite(g).all() for g in grads))
