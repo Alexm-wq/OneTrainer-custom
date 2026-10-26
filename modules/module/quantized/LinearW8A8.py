@@ -47,33 +47,37 @@ def fp8_backward_axiswise(output: Tensor, weight: Tensor, weight_scale: Tensor) 
     return mm_res.float().mul_(weight_scale * output_scale).to(output.dtype)
 
 
-class LinearInt8Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
-        ctx.save_for_backward(weight, weight_scale)
+# A custom op rather than an autograd.Function: compiled inside a checkpointed block, torch 2.11
+# saves the int32/fp32 matmul results of an autograd.Function's forward for the backward pass
+# instead of recomputing them (0.5 GiB per MOSS block at 1536px). As one opaque op that returns
+# compute_dtype, the block is recomputed like in eager mode on every torch version.
+@torch.library.custom_op("onetrainer::linear_w8a8", mutates_args=())
+def linear_w8a8(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+    if weight.dtype == torch.int8:
         return int8_forward_tokenwise(x, weight, weight_scale, bias, compute_dtype)
+    return fp8_forward_tokenwise(x, weight, weight_scale, bias, compute_dtype)
 
-    @staticmethod
-    def backward(ctx, output: Tensor):
-        if ctx.needs_input_grad != (True, False, False, False, False):
-            raise NotImplementedError("Int A8W8 cannot be used for full finetuning")
 
-        weight, weight_scale = ctx.saved_tensors
-        return int8_backward_axiswise(output, weight, weight_scale), None, None, None, None
+@linear_w8a8.register_fake
+def _(x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=compute_dtype)
 
-class LinearFp8Function(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x: Tensor, weight: Tensor, weight_scale: Tensor, bias: Tensor | None, compute_dtype: torch.dtype) -> Tensor:
-        ctx.save_for_backward(weight, weight_scale)
-        return fp8_forward_tokenwise(x, weight, weight_scale, bias, compute_dtype)
 
-    @staticmethod
-    def backward(ctx, output: Tensor):
-        if ctx.needs_input_grad != (True, False, False, False, False):
-            raise NotImplementedError("Float A8W8 cannot be used for full finetuning")
+def _linear_w8a8_setup_context(ctx, inputs, output):
+    _, weight, weight_scale, _, _ = inputs
+    ctx.save_for_backward(weight, weight_scale)
 
-        weight, weight_scale = ctx.saved_tensors
-        return fp8_backward_axiswise(output, weight, weight_scale), None, None, None, None
+
+def _linear_w8a8_backward(ctx, output: Tensor):
+    if any(ctx.needs_input_grad[1:]):
+        raise NotImplementedError("A8W8 cannot be used for full finetuning")
+    weight, weight_scale = ctx.saved_tensors
+    backward = int8_backward_axiswise if weight.dtype == torch.int8 else fp8_backward_axiswise
+    return backward(output, weight, weight_scale), None, None, None, None
+
+
+linear_w8a8.register_autograd(_linear_w8a8_backward, setup_context=_linear_w8a8_setup_context)
+
 
 class LinearW8A8(
     nn.Linear,
@@ -125,10 +129,8 @@ class LinearW8A8(
         x = x_orig.reshape(-1, x_orig.shape[-1])
 
         if x.shape[0] > 16:
-            if self._dtype == torch.int8:
-                y = LinearInt8Function.apply(x, self.weight, self.scale, self.bias, self.compute_dtype)
-            else:
-                y = LinearFp8Function.apply(x, self.weight, self.scale, self.bias, self.compute_dtype)
+            compute_dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype
+            y = linear_w8a8(x, self.weight, self.scale, self.bias, compute_dtype)
         else:
             # Match the quantized path's output dtype, with or without an enclosing autocast.
             dtype = self.compute_dtype if self.compute_dtype is not None else x.dtype
