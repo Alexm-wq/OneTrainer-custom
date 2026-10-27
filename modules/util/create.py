@@ -711,7 +711,7 @@ def create_optimizer(
                 sinkhorn_iterations=optimizer_config.sinkhorn_iterations if optimizer_config.sinkhorn_iterations is not None else 5,
                 weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0.0,
                 d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-5,
-                d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 0.1,
+                d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 1.0,
                 growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else 1.05,
                 beta3=optimizer_config.beta3 if optimizer_config.beta3 is not None else 0.999,
                 d_shrink=optimizer_config.d_shrink if optimizer_config.d_shrink is not None else 0.01,

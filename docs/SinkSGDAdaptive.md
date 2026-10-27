@@ -12,6 +12,8 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
   solution like Prodigy, from how well the gradients point back to the start. Unlike Prodigy, `d`
   falls again once progress stalls (`D Shrink`), down to `D Min Ratio` of its maximum: a learning
   rate decay driven by the training itself. Leave the learning rate at 1.0, as with Prodigy.
+  `D Coefficient` is 1.0, as in Prodigy: on a MOSS Image LoRA (batch 1), 0.1 kept the step
+  near 1e-6 and nothing was learned, while 1.0 with the validation brake off trained well.
   `Initial D` (1e-5) is also the lowest step size. With noisy diffusion gradients the estimate
   rises slowly, often over a few hundred steps; a higher `Initial D` near the lower end of the
   learning rates that work with plain SinkSGD shortens that ramp.
@@ -21,7 +23,8 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
   the recent gradients disagree are damped (`Agreement Threshold`). A layer that only sees
   noise moves less as a whole. Keep the momentum horizon (`1 / (1 - momentum)` steps) well
   below one epoch, otherwise the same image seen again looks like agreement.
-- **Validation brake** (off by default): at every validation, the summed gradient of a few
+- **Validation brake** (off by default; in the MOSS LoRA run above it held the learning rate
+  down before anything was learned, so leave it off for now): at every validation, the summed gradient of a few
   validation images is compared with the training direction. `Validation Brake Images` (8)
   are spread evenly over the validation concepts, so one concept cannot decide alone. While
   training no longer helps held-out images, the step is damped in proportion; `d` cannot grow

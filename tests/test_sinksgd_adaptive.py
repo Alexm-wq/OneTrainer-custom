@@ -161,7 +161,7 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         optimizer = create.create_optimizer(collection, None, config)
         self.assertIsInstance(optimizer, SinkSGDAdaptive)
         group = optimizer.param_groups[0]
-        self.assertEqual((group["growth_rate"], group["d_coef"], group["agreement_threshold"]), (1.05, 0.1, 0.2))
+        self.assertEqual((group["growth_rate"], group["d_coef"], group["agreement_threshold"]), (1.05, 1.0, 0.2))
         self.assertEqual((group["slice_p"], group["state_precision"]), (11, "bf16_sr"))
         group["d"] = 0.01
         reported = Optimizer.SINKSGD_ADAPTIVE.maybe_adjust_lrs({"transformer": 1.0}, optimizer)

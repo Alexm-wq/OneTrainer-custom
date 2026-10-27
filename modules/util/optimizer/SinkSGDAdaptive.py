@@ -55,7 +55,7 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             sinkhorn_iterations: int = 5,
             weight_decay: float = 0.0,
             d0: float = 1e-5,
-            d_coef: float = 0.1,
+            d_coef: float = 1.0,
             growth_rate: float = 1.05,
             beta3: float = 0.999,
             d_shrink: float = 0.01,
