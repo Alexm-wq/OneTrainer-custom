@@ -456,6 +456,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "compile": False,
         "fused_back_pass": False,
         "orthogonal_sinkhorn": False,
+        "split_fused_sinkhorn": False,
         "orthogonal_gradient": 'disabled',
         "spectral_normalization": False,
         "centered_wd": 0.0,

@@ -77,6 +77,8 @@ class MOSSImageLoRASetup(
         model.transformer_lora.set_dropout(config.dropout_probability)
         model.transformer_lora.to(dtype=config.lora_weight_dtype.torch_dtype())
         model.transformer_lora.hook_to_module()
+        if config.tlora:
+            model.enable_tlora()
 
         self._create_self_flow_projector(model, config, config.lora_weight_dtype.torch_dtype())
         params = self.create_parameters(model, config)

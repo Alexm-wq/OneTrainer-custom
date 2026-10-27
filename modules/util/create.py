@@ -675,7 +675,10 @@ def create_optimizer(
 
         # SINKSGD_ADV Optimizer
         case Optimizer.SINKSGD_ADV:
+            from modules.util.optimizer.split_sinkhorn import configure_split_sinkhorn
+
             from adv_optm import SinkSGD_adv
+            configure_split_sinkhorn(model, bool(optimizer_config.split_fused_sinkhorn))
             optimizer = SinkSGD_adv(
                 params=parameters,
                 lr=config.learning_rate,

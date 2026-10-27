@@ -235,6 +235,8 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
 
             teacher_start = self._self_flow_timer()
             ema = model.self_flow_ema
+            # moss_self_flow_forward bypasses the transformer's forward and its T-LoRA hook.
+            model.set_tlora_timestep(clean_index.float() + 1)
             with ema.teacher_weights(model.self_flow_adapter_modules()), torch.no_grad():
                 teacher_feature = moss_self_flow_forward(
                     model.transformer, (clean * (1 - clean_sigma) + noise * clean_sigma).to(dtype),
@@ -246,6 +248,8 @@ class BaseMOSSImageSetup(BaseFlux2Setup):
             if config.self_flow_teacher_target_offload:
                 teacher_feature = teacher_feature.to("cpu")
 
+            # Per sample, the mean noise level of its image tokens sets the student's T-LoRA ranks.
+            model.set_tlora_timestep(token_index.float() + 1)
             student = moss_self_flow_forward(
                 model.transformer, (clean * (1 - token_sigma) + noise * token_sigma).to(dtype),
                 image_timestep=token_index.float() + 1, text_timestep=index.float() + 1,

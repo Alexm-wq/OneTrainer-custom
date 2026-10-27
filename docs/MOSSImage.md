@@ -90,6 +90,38 @@ a few thousand steps would barely move from the starting weights.
 - TensorBoard: `loss/self_flow_rep`, `loss/self_flow_structural`, `loss/generation`,
   `self_flow/cosine_similarity`, the mean timesteps and `performance/self_flow_teacher_ms`.
 
+## T-LoRA
+
+**T-LoRA** in the LoRA tab trains timestep-dependent LoRA ranks, following T-LoRA
+(Soboleva et al., AAAI 2026; official code `ControlGenAI/T-LoRA`). High noise levels
+overfit most, so the noisier the input, the fewer leading LoRA ranks are active:
+`rank(t) = floor((1000 - t) * (rank - min) / 1000) + min` for MOSS's raw time t = 1..1000,
+from almost the full rank at the cleanest timestep down to **T-LoRA Min Rank** (1, as
+upstream) at pure noise. Each sample of a batch gets its own mask.
+
+- The mask sits between LoRA down and up, so masked ranks get no gradient at that step.
+  It applies to training, validation, the RLHF paths and OneTrainer's samples, with
+  compiled blocks too. Self-Flow's student uses, per sample, the mean noise level of
+  its image tokens; its teacher uses the cleaner timestep.
+- An exported LoRA is a normal LoRA without the mask. Other tools apply all ranks at
+  every timestep, which differs from OneTrainer's samples. The official repository
+  likewise needs its own pipeline hook at inference.
+- Plain LoRA only: DoRA, LoHa, LoKr, OFT and SVDQuant layers are rejected, as is any
+  model other than MOSS Image. The upstream SDXL variant's orthogonal initialization
+  (Ortho-LoRA) is not included; the official FLUX release uses the timestep masking alone.
+
+## Split Fused Layers (SinkSGD_adv)
+
+The SinkSGD_adv option **Split Fused Layers** normalizes layers that hold several
+projections in one matrix per part instead of as a whole: FFN up+gate of the 42 main
+blocks (2 parts), the text-refiner QKV (3), the shared block modulation (6) and the
+video head modulation (2). Muon on DiTs converged much better with this split in CMuon
+(Chen, Sun, Yuan, 2026); for SinkSGD it is untested on real training, so compare it in
+an A/B run. It applies to the fused weights in full fine-tuning and to their LoRA up
+matrices (LoRA, DoRA, LoHa); LoRA down is not fused. SNR preconditioning and geometric
+weight decay keep their statistics over the whole matrix. Enabling it when no trained
+parameter belongs to a fused layer is an error.
+
 ## Identity reward
 
 For character LoRAs of real faces, the Identity Reward section of the training tab

@@ -30,6 +30,7 @@ class MOSSImageModel(Flux2Model):
         self.self_flow_state_dict = None
         self.self_flow_student_layer = None
         self.self_flow_teacher_layer = None
+        self._tlora_hook = None
 
     def transformer_to(self, device):
         super().transformer_to(device)
@@ -58,6 +59,49 @@ class MOSSImageModel(Flux2Model):
 
     def fusion_groups(self):
         return None
+
+    def fused_output_chunks(self) -> dict[str, int]:
+        """Transformer layers whose output stacks several projections: name pattern -> number of parts."""
+        return {
+            r"layers\.\d+\.proj\.ffn_up_gate": 2,
+            r"text_embedder\.blocks\.\d+\.qkv": 3,
+            r"shared_block_modulation": 6,
+            r"video_head_modulation": 2,
+        }
+
+    def enable_tlora(self):
+        """Set the T-LoRA rank mask from the timestep of every transformer call (training, validation, sampling)."""
+        if self._tlora_hook is not None:
+            self._tlora_hook.remove()
+        self._tlora_hook = self.transformer.register_forward_pre_hook(self._tlora_pre_hook, with_kwargs=True)
+
+    def _tlora_pre_hook(self, module, args, kwargs):
+        hidden_states = kwargs["hidden_states"] if "hidden_states" in kwargs else args[0]
+        timestep = kwargs["timestep"] if "timestep" in kwargs else args[1]
+        self.set_tlora_timestep(timestep, hidden_states.shape[0], hidden_states.device)
+
+    def set_tlora_timestep(self, timestep: torch.Tensor | None, batch_size: int | None = None,
+                           device: torch.device | None = None):
+        """T-LoRA: the transformer LoRA uses fewer ranks the noisier the input.
+
+        timestep is MOSS's raw time 1..1000 (sigma * 1000), per sample or per image token. As in
+        the official T-LoRA, rank(t) = floor((T - t) * (rank - min_rank) / T) + min_rank.
+        """
+        config = self.train_config
+        if self.transformer_lora is None or config is None or not config.tlora:
+            return
+        if timestep is None:
+            self.transformer_lora.set_rank_mask(None)
+            return
+        times = torch.as_tensor(timestep, dtype=torch.float32, device=device)
+        times = times.reshape(times.shape[0], -1).mean(1) if times.ndim > 1 else times.reshape(-1)
+        if batch_size is not None:
+            times = times.expand(batch_size)
+        rank, min_rank = config.lora_rank, config.tlora_min_rank
+        total = self.noise_scheduler.config.num_train_timesteps
+        ranks = ((total - times) * (rank - min_rank) / total).floor().clamp(0, rank - min_rank) + min_rank
+        mask = torch.arange(rank, device=times.device) < ranks[:, None]
+        self.transformer_lora.set_rank_mask(mask.float())
 
     def diffusers_to_original(self):
         return None

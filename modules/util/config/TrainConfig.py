@@ -157,6 +157,7 @@ class TrainOptimizerConfig(BaseConfig):
     validation_brake: bool
     validation_brake_batches: int
     validation_alignment_ref: float
+    split_fused_sinkhorn: bool
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
@@ -304,6 +305,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("validation_brake", False, bool, False))
         data.append(("validation_brake_batches", None, int, True))
         data.append(("validation_alignment_ref", None, float, True))
+        data.append(("split_fused_sinkhorn", False, bool, False))
         data.append(("nesterov_coef", None, float, True))
         data.append(("snr_cond", False, bool, False))
         data.append(("geometric_wd", False, bool, False))
@@ -618,6 +620,9 @@ class TrainConfig(BaseConfig):
     lora_decompose_norm_epsilon: bool
     lora_decompose_output_axis: bool
     lora_weight_dtype: DataType
+    # T-LoRA: fewer LoRA ranks at noisier timesteps (MOSS Image)
+    tlora: bool
+    tlora_min_rank: int
     bundle_additional_embeddings: bool
 
     # oft
@@ -1374,6 +1379,8 @@ class TrainConfig(BaseConfig):
         data.append(("lora_decompose_norm_epsilon", True, bool, False))
         data.append(("lora_decompose_output_axis", False, bool, False))
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
+        data.append(("tlora", False, bool, False))
+        data.append(("tlora_min_rank", 1, int, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 
         # oft

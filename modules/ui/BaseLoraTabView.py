@@ -46,6 +46,15 @@ class BaseLoraTabView:
                                   tooltip="Apply the weight decomposition on the output axis instead of the input axis.")
             self.components.switch(master, 3, 4, ui_state, "lora_decompose_output_axis")
 
+            if controller.train_config.model_type.is_moss_image():
+                self.components.label(master, 4, 3, "T-LoRA",
+                                      tooltip="Timestep-dependent LoRA (T-LoRA, AAAI 2026): the noisier the input, the fewer LoRA ranks are used, from the full rank at the cleanest timestep down to T-LoRA Min Rank at pure noise. High noise levels overfit most. Training, validation and OneTrainer's samples use the mask; an exported LoRA has no timestep mask and runs at full rank in other tools. Not with DoRA.")
+                self.components.switch(master, 4, 4, ui_state, "tlora")
+                self.components.label(master, 5, 3, "T-LoRA Min Rank",
+                                      tooltip="LoRA ranks used at pure noise. The official T-LoRA uses 1.")
+                self.components.entry(master, 5, 4, ui_state, "tlora_min_rank", required=True,
+                                      extra_validate=check_range(lower=1, message="Min rank must be at least 1"))
+
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
             # rank
