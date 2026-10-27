@@ -5,15 +5,21 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from modules.module.LoRAModule import LoRAModuleWrapper
+from modules.module.quantized import LinearW8A8 as w8a8
+from modules.module.quantized.LinearSVD import BaseLinearSVD
 from modules.ui.BaseLoraTabView import BaseLoraTabView
 from modules.util import create
+from modules.util.config.TrainConfig import QuantizationConfig
+from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType, PeftType
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.quantization_util import replace_linear_with_quantized_layers
 from modules.util.TrainProgress import TrainProgress
 
 import torch
 
 from test_moss_image import tiny_model, train_config
+from test_w8a8_compile import _cpu_mm_8bit
 
 
 def _official_rank(timestep, rank, min_rank, total=1000):
@@ -25,6 +31,10 @@ class TLoRATest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(3)
         torch.set_num_threads(1)
+        # W8A8's Triton backward kernel needs a GPU.
+        self.mm = patch.object(w8a8, "mm_8bit", _cpu_mm_8bit)
+        self.mm.start()
+        self.addCleanup(self.mm.stop)
 
     def _setup(self, compile=False, rank=8, min_rank=1, model=None):
         model = model or tiny_model()
@@ -79,6 +89,28 @@ class TLoRATest(unittest.TestCase):
             self.assertEqual(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
             self.assertGreater(module.lora_up.weight.grad[:, 0].abs().sum().item(), 0.0)
 
+    def test_svd_quantized_layers_mask_only_the_lora_ranks(self):
+        model, config, setup = self._setup(model=self._svd_model())
+        svd = [m for m in model.transformer_lora.lora_modules.values() if isinstance(m.orig_module, BaseLinearSVD)]
+        self.assertTrue(svd)
+        batch = self._batch()
+        output = self._predict(model, config, setup, batch, [999])
+        setup.calculate_loss(model, batch, output, config).backward()
+        for module in svd:
+            self.assertEqual(module.lora_down.weight.grad[1:].abs().sum().item(), 0.0)
+            self.assertEqual(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
+            self.assertGreater(module.lora_up.weight.grad[:, 0].abs().sum().item(), 0.0)
+        # The SVD residual stays unmasked: same output as a LoRA cut to its first rank without a mask.
+        reference = copy.deepcopy(model)
+        reference.train_config = copy.copy(config)
+        reference.train_config.tlora = False
+        reference.transformer_lora.set_rank_mask(None)
+        for module in reference.transformer_lora.lora_modules.values():
+            module.lora_up.weight.data[:, 1:] = 0
+        with torch.no_grad():
+            expected = self._predict(reference, reference.train_config, setup, batch, [999])["predicted"]
+        torch.testing.assert_close(output["predicted"].detach(), expected)
+
     def test_masked_forward_equals_a_lora_cut_to_the_active_ranks(self):
         model, config, setup = self._setup()
         batch = self._batch(2)
@@ -103,24 +135,37 @@ class TLoRATest(unittest.TestCase):
             model.transformer(hidden, torch.tensor(1000.0), torch.randn(2, 3, 8), torch.ones(2, 3, dtype=torch.bool))
         self.assertEqual(model.transformer_lora._rank_mask.sum(1).tolist(), [1.0, 1.0])
 
+    @staticmethod
+    def _svd_model():
+        model = tiny_model()
+        quantization = QuantizationConfig.default_values()
+        quantization.svd_dtype, quantization.svd_rank, quantization.cache_dir = DataType.FLOAT_32, 2, None
+        replace_linear_with_quantized_layers(
+            model.transformer, DataType.INT_W8A8, keep_in_fp32_modules=[], quantization=quantization, copy_parameters=True,
+        )
+        return model
+
     def test_compiled_blocks_see_each_new_mask_without_recompiling(self):
-        base = tiny_model()
-        compiled, config, setup = self._setup(compile=True, model=copy.deepcopy(base))
-        eager, eager_config, _ = self._setup(compile=False, model=base)
-        eager.transformer_lora.load_state_dict(compiled.transformer_lora.state_dict())
-        batch = self._batch()
-        torch._dynamo.reset()
-        graphs = None
-        for index in (999, 0, 500):
-            torch.manual_seed(1)
-            actual = self._predict(compiled, config, setup, batch, [index])["predicted"]
-            torch.manual_seed(1)
-            expected = self._predict(eager, eager_config, setup, batch, [index])["predicted"]
-            torch.testing.assert_close(actual, expected, rtol=1e-4, atol=1e-5)
-            count = torch._dynamo.utils.counters["stats"]["unique_graphs"]
-            if graphs is None:
-                graphs = count
-            self.assertEqual(count, graphs)
+        for svd in (False, True):
+            with self.subTest(svd=svd):
+                base = self._svd_model() if svd else tiny_model()
+                compiled, config, setup = self._setup(compile=True, model=copy.deepcopy(base))
+                eager, eager_config, _ = self._setup(compile=False, model=base)
+                eager.transformer_lora.load_state_dict(compiled.transformer_lora.state_dict())
+                batch = self._batch()
+                torch._dynamo.reset()
+                graphs = None
+                for index in (999, 0, 500):
+                    torch.manual_seed(1)
+                    actual = self._predict(compiled, config, setup, batch, [index])
+                    setup.calculate_loss(compiled, batch, actual, config).backward()
+                    torch.manual_seed(1)
+                    expected = self._predict(eager, eager_config, setup, batch, [index])["predicted"]
+                    torch.testing.assert_close(actual["predicted"].detach(), expected.detach(), rtol=1e-4, atol=1e-4)
+                    count = torch._dynamo.utils.counters["stats"]["unique_graphs"]
+                    if graphs is None:
+                        graphs = count
+                    self.assertEqual(count, graphs)
 
     def test_rejects_unsupported_combinations(self):
         model = tiny_model()

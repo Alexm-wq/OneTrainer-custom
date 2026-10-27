@@ -573,9 +573,9 @@ class LoRAModule(PeftBase):
     def forward(self, x, *args, **kwargs):
         self.check_initialized()
         if isinstance(self.orig_module, BaseLinearSVD):
-            if self.rank_mask is not None:
-                raise NotImplementedError("T-LoRA does not support SVD-quantized layers.")
-            return self.orig_module.forward_with_lora(x, self.lora_down, self.lora_up, self.dropout, self.alpha)
+            return self.orig_module.forward_with_lora(
+                x, self.lora_down, self.lora_up, self.dropout, self.alpha, rank_mask=self.rank_mask,
+            )
 
         return self.orig_forward(x) + self.delta_forward(x, *args, **kwargs)
 

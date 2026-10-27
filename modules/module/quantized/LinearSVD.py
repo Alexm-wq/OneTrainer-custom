@@ -15,7 +15,7 @@ class BaseLinearSVD(
         super().__init__(*args, **kwargs)
 
     @abstractmethod
-    def forward_with_lora(self, x: torch.Tensor, lora_down: torch.nn.Linear, lora_up: torch.nn.Linear, dropout: torch.nn.Dropout, alpha: float) -> torch.Tensor:
+    def forward_with_lora(self, x: torch.Tensor, lora_down: torch.nn.Linear, lora_up: torch.nn.Linear, dropout: torch.nn.Dropout, alpha: float, rank_mask: torch.Tensor | None = None) -> torch.Tensor:
         pass
 
 def _get_tensor_hash(t: torch.Tensor) -> str:
@@ -105,7 +105,7 @@ def make_svd_linear(linear_class):
             x_up = torch.nn.functional.linear(x_down, self.svd_up)
             return x_up + super().forward(x)
 
-        def forward_with_lora(self, x: torch.Tensor, lora_down: torch.nn.Linear, lora_up: torch.nn.Linear, dropout: torch.nn.Dropout, alpha: float) -> torch.Tensor:
+        def forward_with_lora(self, x: torch.Tensor, lora_down: torch.nn.Linear, lora_up: torch.nn.Linear, dropout: torch.nn.Dropout, alpha: float, rank_mask: torch.Tensor | None = None) -> torch.Tensor:
             assert self.__svd_is_quantized
             assert not self.svd_down.requires_grad and not self.svd_up.requires_grad
             assert lora_down.bias is None and lora_up.bias is None
@@ -113,6 +113,12 @@ def make_svd_linear(linear_class):
             lora_rank = lora_down.weight.shape[0]
             down_merged = torch.cat([lora_down.weight, self.svd_down], dim=0)
             x_down = torch.nn.functional.linear(x, down_merged)
+            if rank_mask is not None:
+                # T-LoRA: [B, lora_rank] mask over the LoRA ranks; the SVD components stay unmasked.
+                if x_down.shape[0] != rank_mask.shape[0]:
+                    raise ValueError(f"T-LoRA: rank mask for {rank_mask.shape[0]} samples, but the layer sees {x_down.shape[0]}.")
+                keep = torch.cat([rank_mask, rank_mask.new_ones(rank_mask.shape[0], self.svd_down.shape[0])], dim=1)
+                x_down = x_down * keep.view(keep.shape[0], *[1] * (x_down.ndim - 2), -1).to(x_down.dtype)
             if dropout.p > 0.0 and self.training:
                 x_down[..., :lora_rank] = dropout(x_down[..., :lora_rank])
 

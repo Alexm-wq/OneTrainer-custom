@@ -106,8 +106,8 @@ upstream) at pure noise. Each sample of a batch gets its own mask.
 - An exported LoRA is a normal LoRA without the mask. Other tools apply all ranks at
   every timestep, which differs from OneTrainer's samples. The official repository
   likewise needs its own pipeline hook at inference.
-- Plain LoRA only: DoRA, LoHa, LoKr, OFT and SVDQuant layers are rejected, as is any
-  model other than MOSS Image. The upstream SDXL variant's orthogonal initialization
+- Plain LoRA only: DoRA, LoHa, LoKr and OFT are rejected, as is any model other than
+  MOSS Image. On SVDQuant layers only the LoRA ranks are masked, not the SVD residual. The upstream SDXL variant's orthogonal initialization
   (Ortho-LoRA) is not included; the official FLUX release uses the timestep masking alone.
 
 ## Split Fused Layers (SinkSGD_adv, SINKSGD_ADAPTIVE)
