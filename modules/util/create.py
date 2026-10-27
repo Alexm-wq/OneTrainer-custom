@@ -717,6 +717,8 @@ def create_optimizer(
                 drift_budget=optimizer_config.drift_budget if optimizer_config.drift_budget is not None else 0.0,
                 validation_alignment_ref=optimizer_config.validation_alignment_ref if optimizer_config.validation_alignment_ref is not None else 0.1,
                 stochastic_rounding=optimizer_config.stochastic_rounding,
+                slice_p=optimizer_config.slice_p if optimizer_config.slice_p is not None else 11,
+                state_precision=optimizer_config.state_precision if optimizer_config.state_precision not in (None, "auto") else "bf16_sr",
             )
 
         # ADAMW_ADV Optimizer

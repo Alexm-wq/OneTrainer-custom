@@ -46,5 +46,7 @@ its best validation loss. Whether this carries over to LoRA training needs an A/
 - No fused back pass: `d` is estimated over all parameters of a group before any is updated.
   Full fine-tuning with layer offloading, which needs a fused back pass, is therefore not
   possible.
-- Per parameter, a copy of the start weights plus three float32 states (gradient sum, momentum,
-  agreement); fine for LoRA, large for full fine-tuning.
+- Memory: momentum and agreement in bf16 with stochastic rounding (`state_precision` bf16_sr,
+  or fp32), and the distance estimate on every 11th entry only (`slice_p`, as in Prodigy). For
+  MOSS LoRA rank 32 on all attention and MLP projections that is 0.33 GiB, against 0.28 GiB for
+  SinkSGD_adv with momentum. Full fine-tuning needs about 4 bytes per parameter on top.

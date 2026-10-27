@@ -477,6 +477,8 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "validation_brake": False,
         "validation_alignment_ref": 0.1,
         "stochastic_rounding": True,
+        "slice_p": 11,
+        "state_precision": "bf16_sr",
     },
     Optimizer.ADAMW_ADV: {
         "beta1": 0.9,

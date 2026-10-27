@@ -63,6 +63,8 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             drift_budget: float = 0.0,
             validation_alignment_ref: float = 0.1,
             stochastic_rounding: bool = True,
+            slice_p: int = 11,
+            state_precision: str = "bf16_sr",
     ):
         if lr <= 0:
             raise ValueError(f"Learning rate must be positive, got {lr}.")
@@ -74,6 +76,10 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             raise ValueError("d_shrink and d_min_ratio must be in [0, 1].")
         if drift_budget < 0.0 or weight_decay < 0.0:
             raise ValueError("drift_budget and weight_decay must not be negative.")
+        if slice_p < 1:
+            raise ValueError(f"slice_p must be at least 1, got {slice_p}.")
+        if state_precision not in ("bf16_sr", "fp32"):
+            raise ValueError(f"SINKSGD_ADAPTIVE supports the state precisions bf16_sr and fp32, got {state_precision}.")
         defaults = {
             "lr": lr, "momentum": momentum, "sinkhorn_iterations": sinkhorn_iterations,
             "weight_decay": weight_decay, "d": d0, "d0": d0, "d_max": d0, "d_coef": d_coef,
@@ -82,11 +88,26 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             "agreement_threshold": agreement_threshold, "drift_budget": drift_budget,
             "drift": 0.0, "brake": 1.0, "alignment": None,
             "validation_alignment_ref": validation_alignment_ref,
+            "slice_p": slice_p, "state_precision": state_precision,
             # Reported as "effective_lr" * d by OneTrainer: the learning rate after drift budget and brake.
             "effective_lr": lr,
         }
         self.stochastic_rounding = stochastic_rounding
         super().__init__(params, defaults)
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        # torch casts loaded states to the parameter dtype; restore the configured state precisions.
+        super().load_state_dict(state_dict)
+        for group in self.param_groups:
+            dtype = torch.bfloat16 if group["state_precision"] == "bf16_sr" else torch.float32
+            for p in group["params"]:
+                state = self.state.get(p, {})
+                for key in ("x0", "s"):
+                    if key in state:
+                        state[key] = state[key].float()
+                for key in ("momentum", "magnitude"):
+                    if key in state:
+                        state[key] = state[key].to(dtype)
 
     @property
     def supports_fused_back_pass(self):
@@ -101,15 +122,30 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
     def supports_flat_params(self):
         return False
 
+    @staticmethod
+    def _slice(tensor: Tensor, group: dict) -> Tensor:
+        """Every slice_p-th entry: the distance estimate is a ratio of sums, so a sample suffices (Prodigy)."""
+        return tensor.reshape(-1)[::group["slice_p"]]
+
     def _init_state(self, p: Tensor, group: dict) -> dict:
         state = self.state[p]
-        if "x0" not in state:
-            state["x0"] = p.detach().clone()
-            state["s"] = torch.zeros_like(p, dtype=torch.float32)
-            state["momentum"] = torch.zeros_like(p, dtype=torch.float32)
+        sliced = self._slice(p.detach(), group)
+        if "x0" not in state or state["x0"].numel() != sliced.numel():
+            state["x0"] = sliced.float().clone()
+            state["s"] = torch.zeros_like(state["x0"])
+        if "momentum" not in state:
+            dtype = torch.bfloat16 if group["state_precision"] == "bf16_sr" else torch.float32
+            state["momentum"] = torch.zeros_like(p, dtype=dtype)
             if group["agreement_threshold"] > 0:
-                state["magnitude"] = torch.zeros_like(p, dtype=torch.float32)
+                state["magnitude"] = torch.zeros_like(p, dtype=dtype)
         return state
+
+    @staticmethod
+    def _store(state_tensor: Tensor, value: Tensor):
+        if state_tensor.dtype == torch.bfloat16:
+            copy_stochastic_(state_tensor, value)
+        elif value is not state_tensor:
+            state_tensor.copy_(value)
 
     @torch.no_grad()
     def _update_d(self, group: dict):
@@ -123,8 +159,8 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             if p.grad is None:
                 continue
             state = self._init_state(p, group)
-            grad = p.grad.float()
-            displacement = state["x0"].float() - p.float()
+            grad = self._slice(p.grad, group).float()
+            displacement = state["x0"] - self._slice(p.detach(), group).float()
             state["s"].mul_(beta3).add_(grad, alpha=weight)
             terms = torch.stack((
                 torch.dot(grad.flatten(), displacement.flatten()),
@@ -132,7 +168,7 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
                 displacement.square().sum(),
             ))
             sums = terms if sums is None else sums + terms.to(sums.device)
-            count += p.numel()
+            count += grad.numel()
         if sums is None:
             return
         dot, denominator, drift_squared = sums.tolist()
@@ -175,12 +211,16 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
                     continue
                 state = self._init_state(p, group)
                 normalized = _sinkhorn(p.grad.float().clone(), group["sinkhorn_iterations"])
-                state["momentum"].lerp_(normalized, 1 - beta)
-                direction = _sinkhorn(state["momentum"].clone(), group["sinkhorn_iterations"])
+                momentum = state["momentum"].float().lerp_(normalized, 1 - beta)
+                self._store(state["momentum"], momentum)
+                direction = _sinkhorn(momentum.clone(), group["sinkhorn_iterations"])
                 if threshold > 0:
-                    state["magnitude"].lerp_(normalized.abs_(), 1 - beta)
-                    agreement = state["momentum"].abs() / state["magnitude"].clamp_min(1e-12)
-                    direction.mul_(((agreement - threshold) / (1 - threshold)).clamp_(0, 1))
+                    magnitude = state["magnitude"].float().lerp_(normalized.abs_(), 1 - beta)
+                    self._store(state["magnitude"], magnitude)
+                    # Not in place: with fp32 states, momentum and magnitude are the stored states themselves.
+                    agreement = momentum.abs().div_(magnitude.clamp_min(1e-12))
+                    direction.mul_(agreement.sub_(threshold).div_(1 - threshold).clamp_(0, 1))
+                del normalized, momentum
                 if step_size == 0:
                     continue
                 if group["weight_decay"] > 0:
@@ -207,7 +247,7 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
                 state = self.state.get(p)
                 if gradient is None or not state or "momentum" not in state:
                     continue
-                direction = state["momentum"]
+                direction = state["momentum"].float()
                 gradient = gradient.float()
                 dot += torch.dot(direction.flatten(), gradient.flatten()).item()
                 train_norm += direction.square().sum().item()

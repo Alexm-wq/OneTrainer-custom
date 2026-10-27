@@ -56,9 +56,11 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         self.assertGreaterEqual(group["d"], 0.25 * group["d_max"] * (1 - 1e-6))
 
     def test_agreement_mask_damps_noise_but_not_consistent_gradients(self):
-        def moved(gradients):
+        def moved(gradients, precision):
             parameter = nn.Parameter(torch.zeros(16, 16))
-            optimizer = SinkSGDAdaptive([parameter], growth_rate=1.0, d0=1e-3, agreement_threshold=0.3)
+            optimizer = SinkSGDAdaptive(
+                [parameter], growth_rate=1.0, d0=1e-3, agreement_threshold=0.3, state_precision=precision,
+            )
             for gradient in gradients:
                 parameter.grad = gradient
                 optimizer.step()
@@ -66,7 +68,28 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
 
         consistent = [torch.ones(16, 16) + 0.1 * torch.randn(16, 16) for _ in range(50)]
         noise = [torch.randn(16, 16) for _ in range(50)]
-        self.assertGreater(moved(consistent), 5 * moved(noise))
+        for precision in ("fp32", "bf16_sr"):
+            with self.subTest(precision=precision):
+                self.assertGreater(moved(consistent, precision), 5 * moved(noise, precision))
+
+    def test_fp32_states_are_not_modified_by_the_mask(self):
+        parameter = nn.Parameter(torch.zeros(8, 8))
+        optimizer = SinkSGDAdaptive([parameter], state_precision="fp32", agreement_threshold=0.2)
+        parameter.grad = -torch.ones(8, 8)
+        optimizer.step()
+        # (1 - beta) * normalized gradient: the agreement computation must not take its absolute value in place.
+        torch.testing.assert_close(optimizer.state[parameter]["momentum"], torch.full((8, 8), -0.1))
+
+    def test_states_are_sliced_and_bf16_by_default(self):
+        parameter = nn.Parameter(torch.zeros(110, 10))
+        optimizer = SinkSGDAdaptive([parameter])
+        parameter.grad = torch.randn(110, 10)
+        optimizer.step()
+        state = optimizer.state[parameter]
+        self.assertEqual((state["x0"].numel(), state["s"].numel()), (100, 100))
+        self.assertEqual((state["momentum"].dtype, state["magnitude"].dtype), (torch.bfloat16, torch.bfloat16))
+        with self.assertRaisesRegex(ValueError, "state precisions"):
+            SinkSGDAdaptive([parameter], state_precision="int8_sr")
 
     def test_drift_budget_stops_training(self):
         parameter = nn.Parameter(torch.zeros(8, 8))
@@ -126,6 +149,7 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         self.assertIsInstance(optimizer, SinkSGDAdaptive)
         group = optimizer.param_groups[0]
         self.assertEqual((group["growth_rate"], group["d_coef"], group["agreement_threshold"]), (1.05, 0.1, 0.2))
+        self.assertEqual((group["slice_p"], group["state_precision"]), (11, "bf16_sr"))
         group["d"] = 0.01
         reported = Optimizer.SINKSGD_ADAPTIVE.maybe_adjust_lrs({"transformer": 1.0}, optimizer)
         self.assertAlmostEqual(reported["transformer"], 0.01)
