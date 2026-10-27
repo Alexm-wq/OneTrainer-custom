@@ -104,8 +104,10 @@ upstream) at pure noise. Each sample of a batch gets its own mask.
   compiled blocks too. Self-Flow's student uses, per sample, the mean noise level of
   its image tokens; its teacher uses the cleaner timestep.
 - An exported LoRA is a normal LoRA without the mask. Other tools apply all ranks at
-  every timestep, which differs from OneTrainer's samples. The official repository
-  likewise needs its own pipeline hook at inference.
+  every timestep, which differs from OneTrainer's samples. For ComfyUI, the node in
+  `comfyui/onetrainer_tlora` applies the mask per sampling step; OneTrainer stores T-LoRA
+  Min Rank in the LoRA file for it. The official repository likewise needs its own
+  pipeline hook at inference.
 - Plain LoRA only: DoRA, LoHa, LoKr and OFT are rejected, as is any model other than
   MOSS Image. On SVDQuant layers only the LoRA ranks are masked, not the SVD residual. The upstream SDXL variant's orthogonal initialization
   (Ortho-LoRA) is not included; the official FLUX release uses the timestep masking alone.
