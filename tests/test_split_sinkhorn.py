@@ -1,4 +1,4 @@
-"""SinkSGD_adv Split Fused Layers: per-part Sinkhorn normalization of fused MOSS Image layers. CPU only."""
+"""SinkSGD_adv / SINKSGD_ADAPTIVE Split Fused Layers: per-part Sinkhorn normalization of fused MOSS Image layers. CPU only."""
 import unittest
 
 from modules.module.LoRAModule import LoRAModuleWrapper
@@ -8,7 +8,12 @@ from modules.util.enum.ModelType import ModelType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
-from modules.util.optimizer.split_sinkhorn import SINKHORN_CHUNKS, configure_split_sinkhorn
+from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive, _sinkhorn
+from modules.util.optimizer.split_sinkhorn import (
+    SINKHORN_CHUNKS,
+    configure_split_sinkhorn,
+    install_adv_split_sinkhorn,
+)
 from modules.util.optimizer_util import change_optimizer
 
 import torch
@@ -66,7 +71,7 @@ class SplitSinkhornTest(unittest.TestCase):
         self.assertIsNone(getattr(transformer.layers[0].proj["q"].weight, SINKHORN_CHUNKS, None))
 
     def test_optimizer_normalizes_each_part(self):
-        configure_split_sinkhorn(self._lora_model(), True)  # installs the per-part normalization
+        install_adv_split_sinkhorn()
         grad = torch.randn(12, 4) * torch.tensor([1.0, 5.0, 0.2]).repeat_interleave(4)[:, None]
         expected_split = -0.1 * torch.cat([apply_sr_sinkhorn(part.clone()) for part in grad.chunk(3)])
         expected_whole = -0.1 * apply_sr_sinkhorn(grad.clone())
@@ -81,24 +86,51 @@ class SplitSinkhornTest(unittest.TestCase):
                 torch.testing.assert_close(whole.detach(), expected_whole)
         self.assertFalse(torch.allclose(expected_split, expected_whole))
 
+    def test_adaptive_optimizer_normalizes_each_part(self):
+        grad = torch.randn(12, 4) * torch.tensor([1.0, 5.0, 0.2]).repeat_interleave(4)[:, None]
+        for parts in (3, None):
+            with self.subTest(parts=parts):
+                parameter = nn.Parameter(torch.zeros(12, 4))
+                setattr(parameter, SINKHORN_CHUNKS, parts)
+                optimizer = SinkSGDAdaptive(
+                    [parameter], d0=1e-3, growth_rate=1.0, agreement_threshold=0.0, state_precision="fp32",
+                )
+                parameter.grad = grad.clone()
+                optimizer.step()
+
+                def normalize(update, parts=parts):
+                    if parts:
+                        return torch.cat([_sinkhorn(part.clone(), 5) for part in update.chunk(parts)])
+                    return _sinkhorn(update.clone(), 5)
+
+                # Gradient and momentum are both normalized, each part on its own.
+                momentum = 0.1 * normalize(grad)
+                torch.testing.assert_close(optimizer.state[parameter]["momentum"], momentum)
+                torch.testing.assert_close(parameter.detach(), -1e-3 * normalize(momentum))
+
     def test_created_from_config_and_rejected_without_fused_layers(self):
-        config = TrainConfig.default_values()
-        config.model_type = ModelType.MOSS_IMAGE
-        config.training_method = TrainingMethod.LORA
-        config.optimizer.optimizer = Optimizer.SINKSGD_ADV
-        config.optimizer = change_optimizer(config)
-        self.assertFalse(config.optimizer.split_fused_sinkhorn)
-        config.optimizer.split_fused_sinkhorn = True
-        for layer_filter, fused in (("layers.", True), ("layers.0.proj.q", False)):
-            with self.subTest(layer_filter=layer_filter):
-                model = self._lora_model(layer_filter)
-                collection = NamedParameterGroupCollection()
-                collection.add_group(NamedParameterGroup("transformer", model.transformer_lora.parameters(), 1e-4))
-                if fused:
-                    self.assertIsInstance(create.create_optimizer(collection, None, config, model), SinkSGD_adv)
-                else:
-                    with self.assertRaisesRegex(ValueError, "none of the trained parameters"):
-                        create.create_optimizer(collection, None, config, model)
+        for optimizer_type, optimizer_class in ((Optimizer.SINKSGD_ADV, SinkSGD_adv),
+                                                (Optimizer.SINKSGD_ADAPTIVE, SinkSGDAdaptive)):
+            config = TrainConfig.default_values()
+            config.model_type = ModelType.MOSS_IMAGE
+            config.training_method = TrainingMethod.LORA
+            config.optimizer.optimizer = optimizer_type
+            config.optimizer = change_optimizer(config)
+            self.assertFalse(config.optimizer.split_fused_sinkhorn)
+            config.optimizer.split_fused_sinkhorn = True
+            for layer_filter, fused in (("layers.", True), ("layers.0.proj.q", False)):
+                with self.subTest(optimizer=optimizer_type, layer_filter=layer_filter):
+                    model = self._lora_model(layer_filter)
+                    collection = NamedParameterGroupCollection()
+                    collection.add_group(NamedParameterGroup("transformer", model.transformer_lora.parameters(), 1e-4))
+                    if fused:
+                        optimizer = create.create_optimizer(collection, None, config, model)
+                        self.assertIsInstance(optimizer, optimizer_class)
+                        up = model.transformer_lora.lora_modules["layers.0.proj.ffn_up_gate"].lora_up.weight
+                        self.assertEqual(getattr(up, SINKHORN_CHUNKS), 2)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "none of the trained parameters"):
+                            create.create_optimizer(collection, None, config, model)
 
 
 if __name__ == "__main__":

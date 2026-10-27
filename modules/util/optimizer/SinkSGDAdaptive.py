@@ -25,9 +25,21 @@ alone. On top of that:
 import math
 
 from modules.util.bf16_stochastic_rounding import copy_stochastic_
+from modules.util.optimizer.split_sinkhorn import SINKHORN_CHUNKS
 
 import torch
 from torch import Tensor
+
+
+def _sinkhorn_parts(update: Tensor, iterations: int, parts: int | None) -> Tensor:
+    """Sinkhorn per stacked part of a fused layer (rows split into ``parts``), see split_sinkhorn."""
+    if not parts or update.ndim < 2:
+        return _sinkhorn(update, iterations)
+    if update.shape[0] % parts:
+        raise ValueError(f"Split Fused Layers: {update.shape[0]} rows do not split into {parts} parts.")
+    for part in update.chunk(parts):
+        _sinkhorn(part, iterations)
+    return update
 
 
 def _sinkhorn(update: Tensor, iterations: int) -> Tensor:
@@ -213,10 +225,11 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 state = self._init_state(p, group)
-                normalized = _sinkhorn(p.grad.float().clone(), group["sinkhorn_iterations"])
+                parts = getattr(p, SINKHORN_CHUNKS, None)
+                normalized = _sinkhorn_parts(p.grad.float().clone(), group["sinkhorn_iterations"], parts)
                 momentum = state["momentum"].float().lerp_(normalized, 1 - beta)
                 self._store(state["momentum"], momentum)
-                direction = _sinkhorn(momentum.clone(), group["sinkhorn_iterations"])
+                direction = _sinkhorn_parts(momentum.clone(), group["sinkhorn_iterations"], parts)
                 if threshold > 0:
                     magnitude = state["magnitude"].float().lerp_(normalized.abs_(), 1 - beta)
                     self._store(state["magnitude"], magnitude)

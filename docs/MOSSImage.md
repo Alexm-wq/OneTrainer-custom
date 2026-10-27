@@ -110,16 +110,18 @@ upstream) at pure noise. Each sample of a batch gets its own mask.
   model other than MOSS Image. The upstream SDXL variant's orthogonal initialization
   (Ortho-LoRA) is not included; the official FLUX release uses the timestep masking alone.
 
-## Split Fused Layers (SinkSGD_adv)
+## Split Fused Layers (SinkSGD_adv, SINKSGD_ADAPTIVE)
 
-The SinkSGD_adv option **Split Fused Layers** normalizes layers that hold several
+The SinkSGD_adv and SINKSGD_ADAPTIVE option **Split Fused Layers** normalizes layers that hold several
 projections in one matrix per part instead of as a whole: FFN up+gate of the 42 main
 blocks (2 parts), the text-refiner QKV (3), the shared block modulation (6) and the
 video head modulation (2). Muon on DiTs converged much better with this split in CMuon
 (Chen, Sun, Yuan, 2026); for SinkSGD it is untested on real training, so compare it in
 an A/B run. It applies to the fused weights in full fine-tuning and to their LoRA up
-matrices (LoRA, DoRA, LoHa); LoRA down is not fused. SNR preconditioning and geometric
-weight decay keep their statistics over the whole matrix. Enabling it when no trained
+matrices (LoRA, DoRA, LoHa); LoRA down is not fused. In SINKSGD_ADAPTIVE both Sinkhorn
+normalizations (gradient and momentum) are split; the agreement mask and the distance
+estimate are per entry or over the whole group anyway. In SinkSGD_adv, SNR
+preconditioning and geometric weight decay keep their statistics over the whole matrix. Enabling it when no trained
 parameter belongs to a fused layer is an error.
 
 ## Identity reward

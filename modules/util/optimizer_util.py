@@ -466,6 +466,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
     Optimizer.SINKSGD_ADAPTIVE: {
         "momentum": 0.9,
         "sinkhorn_iterations": 5,
+        "split_fused_sinkhorn": False,
         "weight_decay": 0.0,
         "d0": 1e-5,
         "d_coef": 1.0,

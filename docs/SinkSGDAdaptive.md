@@ -32,6 +32,8 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
   on the whole learning rate, not per concept. Needs validation concepts and costs one extra
   backward pass per brake image; validate often enough, e.g. every 50–100 steps.
   `Validation Alignment Ref` is the cosine that counts as fully helpful.
+- **Split Fused Layers** (off by default): normalizes fused weights such as MOSS Image's FFN
+  up+gate per part, as for SinkSGD_adv; see the MOSS Image docs.
 - **Drift budget** (off by default): the step falls linearly with the RMS distance of the
   trained weights from their start and reaches zero at `Drift Budget`.
 

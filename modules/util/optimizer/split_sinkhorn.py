@@ -1,4 +1,4 @@
-"""Sinkhorn normalization per sub-matrix of fused layers, for SinkSGD_adv.
+"""Sinkhorn normalization per sub-matrix of fused layers, for SinkSGD_adv and SINKSGD_ADAPTIVE.
 
 Some layers stack several projections in one weight, e.g. MOSS Image's FFN up and gate. Normalizing
 such a matrix as a whole lets the column norms mix the parts. CMuon (Chen, Sun, Yuan, 2026) reports
@@ -46,7 +46,10 @@ def _split_parameters(model) -> list[tuple[nn.Parameter, int]]:
 
 
 def configure_split_sinkhorn(model, enabled: bool):
-    """Mark the parameters of fused layers for per-part Sinkhorn normalization, or clear the marks."""
+    """Mark the parameters of fused layers for per-part Sinkhorn normalization, or clear the marks.
+
+    SINKSGD_ADAPTIVE reads the marks itself; SinkSGD_adv needs install_adv_split_sinkhorn as well.
+    """
     split = _split_parameters(model) if model is not None else []
     for parameter, chunks in split:
         setattr(parameter, SINKHORN_CHUNKS, chunks if enabled else None)
@@ -57,10 +60,9 @@ def configure_split_sinkhorn(model, enabled: bool):
             "Split Fused Layers: none of the trained parameters belongs to a fused layer. The fused layers are "
             "known for MOSS Image (FFN up+gate, text-refiner QKV, timestep modulation); LoKr and OFT are not split."
         )
-    _install()
 
 
-def _install():
+def install_adv_split_sinkhorn():
     # The package exports the optimizer class under the module's name; patch the module itself.
     SinkSGD_adv = importlib.import_module("adv_optm.optim.SinkSGD_adv")
     original = SinkSGD_adv.apply_sr_sinkhorn
