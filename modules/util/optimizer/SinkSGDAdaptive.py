@@ -17,7 +17,8 @@ alone. On top of that:
   moves less as a whole. The momentum horizon should stay well below one epoch.
 - Drift budget: the step shrinks linearly with the RMS distance of the trained weights from their
   start and stops at ``drift_budget``.
-- Validation brake: ``observe_validation_gradient`` compares a held-out gradient with the current
+- Validation brake: ``observe_validation_gradient`` compares a held-out gradient (OneTrainer sums
+  it over a few validation images spread over the validation concepts) with the current
   training direction. While the training direction stops helping held-out images, the step is
   damped and d stops growing.
 """

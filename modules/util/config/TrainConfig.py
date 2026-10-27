@@ -155,6 +155,7 @@ class TrainOptimizerConfig(BaseConfig):
     agreement_threshold: float
     drift_budget: float
     validation_brake: bool
+    validation_brake_batches: int
     validation_alignment_ref: float
 
     def __init__(self, data: list[(str, Any, type, bool)]):
@@ -301,6 +302,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("agreement_threshold", None, float, True))
         data.append(("drift_budget", None, float, True))
         data.append(("validation_brake", False, bool, False))
+        data.append(("validation_brake_batches", None, int, True))
         data.append(("validation_alignment_ref", None, float, True))
         data.append(("nesterov_coef", None, float, True))
         data.append(("snr_cond", False, bool, False))

@@ -18,10 +18,12 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
   the recent gradients disagree are damped (`Agreement Threshold`). A layer that only sees
   noise moves less as a whole. Keep the momentum horizon (`1 / (1 - momentum)` steps) well
   below one epoch, otherwise the same image seen again looks like agreement.
-- **Validation brake** (off by default): at every validation, the gradient of one validation
-  batch is compared with the training direction. While training no longer helps held-out
-  images, the step is damped and `d` cannot grow. Needs validation concepts and costs one
-  forward and backward pass per validation; validate often enough, e.g. every 50–100 steps.
+- **Validation brake** (off by default): at every validation, the summed gradient of a few
+  validation images is compared with the training direction. `Validation Brake Images` (8)
+  are spread evenly over the validation concepts, so one concept cannot decide alone. While
+  training no longer helps held-out images, the step is damped and `d` cannot grow. It acts
+  on the whole learning rate, not per concept. Needs validation concepts and costs one extra
+  backward pass per brake image; validate often enough, e.g. every 50–100 steps.
   `Validation Alignment Ref` is the cosine that counts as fully helpful.
 - **Drift budget** (off by default): the step falls linearly with the RMS distance of the
   trained weights from their start and reaches zero at `Drift Budget`.

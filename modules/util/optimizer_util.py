@@ -475,6 +475,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "agreement_threshold": 0.2,
         "drift_budget": 0.0,
         "validation_brake": False,
+        "validation_brake_batches": 8,
         "validation_alignment_ref": 0.1,
         "stochastic_rounding": True,
         "slice_p": 11,

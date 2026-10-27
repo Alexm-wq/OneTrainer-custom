@@ -22,6 +22,7 @@ from modules.util.bf16_stochastic_rounding import set_seed as bf16_stochastic_ro
 from modules.util.callbacks.TrainCallbacks import TrainCallbacks
 from modules.util.commands.TrainCommands import TrainCommands
 from modules.util.compile_util import init_compile
+from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import TrainConfig
 from modules.util.dpo_beta_controller import DPOBetaController
@@ -48,6 +49,43 @@ from torch.utils.tensorboard import SummaryWriter
 from torchvision.transforms.functional import pil_to_tensor
 
 from tqdm import tqdm
+
+
+class _ValidationBrakeGradient:
+    """Sums the gradients of up to ``total`` validation images, spread evenly over the validation concepts.
+
+    Validation runs between optimizer steps, so no training gradient is pending and the parameters'
+    .grad buffers can hold the sum. backward() rather than autograd.grad(): reentrant checkpointing of
+    offloaded layers supports only the former.
+    """
+
+    def __init__(self, optimizer, total: int, concepts: int):
+        self.optimizer = optimizer
+        self.parameters = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
+        if any(p.grad is not None and p.grad.count_nonzero() > 0 for p in self.parameters):
+            raise RuntimeError("Validation brake: a training gradient is still pending.")
+        self.clear()
+        self.quota = max(1, math.ceil(total / max(1, concepts)))
+        self.remaining = total
+        self.counts = {}
+
+    def wants(self, concept_key: str) -> bool:
+        return self.remaining > 0 and self.counts.get(concept_key, 0) < self.quota
+
+    def add(self, concept_key: str, loss: Tensor):
+        loss.backward()
+        self.counts[concept_key] = self.counts.get(concept_key, 0) + 1
+        self.remaining -= 1
+
+    def finish(self):
+        if self.counts:
+            self.optimizer.observe_validation_gradient(
+                {p: p.grad for p in self.parameters if p.grad is not None}
+            )
+
+    def clear(self):
+        for p in self.parameters:
+            p.grad = None
 
 
 class GenericTrainer(BaseTrainer):
@@ -627,8 +665,11 @@ class GenericTrainer(BaseTrainer):
         normal_sums, normal_counts = {}, {}
         pair_sums, pair_count = {}, 0
         previous_metrics = self.model_setup.get_last_dpo_metrics()
-        brake_batch = None
-        wants_brake = self.config.optimizer.validation_brake and hasattr(self.model.optimizer, "observe_validation_gradient")
+        brake = None
+        if self.config.optimizer.validation_brake and hasattr(self.model.optimizer, "observe_validation_gradient"):
+            brake = _ValidationBrakeGradient(
+                self.model.optimizer, self.config.optimizer.validation_brake_batches or 8, self.__validation_concept_count(),
+            )
         try:
             for batch in tqdm(self.validation_data_loader.get_data_loader(), desc="validation_step", total=length):
                 if self.__needs_gc(train_progress):
@@ -647,14 +688,16 @@ class GenericTrainer(BaseTrainer):
                                 pair_sums[name] = pair_sums.get(name, 0.0) + value
                         pair_count += 1
                     continue
-                if wants_brake and brake_batch is None:
-                    brake_batch = batch
-                with torch.no_grad():
-                    output = self.model_setup.predict(self.model, batch, self.config, train_progress, deterministic=True)
-                    loss = self.model_setup.calculate_loss(self.model, batch, output, self.config).item()
                 # Include the concept seed to avoid merging equal display names.
                 name = batch["concept_name"][0] or os.path.basename(batch["concept_path"][0])
                 key = f"{name}-{batch['concept_seed'][0]}"
+                with_gradient = brake is not None and brake.wants(key)
+                with torch.set_grad_enabled(with_gradient):
+                    output = self.model_setup.predict(self.model, batch, self.config, train_progress, deterministic=True)
+                    loss_tensor = self.model_setup.calculate_loss(self.model, batch, output, self.config)
+                    if with_gradient:
+                        brake.add(key, loss_tensor)
+                loss = loss_tensor.item()
                 normal_sums[key] = normal_sums.get(key, 0.0) + loss
                 normal_counts[key] = normal_counts.get(key, 0) + 1
 
@@ -670,35 +713,23 @@ class GenericTrainer(BaseTrainer):
                 self.__record_dpo_validation(metrics, train_progress)
             elif paired_validation:
                 print("[OT-DPO] No held-out preference pairs; DPO Save Best and patience have no observations.")
-            if brake_batch is not None:
-                self.__observe_validation_gradient(brake_batch, train_progress)
+            if brake is not None:
+                brake.finish()
         finally:
+            if brake is not None:
+                brake.clear()
             self.model_setup._last_dpo_metrics = previous_metrics
             if schedule_free:
                 torch.clear_autocast_cache()
                 self.model.optimizer.train()
             self.model_setup.setup_train_device(self.model, self.config)
 
-    def __observe_validation_gradient(self, batch, train_progress: TrainProgress):
-        """Hand the optimizer the gradient of one validation batch (SINKSGD_ADAPTIVE validation brake).
-
-        Validation runs between optimizer steps, so no training gradient is pending. backward()
-        rather than autograd.grad(): reentrant checkpointing of offloaded layers supports only the former.
-        """
-        parameters = [
-            p for group in self.model.optimizer.param_groups for p in group["params"] if p.requires_grad
-        ]
-        if any(p.grad is not None and p.grad.count_nonzero() > 0 for p in parameters):
-            raise RuntimeError("Validation brake: a training gradient is still pending.")
-        for p in parameters:
-            p.grad = None
-        with torch.enable_grad():
-            output = self.model_setup.predict(self.model, batch, self.config, train_progress, deterministic=True)
-            self.model_setup.calculate_loss(self.model, batch, output, self.config).backward()
-        gradients = {p: p.grad.detach().clone() for p in parameters if p.grad is not None}
-        for p in parameters:
-            p.grad = None
-        self.model.optimizer.observe_validation_gradient(gradients)
+    def __validation_concept_count(self) -> int:
+        concepts = self.config.concepts
+        if concepts is None:
+            with open(self.config.concept_file_name, "r") as f:
+                concepts = [ConceptConfig.default_values().from_dict(c) for c in json.load(f)]
+        return sum(1 for c in concepts if c.enabled and ConceptType(c.type) == ConceptType.VALIDATION)
 
     def __record_dpo_validation(self, metrics, train_progress):
         score = metrics["objective_loss"]

@@ -3,14 +3,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from modules.trainer.GenericTrainer import GenericTrainer
+from modules.trainer.GenericTrainer import GenericTrainer, _ValidationBrakeGradient
 from modules.util import create
+from modules.util.config.ConceptConfig import ConceptConfig
 from modules.util.config.TrainConfig import TrainConfig
+from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
 from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive, _sinkhorn
 from modules.util.optimizer_util import change_optimizer
-from modules.util.TrainProgress import TrainProgress
 
 import torch
 from torch import nn
@@ -155,30 +156,44 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         self.assertAlmostEqual(reported["transformer"], 0.01)
         self.assertFalse(Optimizer.SINKSGD_ADAPTIVE.supports_fused_back_pass())
 
-    def test_trainer_hands_validation_gradient_to_optimizer(self):
+    def test_validation_brake_sums_images_spread_over_concepts(self):
         model = nn.Linear(4, 2)
         optimizer = SinkSGDAdaptive(model.parameters())
         optimizer.observe_validation_gradient = Mock()
-        trainer = object.__new__(GenericTrainer)
-        trainer.model = SimpleNamespace(optimizer=optimizer)
-        trainer.config = Mock()
-        batch = {"x": torch.randn(3, 4)}
-
-        def predict(model_, batch_, config_, progress_, deterministic=False):
-            self.assertTrue(deterministic and torch.is_grad_enabled())
-            return {"y": model(batch_["x"])}
-
-        trainer.model_setup = SimpleNamespace(
-            predict=predict, calculate_loss=lambda model_, batch_, output, config_: output["y"].square().mean(),
-        )
-        trainer._GenericTrainer__observe_validation_gradient(batch, TrainProgress())
+        brake = _ValidationBrakeGradient(optimizer, total=4, concepts=2)
+        taken = []
+        expected = [torch.zeros_like(p) for p in model.parameters()]
+        # A loader that yields concept a's images first must not use up the whole budget on it.
+        for key in ["a"] * 5 + ["b"] * 5:
+            if not brake.wants(key):
+                continue
+            x = torch.randn(3, 4)
+            brake.add(key, model(x).square().mean())
+            for total, grad in zip(expected, torch.autograd.grad(model(x).square().mean(), list(model.parameters())), strict=True):
+                total.add_(grad)
+            taken.append(key)
+        self.assertEqual(taken, ["a", "a", "b", "b"])
+        brake.finish()
         gradients = optimizer.observe_validation_gradient.call_args.args[0]
-        self.assertEqual(set(gradients), set(model.parameters()))
+        for parameter, total in zip(model.parameters(), expected, strict=True):
+            torch.testing.assert_close(gradients[parameter], total)
+        brake.clear()
         self.assertTrue(all(p.grad is None for p in model.parameters()))
 
         model.weight.grad = torch.ones_like(model.weight)
         with self.assertRaisesRegex(RuntimeError, "pending"):
-            trainer._GenericTrainer__observe_validation_gradient(batch, TrainProgress())
+            _ValidationBrakeGradient(optimizer, total=4, concepts=2)
+
+    def test_validation_concepts_are_counted(self):
+        trainer = object.__new__(GenericTrainer)
+        concepts = []
+        for concept_type, enabled in ((ConceptType.VALIDATION, True), (ConceptType.VALIDATION, False),
+                                      (ConceptType.STANDARD, True), (ConceptType.VALIDATION, True)):
+            concept = ConceptConfig.default_values()
+            concept.type, concept.enabled = concept_type, enabled
+            concepts.append(concept)
+        trainer.config = SimpleNamespace(concepts=concepts)
+        self.assertEqual(trainer._GenericTrainer__validation_concept_count(), 2)
 
 
 if __name__ == "__main__":
