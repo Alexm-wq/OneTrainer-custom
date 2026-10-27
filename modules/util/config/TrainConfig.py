@@ -150,6 +150,12 @@ class TrainOptimizerConfig(BaseConfig):
     nesterov_coef: float
     snr_cond: False
     geometric_wd: False
+    d_shrink: float
+    d_min_ratio: float
+    agreement_threshold: float
+    drift_budget: float
+    validation_brake: bool
+    validation_alignment_ref: float
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
@@ -290,6 +296,12 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("orthogonal_sinkhorn", False, bool, False))
         data.append(("sinkhorn_iterations", None, int, True))
         data.append(("normed_momentum", False, bool, False))
+        data.append(("d_shrink", None, float, True))
+        data.append(("d_min_ratio", None, float, True))
+        data.append(("agreement_threshold", None, float, True))
+        data.append(("drift_budget", None, float, True))
+        data.append(("validation_brake", False, bool, False))
+        data.append(("validation_alignment_ref", None, float, True))
         data.append(("nesterov_coef", None, float, True))
         data.append(("snr_cond", False, bool, False))
         data.append(("geometric_wd", False, bool, False))

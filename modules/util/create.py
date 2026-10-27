@@ -698,6 +698,27 @@ def create_optimizer(
                 geometric_wd=optimizer_config.geometric_wd if optimizer_config.geometric_wd is not None else False,
             )
 
+        # SINKSGD_ADAPTIVE Optimizer (experimental)
+        case Optimizer.SINKSGD_ADAPTIVE:
+            from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive
+            optimizer = SinkSGDAdaptive(
+                params=parameters,
+                lr=config.learning_rate,
+                momentum=optimizer_config.momentum if optimizer_config.momentum is not None else 0.9,
+                sinkhorn_iterations=optimizer_config.sinkhorn_iterations if optimizer_config.sinkhorn_iterations is not None else 5,
+                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0.0,
+                d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-6,
+                d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 0.1,
+                growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else 1.05,
+                beta3=optimizer_config.beta3 if optimizer_config.beta3 is not None else 0.999,
+                d_shrink=optimizer_config.d_shrink if optimizer_config.d_shrink is not None else 0.01,
+                d_min_ratio=optimizer_config.d_min_ratio if optimizer_config.d_min_ratio is not None else 0.1,
+                agreement_threshold=optimizer_config.agreement_threshold if optimizer_config.agreement_threshold is not None else 0.2,
+                drift_budget=optimizer_config.drift_budget if optimizer_config.drift_budget is not None else 0.0,
+                validation_alignment_ref=optimizer_config.validation_alignment_ref if optimizer_config.validation_alignment_ref is not None else 0.1,
+                stochastic_rounding=optimizer_config.stochastic_rounding,
+            )
+
         # ADAMW_ADV Optimizer
         case Optimizer.ADAMW_ADV:
             from adv_optm import AdamW_adv

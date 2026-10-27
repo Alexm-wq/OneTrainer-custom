@@ -161,6 +161,11 @@ class BaseModelSetup(
                 f"lr/{name}", lr, model.train_progress.global_step
             )
 
+        optimizer_stats = getattr(model.optimizer, 'tensorboard_stats', None)
+        if callable(optimizer_stats):
+            for name, value in optimizer_stats().items():
+                tensorboard.add_scalar(name, value, model.train_progress.global_step)
+
         if hasattr(model.optimizer, 'kourkoutas_helper') and model.optimizer.kourkoutas_helper is not None:
             stats = model.optimizer.kourkoutas_helper.last_beta2_stats
             if stats:
