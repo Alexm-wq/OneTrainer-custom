@@ -20,7 +20,7 @@ alone. On top of that:
 - Validation brake: ``observe_validation_gradient`` compares a held-out gradient (OneTrainer sums
   it over a few validation images spread over the validation concepts) with the current
   training direction. While the training direction stops helping held-out images, the step is
-  damped and d stops growing.
+  damped; d stops growing once it does not help at all.
 """
 import math
 
@@ -54,7 +54,7 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             momentum: float = 0.9,
             sinkhorn_iterations: int = 5,
             weight_decay: float = 0.0,
-            d0: float = 1e-6,
+            d0: float = 1e-5,
             d_coef: float = 0.1,
             growth_rate: float = 1.05,
             beta3: float = 0.999,
@@ -180,8 +180,10 @@ class SinkSGDAdaptive(torch.optim.Optimizer):
             return
         estimate = group["d_coef"] * numerator / denominator
         group["d_max"] = max(group["d_max"], estimate)
-        # While held-out gradients disagree with the training direction, d may not grow.
-        growth_allowed = group["brake"] >= 1.0
+        # d may not grow while held-out gradients no longer agree with the training direction at all.
+        # A small positive alignment still means progress: it damps the step, but must not freeze d
+        # at a start value at which the weights barely move and the alignment cannot rise.
+        growth_allowed = group["alignment"] is None or group["alignment"] > 0
         if estimate > d:
             if growth_allowed:
                 group["d"] = min(estimate, d * group["growth_rate"])

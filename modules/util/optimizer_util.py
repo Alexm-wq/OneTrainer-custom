@@ -466,7 +466,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "momentum": 0.9,
         "sinkhorn_iterations": 5,
         "weight_decay": 0.0,
-        "d0": 1e-6,
+        "d0": 1e-5,
         "d_coef": 0.1,
         "growth_rate": 1.05,
         "beta3": 0.999,

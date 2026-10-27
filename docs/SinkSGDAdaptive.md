@@ -12,6 +12,9 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
   solution like Prodigy, from how well the gradients point back to the start. Unlike Prodigy, `d`
   falls again once progress stalls (`D Shrink`), down to `D Min Ratio` of its maximum: a learning
   rate decay driven by the training itself. Leave the learning rate at 1.0, as with Prodigy.
+  `Initial D` (1e-5) is also the lowest step size. With noisy diffusion gradients the estimate
+  rises slowly, often over a few hundred steps; a higher `Initial D` near the lower end of the
+  learning rates that work with plain SinkSGD shortens that ramp.
   TensorBoard's `lr/...` shows the effective rate, `sinksgd_adaptive/d/...` the estimate.
 - **Agreement mask:** memorizing single images produces gradients that differ from image to
   image; the features of a concept point the same way across images. Update entries on which
@@ -21,7 +24,8 @@ tested on CPU and on a small overfitting toy problem, not yet on real diffusion 
 - **Validation brake** (off by default): at every validation, the summed gradient of a few
   validation images is compared with the training direction. `Validation Brake Images` (8)
   are spread evenly over the validation concepts, so one concept cannot decide alone. While
-  training no longer helps held-out images, the step is damped and `d` cannot grow. It acts
+  training no longer helps held-out images, the step is damped in proportion; `d` cannot grow
+  while the alignment is zero or negative. It acts
   on the whole learning rate, not per concept. Needs validation concepts and costs one extra
   backward pass per brake image; validate often enough, e.g. every 50–100 steps.
   `Validation Alignment Ref` is the cosine that counts as fully helpful.

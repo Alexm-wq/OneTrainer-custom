@@ -118,6 +118,18 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         torch.testing.assert_close(parameter.detach(), before)
         self.assertLessEqual(group["d"], d)
 
+    def test_small_positive_alignment_damps_but_does_not_freeze_d(self):
+        results = {}
+        for alignment in (0.05, -0.05):
+            parameter = nn.Parameter(torch.zeros(16, 16))
+            optimizer = SinkSGDAdaptive([parameter], d_coef=1.0, agreement_threshold=0.0, validation_alignment_ref=0.5)
+            group = optimizer.param_groups[0]
+            group["alignment"], group["brake"] = alignment, max(0.0, alignment / 0.5)
+            _quadratic_steps(optimizer, parameter, torch.randn(16, 16), 100)
+            results[alignment] = group["d"]
+        self.assertGreater(results[0.05], 10 * 1e-5)
+        self.assertEqual(results[-0.05], 1e-5)
+
     def test_bf16_parameters_use_stochastic_rounding(self):
         parameter = nn.Parameter(torch.zeros(8, 8, dtype=torch.bfloat16))
         optimizer = SinkSGDAdaptive([parameter], d0=1e-3, growth_rate=1.0, agreement_threshold=0.0)
