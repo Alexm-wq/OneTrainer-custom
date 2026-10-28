@@ -88,7 +88,12 @@ class MOSSImageModel(Flux2Model):
         the official T-LoRA, rank(t) = floor((T - t) * (rank - min_rank) / T) + min_rank.
         """
         config = self.train_config
-        if self.transformer_lora is None or config is None or not config.tlora:
+        if self.transformer_lora is None:
+            return
+        if config is None or not config.tlora:
+            # Without T-LoRA every rank is used, also after a run that had it on.
+            if self.transformer_lora._rank_mask is not None:
+                self.transformer_lora.set_rank_mask(None)
             return
         if timestep is None:
             self.transformer_lora.set_rank_mask(None)

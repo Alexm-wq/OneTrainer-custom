@@ -2,13 +2,15 @@
 import copy
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from modules.modelSampler.MOSSImageSampler import MOSSImageSampler
 from modules.module.LoRAModule import LoRAModuleWrapper
 from modules.module.quantized import LinearW8A8 as w8a8
 from modules.module.quantized.LinearSVD import BaseLinearSVD
 from modules.ui.BaseLoraTabView import BaseLoraTabView
 from modules.util import create
+from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType, PeftType
@@ -36,11 +38,11 @@ class TLoRATest(unittest.TestCase):
         self.mm.start()
         self.addCleanup(self.mm.stop)
 
-    def _setup(self, compile=False, rank=8, min_rank=1, model=None):
+    def _setup(self, compile=False, rank=8, min_rank=1, model=None, tlora=True):
         model = model or tiny_model()
         config = train_config()
         config.lora_rank, config.lora_alpha = rank, rank
-        config.tlora, config.tlora_min_rank = True, min_rank
+        config.tlora, config.tlora_min_rank = tlora, min_rank
         config.compile = compile
         model.train_config = config
         setup = create.create_model_setup(
@@ -166,6 +168,39 @@ class TLoRATest(unittest.TestCase):
                     if graphs is None:
                         graphs = count
                     self.assertEqual(count, graphs)
+
+    def test_without_tlora_training_and_sampling_use_every_rank(self):
+        model, config, setup = self._setup(tlora=False)
+        self.assertIsNone(model._tlora_hook)
+        loras = list(model.transformer_lora.lora_modules.values())
+
+        batch = self._batch()
+        output = self._predict(model, config, setup, batch, [999])
+        setup.calculate_loss(model, batch, output, config).backward()
+        for module in loras:
+            self.assertIsNone(module.rank_mask)
+            self.assertGreater(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
+
+        positive = torch.randn(1, 3, 8)
+        mask = torch.ones(1, 3, dtype=torch.bool)
+        model.encode_text = Mock(side_effect=[(positive, mask), (positive, mask)])
+        sample_config = SampleConfig.default_values(ModelType.MOSS_IMAGE)
+        sample_config.width = sample_config.height = 32
+        sample_config.diffusion_steps, sample_config.cfg_scale, sample_config.moss_uncond_skip_layers = 2, 3.0, ""
+        sampler = MOSSImageSampler(torch.device("cpu"), torch.device("cpu"), model, ModelType.MOSS_IMAGE)
+        sampler.save_sampler_output = Mock()
+        with patch.object(model.transformer, "forward", wraps=model.transformer.forward) as forward:
+            sampler.sample(sample_config, "unused")
+        self.assertGreater(forward.call_count, 0)
+        self.assertTrue(all(module.rank_mask is None for module in loras))
+
+    def test_switching_tlora_off_clears_a_previous_mask(self):
+        model, config, _ = self._setup()
+        model.set_tlora_timestep(torch.tensor([1000.0]))
+        self.assertIsNotNone(model.transformer_lora._rank_mask)
+        config.tlora = False
+        model.set_tlora_timestep(torch.tensor([1000.0]))
+        self.assertTrue(all(module.rank_mask is None for module in model.transformer_lora.lora_modules.values()))
 
     def test_rejects_unsupported_combinations(self):
         model = tiny_model()
