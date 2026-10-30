@@ -109,7 +109,14 @@ upstream) at pure noise. Each sample of a batch gets its own mask.
   Min Rank in the LoRA file for it. The official repository likewise needs its own
   pipeline hook at inference.
 - Plain LoRA only: DoRA, LoHa, LoKr and OFT are rejected, as is any model other than
-  MOSS Image. On SVDQuant layers only the LoRA ranks are masked, not the SVD residual. The upstream SDXL variant's orthogonal initialization
+  MOSS Image. On SVDQuant layers only the LoRA ranks are masked, not the SVD residual.
+- **T-LoRA Gradient Only** keeps the masked ranks in the forward and cuts only their gradient.
+  What a rank learned at other noise levels stays in the output, so the mask can be faded in
+  during a run: no mask before **T-LoRA Start**, the full mask (T-LoRA Min Rank) from
+  **T-LoRA End** on, linear in between (global steps; both 0 masks from the first step).
+  Several concepts in one LoRA can then use every rank at high noise while they are learned,
+  before memorization of single layouts is cut off. The exported LoRA is a plain LoRA that
+  needs no mask at inference, in ComfyUI's normal loader as in OneTrainer's samples. The upstream SDXL variant's orthogonal initialization
   (Ortho-LoRA) is not included; the official FLUX release uses the timestep masking alone.
 
 ## Split Fused Layers (SinkSGD_adv, SINKSGD_ADAPTIVE)

@@ -15,11 +15,17 @@ from torch import Tensor, nn
 def file_min_rank(metadata: dict | None) -> int | None:
     """T-LoRA min rank from a OneTrainer LoRA's safetensors metadata, or None if it does not say."""
     metadata = metadata or {}
-    if "ot_tlora_min_rank" in metadata:
-        return int(metadata["ot_tlora_min_rank"])
     try:
         config = json.loads(metadata["ot_config"])
     except (KeyError, ValueError):
+        config = {}
+    gradient_only = metadata.get("ot_tlora_gradient_only", str(config.get("tlora_gradient_only", False)))
+    if gradient_only == "True":
+        logging.warning("OneTrainer T-LoRA: trained in gradient-only mode, a plain LoRA; a rank mask would change it.")
+        return None
+    if "ot_tlora_min_rank" in metadata:
+        return int(metadata["ot_tlora_min_rank"])
+    if not config:
         return None
     if not config.get("tlora", False):
         logging.warning("OneTrainer T-LoRA: this LoRA was trained without T-LoRA; the rank mask will change it.")

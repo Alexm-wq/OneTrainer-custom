@@ -145,6 +145,16 @@ class ComfyTLoRACoreTest(unittest.TestCase):
         self.assertEqual(core.file_min_rank({"ot_config": json.dumps({"tlora": True, "tlora_min_rank": 4})}), 4)
         self.assertIsNone(core.file_min_rank({"ot_config": json.dumps({"tlora": False})}))
         self.assertIsNone(core.file_min_rank(None))
+        # A gradient-only T-LoRA is a plain LoRA: no mask at inference.
+        model.train_config.tlora_gradient_only = True
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "tlora.safetensors")
+            MOSSImageLoRASaver().save(model, ModelFormat.COMFY_LORA, path, torch.float32)
+            with safe_open(path, "pt") as file:
+                metadata = file.metadata()
+        self.assertEqual(metadata["ot_tlora_gradient_only"], "True")
+        self.assertIsNone(core.file_min_rank(metadata))
+        self.assertIsNone(core.file_min_rank({"ot_config": json.dumps({"tlora": True, "tlora_gradient_only": True})}))
 
 
 if __name__ == "__main__":

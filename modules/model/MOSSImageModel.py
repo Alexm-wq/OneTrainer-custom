@@ -102,11 +102,24 @@ class MOSSImageModel(Flux2Model):
         times = times.reshape(times.shape[0], -1).mean(1) if times.ndim > 1 else times.reshape(-1)
         if batch_size is not None:
             times = times.expand(batch_size)
-        rank, min_rank = config.lora_rank, config.tlora_min_rank
+        rank, min_rank = config.lora_rank, self.tlora_min_rank()
         total = self.noise_scheduler.config.num_train_timesteps
         ranks = ((total - times) * (rank - min_rank) / total).floor().clamp(0, rank - min_rank) + min_rank
         mask = torch.arange(rank, device=times.device) < ranks[:, None]
-        self.transformer_lora.set_rank_mask(mask.float())
+        self.transformer_lora.set_rank_mask(mask.float(), gradient_only=config.tlora_gradient_only)
+
+    def tlora_min_rank(self) -> float:
+        """Gradient mode fades the mask in: the min rank falls from the full rank at T-LoRA Start to the
+        configured value at T-LoRA End. Forward mode uses the configured value from the first step."""
+        config = self.train_config
+        if not config.tlora_gradient_only:
+            return config.tlora_min_rank
+        start, end, step = config.tlora_start_step, config.tlora_end_step, self.train_progress.global_step
+        if step >= end:
+            return config.tlora_min_rank
+        if step <= start:
+            return config.lora_rank
+        return config.lora_rank - (config.lora_rank - config.tlora_min_rank) * (step - start) / (end - start)
 
     def diffusers_to_original(self):
         return None

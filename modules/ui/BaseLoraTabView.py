@@ -54,6 +54,15 @@ class BaseLoraTabView:
                                       tooltip="LoRA ranks used at pure noise. The official T-LoRA uses 1.")
                 self.components.entry(master, 5, 4, ui_state, "tlora_min_rank", required=True,
                                       extra_validate=check_range(lower=1, message="Min rank must be at least 1"))
+                self.components.label(master, 6, 3, "T-LoRA Gradient Only",
+                                      tooltip="Masked ranks keep running in the forward and only lose their gradient: what they learned at other noise levels stays, the exported LoRA needs no mask at inference (plain loaders work), and the mask can be faded in during the run. The mask ramps from no mask at T-LoRA Start to T-LoRA Min Rank at T-LoRA End (global steps). Off: the official T-LoRA, which removes the masked ranks from the forward.")
+                self.components.switch(master, 6, 4, ui_state, "tlora_gradient_only")
+                self.components.label(master, 7, 3, "T-LoRA Start / End",
+                                      tooltip="Gradient Only: global step at which the mask starts to fade in (no mask before) and the step at which it reaches T-LoRA Min Rank. Both 0: the full mask from the first step.")
+                self.components.entry(master, 7, 4, ui_state, "tlora_start_step", required=True,
+                                      extra_validate=check_range(lower=0, message="Start must not be negative"))
+                self.components.entry(master, 8, 4, ui_state, "tlora_end_step", required=True,
+                                      extra_validate=check_range(lower=0, message="End must not be negative"))
 
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:

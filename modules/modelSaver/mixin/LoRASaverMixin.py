@@ -53,8 +53,10 @@ class LoRASaverMixin(
         os.makedirs(Path(destination).parent.absolute(), exist_ok=True)
         header = self._create_safetensors_header(model, save_state_dict)
         if model.train_config is not None and model.train_config.tlora:
-            # Read by the ComfyUI T-LoRA loader in comfyui/onetrainer_tlora.
+            # Read by the ComfyUI T-LoRA loader in comfyui/onetrainer_tlora. A gradient-only mask
+            # never acted on the forward, so the file is a plain LoRA.
             header["ot_tlora_min_rank"] = str(model.train_config.tlora_min_rank)
+            header["ot_tlora_gradient_only"] = str(bool(model.train_config.tlora_gradient_only))
         save_file(save_state_dict, destination, header)
 
     # Per-format save methods. Every model is migrated to the convert() tool. KOHYA and ORIGINAL/COMFY are

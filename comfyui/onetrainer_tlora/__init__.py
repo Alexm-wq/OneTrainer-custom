@@ -42,8 +42,8 @@ class OneTrainerTLoRALoader:
         if min_rank == 0:
             min_rank = file_min_rank(metadata)
             if min_rank is None:
-                logging.warning("OneTrainer T-LoRA: no T-LoRA min rank in the file, using 1.")
-                min_rank = 1
+                raise ValueError("OneTrainer T-LoRA: this file was not trained with a forward T-LoRA mask "
+                                 "(see the log). Use ComfyUI's LoRA loader, or set min_rank explicitly.")
 
         key_map = comfy.lora.model_lora_keys_unet(model.model, {})
         loaded = comfy.lora.load_lora(comfy.lora_convert.convert_lora(lora), key_map)

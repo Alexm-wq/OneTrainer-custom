@@ -20,6 +20,32 @@ from torch import Tensor, nn
 from torch.nn import Conv2d, Dropout, Linear, Parameter
 
 
+def mask_ranks(down: Tensor, mask: Tensor, gradient_only: bool) -> Tensor:
+    """T-LoRA rank mask on a LoRA down projection's output.
+
+    Forward mode zeroes the masked ranks. Gradient mode keeps their value and cuts their
+    gradient: the down weights through the detached value, the up weights through the
+    frozen_rank_contribution below. What they learned at other noise levels stays in the output,
+    so the mask may be switched on during a run and the exported LoRA needs no mask at inference.
+    """
+    if not gradient_only or not torch.is_grad_enabled():
+        return down * mask
+    return down.detach() + (down - down.detach()) * mask
+
+
+def lora_up_masked(up: nn.Module, hidden: Tensor, mask: Tensor | None, gradient_only: bool) -> Tensor:
+    """LoRA up projection whose masked ranks, in gradient mode, do not train the up weights either.
+
+    The masked ranks' contribution is computed with a detached copy of the up weight: same
+    output, no gradient into the up columns of those ranks.
+    """
+    if mask is None or not gradient_only or not torch.is_grad_enabled():
+        return up(hidden)
+    active = up(hidden * mask)
+    frozen = F.linear(hidden * (1 - mask), up.weight.detach())
+    return active + frozen
+
+
 class PeftBase(nn.Module):
     is_applied: bool
     orig_forward: Any | None
@@ -553,6 +579,8 @@ class LoRAModule(PeftBase):
         self.lora_up = None
         # T-LoRA: [B, rank] mask over the rank components, set per forward by LoRAModuleWrapper.set_rank_mask.
         self.rank_mask = None
+        # Gradient mode: masked ranks still run in the forward but receive no gradient.
+        self.rank_mask_gradient_only = False
 
         if orig_module is not None:
             self.initialize_weights()
@@ -575,6 +603,7 @@ class LoRAModule(PeftBase):
         if isinstance(self.orig_module, BaseLinearSVD):
             return self.orig_module.forward_with_lora(
                 x, self.lora_down, self.lora_up, self.dropout, self.alpha, rank_mask=self.rank_mask,
+                rank_mask_gradient_only=self.rank_mask_gradient_only,
             )
 
         return self.orig_forward(x) + self.delta_forward(x, *args, **kwargs)
@@ -582,9 +611,14 @@ class LoRAModule(PeftBase):
     def delta_forward(self, x, *args, **kwargs) -> Tensor | None:
         self.check_initialized()
         down = self.lora_down(x)
+        mask = None
         if self.rank_mask is not None:
-            down = down * self._rank_mask_for(down)
-        ld = self.lora_up(self.dropout(down))
+            mask = self._rank_mask_for(down)
+            down = mask_ranks(down, mask, self.rank_mask_gradient_only)
+        if self.op is F.conv2d:
+            ld = self.lora_up(self.dropout(down))
+        else:
+            ld = lora_up_masked(self.lora_up, self.dropout(down), mask, self.rank_mask_gradient_only)
         return ld * (self.alpha / self.rank)
 
     def _rank_mask_for(self, down: Tensor) -> Tensor:
@@ -1004,7 +1038,10 @@ class LoRAModuleWrapper:
                 raise ValueError("T-LoRA is only connected for MOSS Image, which passes its timesteps to the LoRA.")
             if not 1 <= config.tlora_min_rank <= self.rank:
                 raise ValueError(f"T-LoRA min rank must be between 1 and the LoRA rank {self.rank}.")
+            if config.tlora_gradient_only and config.tlora_start_step > config.tlora_end_step:
+                raise ValueError("T-LoRA Start must not be after T-LoRA End.")
         self._rank_mask = None
+        self._rank_mask_gradient_only = False
 
         self.fused_groups = []
         self.lora_modules = self.__create_modules(orig_module, config)
@@ -1214,26 +1251,30 @@ class LoRAModuleWrapper:
         """
         self.lora_modules = {k: v for (k, v) in self.lora_modules.items() if not isinstance(v, self.dummy_klass)}
 
-    def set_rank_mask(self, mask: Tensor | None):
+    def set_rank_mask(self, mask: Tensor | None, gradient_only: bool = False):
         """T-LoRA: limit each LoRA module to the ranks enabled in mask [B, rank] for the following forwards.
 
         A mask of the same shape is copied into the previous tensor, so compiled blocks see the new
         values without recompiling. Gradient checkpointing recomputes with the mask current at
         backward time: every forward between two backward passes must use the same timesteps
-        (Self-Flow's teacher runs without gradients, before the student).
+        (Self-Flow's teacher runs without gradients, before the student). With gradient_only the
+        masked ranks still run and only lose their gradient (see mask_ranks).
         """
         if mask is None:
             self._rank_mask = None
         elif (self._rank_mask is not None and self._rank_mask.shape == mask.shape
               and self._rank_mask.device == mask.device):
             self._rank_mask.copy_(mask)
-            return
+            if gradient_only == self._rank_mask_gradient_only:
+                return
         else:
             self._rank_mask = mask.detach().clone()
+        self._rank_mask_gradient_only = gradient_only
         for module in self.lora_modules.values():
             module = module.module if isinstance(module, FusedModuleGroup) else module
             if isinstance(module, LoRAModule):
                 module.rank_mask = self._rank_mask
+                module.rank_mask_gradient_only = gradient_only
 
     def set_dropout(self, dropout_probability: float):
         """

@@ -18,7 +18,8 @@ Replace the LoRA loader with **Load T-LoRA (OneTrainer)** (category `loaders`):
   the Kohya and Original formats work as well.
 - `strength_model`: as in ComfyUI's LoRA loader.
 - `min_rank`: `0` reads T-LoRA Min Rank from the file (OneTrainer writes it when T-LoRA is on);
-  otherwise the given value.
+  otherwise the given value. A LoRA trained with **T-LoRA Gradient Only** is a plain LoRA: use
+  ComfyUI's normal LoRA loader for it; at `0` this node refuses such a file.
 
 At each sampling step the node takes the step's noise level sigma and uses the first
 `floor((1 - sigma) * (rank - min_rank)) + min_rank` ranks, as OneTrainer does.

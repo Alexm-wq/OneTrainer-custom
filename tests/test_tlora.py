@@ -40,11 +40,13 @@ class TLoRATest(unittest.TestCase):
         self.mm.start()
         self.addCleanup(self.mm.stop)
 
-    def _setup(self, compile=False, rank=8, min_rank=1, model=None, tlora=True):
+    def _setup(self, compile=False, rank=8, min_rank=1, model=None, tlora=True, gradient_only=False,
+               start=0, end=0):
         model = model or tiny_model()
         config = train_config()
         config.lora_rank, config.lora_alpha = rank, rank
         config.tlora, config.tlora_min_rank = tlora, min_rank
+        config.tlora_gradient_only, config.tlora_start_step, config.tlora_end_step = gradient_only, start, end
         config.compile = compile
         model.train_config = config
         setup = create.create_model_setup(
@@ -92,6 +94,44 @@ class TLoRATest(unittest.TestCase):
             self.assertEqual(module.lora_down.weight.grad[1:].abs().sum().item(), 0.0)
             self.assertEqual(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
             self.assertGreater(module.lora_up.weight.grad[:, 0].abs().sum().item(), 0.0)
+
+    def test_gradient_only_keeps_the_forward_and_cuts_the_gradient(self):
+        for svd in (False, True):
+            with self.subTest(svd=svd):
+                base = self._svd_model() if svd else tiny_model()
+                model, config, setup = self._setup(model=copy.deepcopy(base), gradient_only=True)
+                plain, plain_config, _ = self._setup(model=base, tlora=False)
+                plain.transformer_lora.load_state_dict(model.transformer_lora.state_dict())
+                batch = self._batch()
+                torch.manual_seed(2)
+                output = self._predict(model, config, setup, batch, [999])  # pure noise: only rank 1 trains
+                torch.manual_seed(2)
+                expected = self._predict(plain, plain_config, setup, batch, [999])["predicted"]
+                # The forward is that of an unmasked LoRA: every rank contributes.
+                torch.testing.assert_close(output["predicted"], expected)
+                setup.calculate_loss(model, batch, output, config).backward()
+                for module in model.transformer_lora.lora_modules.values():
+                    self.assertEqual(module.lora_down.weight.grad[1:].abs().sum().item(), 0.0)
+                    self.assertEqual(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
+                    self.assertGreater(module.lora_up.weight.grad[:, 0].abs().sum().item(), 0.0)
+
+    def test_gradient_only_mask_fades_in_between_start_and_end(self):
+        model, config, _ = self._setup(rank=8, min_rank=2, gradient_only=True, start=100, end=300)
+        expected = {0: 8, 100: 8, 200: 5, 300: 2, 1000: 2}
+        for step, min_rank in expected.items():
+            model.train_progress = TrainProgress(global_step=step)
+            self.assertEqual(model.tlora_min_rank(), min_rank)
+            model.set_tlora_timestep(torch.tensor([1000.0, 1.0]))  # pure noise, nearly clean
+            counts = model.transformer_lora._rank_mask.sum(1).tolist()
+            self.assertEqual(counts[0], float(min_rank))
+            self.assertEqual(counts[1], float(_official_rank(1.0, 8, min_rank)))
+        self.assertTrue(all(m.rank_mask_gradient_only for m in model.transformer_lora.lora_modules.values()))
+        # Forward mode ignores the schedule.
+        forward, forward_config, _ = self._setup(rank=8, min_rank=2, start=100, end=300)
+        forward.train_progress = TrainProgress(global_step=0)
+        self.assertEqual(forward.tlora_min_rank(), 2)
+        with self.assertRaisesRegex(ValueError, "Start must not be after"):
+            self._setup(gradient_only=True, start=300, end=100)
 
     def test_svd_quantized_layers_mask_only_the_lora_ranks(self):
         model, config, setup = self._setup(model=self._svd_model())
@@ -249,7 +289,7 @@ class TLoRATest(unittest.TestCase):
                 train_config=SimpleNamespace(model_type=model_type), get_lora_weight_dtypes=list,
             )
             BaseLoraTabView(components).build_lora_options(None, controller, None, PeftType.LORA)
-            self.assertEqual("T-LoRA" in labels and "T-LoRA Min Rank" in labels, shown)
+            self.assertEqual({"T-LoRA", "T-LoRA Min Rank", "T-LoRA Gradient Only", "T-LoRA Start / End"} <= set(labels), shown)
 
 
 if __name__ == "__main__":

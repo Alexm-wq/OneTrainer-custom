@@ -639,6 +639,9 @@ class TrainConfig(BaseConfig):
     # T-LoRA: fewer LoRA ranks at noisier timesteps (MOSS Image)
     tlora: bool
     tlora_min_rank: int
+    tlora_gradient_only: bool
+    tlora_start_step: int
+    tlora_end_step: int
     bundle_additional_embeddings: bool
 
     # oft
@@ -1397,6 +1400,9 @@ class TrainConfig(BaseConfig):
         data.append(("lora_weight_dtype", DataType.FLOAT_32, DataType, False))
         data.append(("tlora", False, bool, False))
         data.append(("tlora_min_rank", 1, int, False))
+        data.append(("tlora_gradient_only", False, bool, False))
+        data.append(("tlora_start_step", 0, int, False))
+        data.append(("tlora_end_step", 0, int, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 
         # oft
