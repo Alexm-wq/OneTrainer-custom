@@ -481,6 +481,7 @@ OPTIMIZER_DEFAULT_PARAMETERS = {
         "orthogonal_gradient": 'disabled',
         "spectral_normalization": False,
         "d0": 1e-5,
+        "d_floor": 1e-5,
         "d_coef": 1.0,
         "growth_rate": 1.05,
         "beta3": 0.999,

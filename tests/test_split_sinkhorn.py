@@ -93,7 +93,7 @@ class SplitSinkhornTest(unittest.TestCase):
                 parameter = nn.Parameter(torch.zeros(12, 4))
                 setattr(parameter, SINKHORN_CHUNKS, parts)
                 optimizer = SinkSGDAdaptive(
-                    [parameter], d0=1e-3, growth_rate=1.0, agreement_threshold=0.0, state_precision="fp32",
+                    [parameter], d0=1e-3, d_floor=1e-3, growth_rate=1.0, agreement_threshold=0.0, state_precision="fp32",
                 )
                 parameter.grad = grad.clone()
                 optimizer.step()

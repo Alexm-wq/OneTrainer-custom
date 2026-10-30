@@ -23,9 +23,11 @@ on CPU, on a small overfitting toy problem and in MOSS Image LoRA runs.
   rate decay driven by the training itself. Leave the learning rate at 1.0, as with Prodigy.
   `D Coefficient` is 1.0, as in Prodigy: on a MOSS Image LoRA (batch 1), 0.1 kept the step
   near 1e-6 and nothing was learned, while 1.0 with the validation brake off trained well.
-  `Initial D` (1e-5) is also the lowest step size. With noisy diffusion gradients the estimate
-  rises slowly, often over a few hundred steps; a higher `Initial D` near the lower end of the
-  learning rates that work with plain SinkSGD shortens that ramp.
+  `D Floor` (1e-5) is the lowest step size. `Initial D` (1e-5) is the start: with noisy
+  diffusion gradients the estimate rises slowly, often over a few hundred steps. To start with
+  large steps that then decay, set `Initial D` to a learning rate that learns fast with plain
+  SinkSGD (e.g. 5e-4), keep `D Floor` low (1e-5) and lower `D Shrink` to 0.001–0.002: D then
+  approaches the estimate over roughly 1/`D Shrink` steps (0.01 takes only a few hundred).
   TensorBoard's `lr/...` shows the effective rate, `sinksgd_adaptive/d/...` the estimate.
 - **Agreement mask:** memorizing single images produces gradients that differ from image to
   image; the features of a concept point the same way across images. Update entries on which

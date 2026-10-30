@@ -97,6 +97,22 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         self.assertLess(group["d"], group["d_max"])
         self.assertGreaterEqual(group["d"], 0.25 * group["d_max"] * (1 - 1e-6))
 
+    def test_high_initial_d_decays_towards_its_floor(self):
+        parameter = nn.Parameter(torch.zeros(8, 8))
+        optimizer = SinkSGDAdaptive([parameter], d0=1e-2, d_floor=1e-4, d_shrink=0.05, agreement_threshold=0.0)
+        group = optimizer.param_groups[0]
+        steps = []
+        for _ in range(300):
+            parameter.grad = torch.randn(8, 8)
+            optimizer.step()
+            steps.append(group["d"])
+        # Pure noise: no progress, so the large initial step decays, but not below the floor.
+        self.assertLess(steps[50], 0.5 * 1e-2)
+        self.assertLess(steps[-1], 1e-3)
+        self.assertGreaterEqual(min(steps), 1e-4)
+        with self.assertRaisesRegex(ValueError, "D Floor"):
+            SinkSGDAdaptive([parameter], d0=1e-5, d_floor=1e-4)
+
     def test_agreement_mask_damps_noise_but_not_consistent_gradients(self):
         def moved(gradients, precision):
             parameter = nn.Parameter(torch.zeros(16, 16))
@@ -282,6 +298,7 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         self.assertIsInstance(optimizer, SinkSGDAdaptive)
         group = optimizer.param_groups[0]
         self.assertEqual((group["growth_rate"], group["d_coef"], group["agreement_threshold"]), (1.05, 1.0, 0.2))
+        self.assertEqual((group["d0"], group["d_floor"]), (1e-5, 1e-5))
         self.assertEqual((group["slice_p"], group["state_precision"]), (11, "bf16_sr"))
         self.assertEqual((group["normed_momentum"], group["momentum_renorm"], group["tlora_aware"]), (True, True, True))
         self.assertEqual((group["nesterov"], group["spectral_normalization"], group["orthogonal_gradient"]), (False, False, "disabled"))

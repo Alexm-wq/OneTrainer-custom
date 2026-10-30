@@ -730,6 +730,7 @@ def create_optimizer(
                 state_precision=optimizer_config.state_precision if optimizer_config.state_precision not in (None, "auto") else "bf16_sr",
                 compiled_optimizer=optimizer_config.compile if optimizer_config.compile is not None else False,
                 d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-5,
+                d_floor=optimizer_config.d_floor if optimizer_config.d_floor is not None else 1e-5,
                 d_coef=optimizer_config.d_coef if optimizer_config.d_coef is not None else 1.0,
                 growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else 1.05,
                 beta3=optimizer_config.beta3 if optimizer_config.beta3 is not None else 0.999,

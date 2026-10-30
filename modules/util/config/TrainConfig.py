@@ -151,6 +151,7 @@ class TrainOptimizerConfig(BaseConfig):
     snr_cond: False
     geometric_wd: False
     d_shrink: float
+    d_floor: float
     d_min_ratio: float
     agreement_threshold: float
     drift_budget: float
@@ -301,6 +302,7 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("sinkhorn_iterations", None, int, True))
         data.append(("normed_momentum", False, bool, False))
         data.append(("d_shrink", None, float, True))
+        data.append(("d_floor", None, float, True))
         data.append(("d_min_ratio", None, float, True))
         data.append(("agreement_threshold", None, float, True))
         data.append(("drift_budget", None, float, True))

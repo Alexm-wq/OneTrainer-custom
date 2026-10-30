@@ -8,7 +8,8 @@ rounding. On top of that:
 - Distance estimation (Prodigy): the step size is lr * d, where d estimates the distance to the
   solution from <g, x0 - x> over the accumulated gradients, with the L1 norm in the denominator
   that suits normalized (sign-like) updates. d may shrink again by ``d_shrink`` once the estimate
-  falls, but not below ``d_min_ratio`` times its maximum.
+  falls, but not below ``d_floor`` or ``d_min_ratio`` times its maximum. A high ``d0`` with a
+  low ``d_floor`` starts with large steps that then decay.
 - Momentum renormalization: with normalization then momentum, the momentum is normalized once
   more (``momentum_renorm``), as in the first version of this optimizer.
 - Agreement mask: entries whose momentum is small against the momentum of their magnitudes, i.e.
@@ -65,6 +66,7 @@ class SinkSGDAdaptive(SinkSGD_adv):
             state_precision: str = "bf16_sr",
             compiled_optimizer: bool = False,
             d0: float = 1e-5,
+            d_floor: float = 1e-5,
             d_coef: float = 1.0,
             growth_rate: float = 1.05,
             beta3: float = 0.999,
@@ -86,6 +88,8 @@ class SinkSGDAdaptive(SinkSGD_adv):
             raise ValueError("The agreement mask compares momenta; it needs momentum > 0.")
         if not 0.0 <= d_shrink <= 1.0 or not 0.0 <= d_min_ratio <= 1.0:
             raise ValueError("d_shrink and d_min_ratio must be in [0, 1].")
+        if not 0.0 < d_floor <= d0:
+            raise ValueError(f"D Floor must be positive and at most Initial D, got {d_floor} and {d0}.")
         if drift_budget < 0.0:
             raise ValueError("drift_budget must not be negative.")
         if slice_p < 1:
@@ -102,7 +106,7 @@ class SinkSGDAdaptive(SinkSGD_adv):
         )
         adaptive = {
             "momentum_renorm": momentum_renorm, "compiled_optimizer": compiled_optimizer,
-            "d": d0, "d0": d0, "d_max": d0, "d_coef": d_coef, "growth_rate": growth_rate,
+            "d": d0, "d0": d0, "d_floor": d_floor, "d_max": d_floor, "d_coef": d_coef, "growth_rate": growth_rate,
             "beta3": beta3, "d_numerator": 0.0, "d_shrink": d_shrink, "d_min_ratio": d_min_ratio,
             "agreement_threshold": agreement_threshold, "drift_budget": drift_budget,
             "drift": 0.0, "brake": 1.0, "alignment": None,
@@ -158,7 +162,7 @@ class SinkSGDAdaptive(SinkSGD_adv):
         for group_index, (sums, count, weight) in self._pending.items():
             group = self.param_groups[group_index]
             dot, denominator, drift_squared = sums.tolist()
-            d, d0, beta3 = group["d"], group["d0"], group["beta3"]
+            d, beta3 = group["d"], group["beta3"]
             numerator = group["d_numerator"] * beta3 + weight * dot
             group["d_numerator"] = numerator
             group["drift"] = math.sqrt(drift_squared / max(count, 1))
@@ -173,7 +177,7 @@ class SinkSGDAdaptive(SinkSGD_adv):
                     group["d"] = min(estimate, d * group["growth_rate"])
             else:
                 # Shrinking acts as a learning rate decay once progress stalls; the floor keeps training alive.
-                floor = max(d0, group["d_min_ratio"] * group["d_max"])
+                floor = max(group["d_floor"], group["d_min_ratio"] * group["d_max"])
                 group["d"] = max(floor, d - group["d_shrink"] * (d - estimate))
         self._pending.clear()
         self._stepped.clear()
