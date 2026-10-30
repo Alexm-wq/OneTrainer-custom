@@ -111,9 +111,11 @@ upstream) at pure noise. Each sample of a batch gets its own mask.
 - Plain LoRA only: DoRA, LoHa, LoKr and OFT are rejected, as is any model other than
   MOSS Image. On SVDQuant layers only the LoRA ranks are masked, not the SVD residual.
 - **T-LoRA Gradient Only** keeps the masked ranks in the forward and cuts only their gradient.
-  What a rank learned at other noise levels stays in the output, so the mask can be faded in
-  during a run: no mask before **T-LoRA Start**, the full mask (T-LoRA Min Rank) from
-  **T-LoRA End** on, linear in between (global steps; both 0 masks from the first step).
+  What a rank learned at other noise levels stays in the output, so the mask can change during
+  a run: **T-LoRA Schedule** gives the min rank as `epoch:percent of the rank` points, linear in
+  between (fractional epochs too). `0:100, 3:80, 10:20` keeps every rank at the start, eases to
+  80 % by epoch 3, then closes to 20 % by epoch 10 and stays there. While set it replaces
+  T-LoRA Min Rank; empty, Min Rank holds from the first step. It needs Gradient Only.
   Several concepts in one LoRA can then use every rank at high noise while they are learned,
   before memorization of single layouts is cut off. The exported LoRA is a plain LoRA that
   needs no mask at inference, in ComfyUI's normal loader as in OneTrainer's samples. The upstream SDXL variant's orthogonal initialization

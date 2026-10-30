@@ -13,6 +13,7 @@ from modules.util.enum.ModelType import PeftType
 from modules.util.lokr_utils import factorization, make_kron, rebuild_tucker
 from modules.util.ModuleFilter import ModuleFilter
 from modules.util.quantization_util import get_unquantized_weight, get_weight_shape
+from modules.util.tlora_schedule import parse_tlora_schedule
 
 import torch
 import torch.nn.functional as F
@@ -1038,8 +1039,11 @@ class LoRAModuleWrapper:
                 raise ValueError("T-LoRA is only connected for MOSS Image, which passes its timesteps to the LoRA.")
             if not 1 <= config.tlora_min_rank <= self.rank:
                 raise ValueError(f"T-LoRA min rank must be between 1 and the LoRA rank {self.rank}.")
-            if config.tlora_gradient_only and config.tlora_start_step > config.tlora_end_step:
-                raise ValueError("T-LoRA Start must not be after T-LoRA End.")
+            if config.tlora_schedule.strip():
+                if not config.tlora_gradient_only:
+                    raise ValueError("T-LoRA Schedule needs T-LoRA Gradient Only: a forward mask switched on "
+                                     "during the run would remove what the masked ranks learned before.")
+                parse_tlora_schedule(config.tlora_schedule)
         self._rank_mask = None
         self._rank_mask_gradient_only = False
 

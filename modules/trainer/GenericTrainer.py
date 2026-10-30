@@ -1684,6 +1684,7 @@ class GenericTrainer(BaseTrainer):
                 )
 
             current_epoch_length = self.data_loader.get_data_set().approximate_length()
+            self.model.epoch_length = current_epoch_length
 
             batches = self.data_loader.get_data_loader()
             if self.config.prefetch_next_batch:

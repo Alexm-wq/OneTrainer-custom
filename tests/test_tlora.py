@@ -18,6 +18,7 @@ from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.optimizer_util import change_optimizer
 from modules.util.quantization_util import replace_linear_with_quantized_layers
+from modules.util.tlora_schedule import parse_tlora_schedule
 from modules.util.TrainProgress import TrainProgress
 
 import torch
@@ -41,12 +42,12 @@ class TLoRATest(unittest.TestCase):
         self.addCleanup(self.mm.stop)
 
     def _setup(self, compile=False, rank=8, min_rank=1, model=None, tlora=True, gradient_only=False,
-               start=0, end=0):
+               schedule=""):
         model = model or tiny_model()
         config = train_config()
         config.lora_rank, config.lora_alpha = rank, rank
         config.tlora, config.tlora_min_rank = tlora, min_rank
-        config.tlora_gradient_only, config.tlora_start_step, config.tlora_end_step = gradient_only, start, end
+        config.tlora_gradient_only, config.tlora_schedule = gradient_only, schedule
         config.compile = compile
         model.train_config = config
         setup = create.create_model_setup(
@@ -115,23 +116,26 @@ class TLoRATest(unittest.TestCase):
                     self.assertEqual(module.lora_up.weight.grad[:, 1:].abs().sum().item(), 0.0)
                     self.assertGreater(module.lora_up.weight.grad[:, 0].abs().sum().item(), 0.0)
 
-    def test_gradient_only_mask_fades_in_between_start_and_end(self):
-        model, config, _ = self._setup(rank=8, min_rank=2, gradient_only=True, start=100, end=300)
-        expected = {0: 8, 100: 8, 200: 5, 300: 2, 1000: 2}
-        for step, min_rank in expected.items():
-            model.train_progress = TrainProgress(global_step=step)
-            self.assertEqual(model.tlora_min_rank(), min_rank)
-            model.set_tlora_timestep(torch.tensor([1000.0, 1.0]))  # pure noise, nearly clean
-            counts = model.transformer_lora._rank_mask.sum(1).tolist()
-            self.assertEqual(counts[0], float(min_rank))
-            self.assertEqual(counts[1], float(_official_rank(1.0, 8, min_rank)))
+    def test_gradient_only_follows_the_epoch_schedule(self):
+        model, config, _ = self._setup(rank=10, min_rank=1, gradient_only=True, schedule="0:100, 3:80, 10:20")
+        model.epoch_length = 100
+        # (epoch, epoch step) -> min rank in ranks of 10: 100 % -> 80 % by epoch 3 -> 20 % by epoch 10.
+        expected = {(0, 0): 10, (1, 50): 9, (3, 0): 8, (6, 50): 5, (10, 0): 2, (25, 0): 2}
+        for (epoch, step), min_rank in expected.items():
+            model.train_progress = TrainProgress(epoch=epoch, epoch_step=step)
+            self.assertAlmostEqual(model.tlora_min_rank(), min_rank)
+        model.train_progress = TrainProgress(epoch=6, epoch_step=50)
+        model.set_tlora_timestep(torch.tensor([1000.0, 1.0]))  # pure noise, nearly clean
+        self.assertEqual(model.transformer_lora._rank_mask.sum(1).tolist(), [5.0, 9.0])
         self.assertTrue(all(m.rank_mask_gradient_only for m in model.transformer_lora.lora_modules.values()))
-        # Forward mode ignores the schedule.
-        forward, forward_config, _ = self._setup(rank=8, min_rank=2, start=100, end=300)
-        forward.train_progress = TrainProgress(global_step=0)
-        self.assertEqual(forward.tlora_min_rank(), 2)
-        with self.assertRaisesRegex(ValueError, "Start must not be after"):
-            self._setup(gradient_only=True, start=300, end=100)
+        # Without a schedule, or in forward mode, T-LoRA Min Rank holds.
+        plain, _, _ = self._setup(rank=10, min_rank=3, gradient_only=True)
+        self.assertEqual(plain.tlora_min_rank(), 3)
+        with self.assertRaisesRegex(ValueError, "needs T-LoRA Gradient Only"):
+            self._setup(schedule="0:100, 3:20")
+        for broken in ("0:100, 0:50", "1:0", "3-80"):
+            with self.subTest(broken), self.assertRaisesRegex(ValueError, "T-LoRA Schedule"):
+                parse_tlora_schedule(broken)
 
     def test_svd_quantized_layers_mask_only_the_lora_ranks(self):
         model, config, setup = self._setup(model=self._svd_model())
@@ -289,7 +293,7 @@ class TLoRATest(unittest.TestCase):
                 train_config=SimpleNamespace(model_type=model_type), get_lora_weight_dtypes=list,
             )
             BaseLoraTabView(components).build_lora_options(None, controller, None, PeftType.LORA)
-            self.assertEqual({"T-LoRA", "T-LoRA Min Rank", "T-LoRA Gradient Only", "T-LoRA Start / End"} <= set(labels), shown)
+            self.assertEqual({"T-LoRA", "T-LoRA Min Rank", "T-LoRA Gradient Only", "T-LoRA Schedule"} <= set(labels), shown)
 
 
 if __name__ == "__main__":

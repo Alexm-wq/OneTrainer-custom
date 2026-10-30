@@ -90,6 +90,8 @@ class BaseModel(metaclass=ABCMeta):
         self.param_group_mapping = None
         self.ema_state_dict = None
         self.train_progress = TrainProgress()
+        # Batches per epoch of the running training, set by the trainer; for epoch-based schedules.
+        self.epoch_length = None
         self.model_spec = None
         self.train_config = None
         self.embedding_state_dicts = {}

@@ -640,8 +640,7 @@ class TrainConfig(BaseConfig):
     tlora: bool
     tlora_min_rank: int
     tlora_gradient_only: bool
-    tlora_start_step: int
-    tlora_end_step: int
+    tlora_schedule: str
     bundle_additional_embeddings: bool
 
     # oft
@@ -1401,8 +1400,7 @@ class TrainConfig(BaseConfig):
         data.append(("tlora", False, bool, False))
         data.append(("tlora_min_rank", 1, int, False))
         data.append(("tlora_gradient_only", False, bool, False))
-        data.append(("tlora_start_step", 0, int, False))
-        data.append(("tlora_end_step", 0, int, False))
+        data.append(("tlora_schedule", "", str, False))
         data.append(("bundle_additional_embeddings", True, bool, False))
 
         # oft

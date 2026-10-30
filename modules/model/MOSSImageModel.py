@@ -6,6 +6,7 @@ from modules.module.moss.pipeline_moss_image import MOSSImagePipeline
 from modules.module.SelfFlow import SelfFlowEMA, SelfFlowProjector
 from modules.util.enum.DataType import DataType
 from modules.util.moss_layout import is_layout
+from modules.util.tlora_schedule import parse_tlora_schedule, scheduled_min_rank
 
 import torch
 
@@ -104,22 +105,20 @@ class MOSSImageModel(Flux2Model):
             times = times.expand(batch_size)
         rank, min_rank = config.lora_rank, self.tlora_min_rank()
         total = self.noise_scheduler.config.num_train_timesteps
-        ranks = ((total - times) * (rank - min_rank) / total).floor().clamp(0, rank - min_rank) + min_rank
+        # A scheduled min rank may be fractional; for whole numbers this is the official schedule.
+        ranks = ((total - times) * (rank - min_rank) / total + min_rank).floor().clamp(1, rank)
         mask = torch.arange(rank, device=times.device) < ranks[:, None]
         self.transformer_lora.set_rank_mask(mask.float(), gradient_only=config.tlora_gradient_only)
 
     def tlora_min_rank(self) -> float:
-        """Gradient mode fades the mask in: the min rank falls from the full rank at T-LoRA Start to the
-        configured value at T-LoRA End. Forward mode uses the configured value from the first step."""
+        """Gradient mode may follow T-LoRA Schedule (percent of the rank per epoch); otherwise the
+        configured T-LoRA Min Rank holds from the first step."""
         config = self.train_config
-        if not config.tlora_gradient_only:
+        if not config.tlora_gradient_only or not config.tlora_schedule.strip():
             return config.tlora_min_rank
-        start, end, step = config.tlora_start_step, config.tlora_end_step, self.train_progress.global_step
-        if step >= end:
-            return config.tlora_min_rank
-        if step <= start:
-            return config.lora_rank
-        return config.lora_rank - (config.lora_rank - config.tlora_min_rank) * (step - start) / (end - start)
+        progress = self.train_progress
+        epoch = progress.epoch + (progress.epoch_step / self.epoch_length if self.epoch_length else 0.0)
+        return scheduled_min_rank(parse_tlora_schedule(config.tlora_schedule), epoch, config.lora_rank)
 
     def diffusers_to_original(self):
         return None

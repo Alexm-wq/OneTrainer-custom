@@ -1,7 +1,16 @@
 
 from modules.util import path_util
 from modules.util.enum.ModelType import PeftType
+from modules.util.tlora_schedule import parse_tlora_schedule
 from modules.util.ui.validation_helpers import check_range
+
+
+def _check_tlora_schedule(value: str) -> str | None:
+    try:
+        parse_tlora_schedule(value)
+    except ValueError as error:
+        return str(error)
+    return None
 
 
 class BaseLoraTabView:
@@ -55,14 +64,11 @@ class BaseLoraTabView:
                 self.components.entry(master, 5, 4, ui_state, "tlora_min_rank", required=True,
                                       extra_validate=check_range(lower=1, message="Min rank must be at least 1"))
                 self.components.label(master, 6, 3, "T-LoRA Gradient Only",
-                                      tooltip="Masked ranks keep running in the forward and only lose their gradient: what they learned at other noise levels stays, the exported LoRA needs no mask at inference (plain loaders work), and the mask can be faded in during the run. The mask ramps from no mask at T-LoRA Start to T-LoRA Min Rank at T-LoRA End (global steps). Off: the official T-LoRA, which removes the masked ranks from the forward.")
+                                      tooltip="Masked ranks keep running in the forward and only lose their gradient: what they learned at other noise levels stays, and the exported LoRA needs no mask at inference (plain loaders work). This also allows T-LoRA Schedule. Off: the official T-LoRA, which removes the masked ranks from the forward.")
                 self.components.switch(master, 6, 4, ui_state, "tlora_gradient_only")
-                self.components.label(master, 7, 3, "T-LoRA Start / End",
-                                      tooltip="Gradient Only: global step at which the mask starts to fade in (no mask before) and the step at which it reaches T-LoRA Min Rank. Both 0: the full mask from the first step.")
-                self.components.entry(master, 7, 4, ui_state, "tlora_start_step", required=True,
-                                      extra_validate=check_range(lower=0, message="Start must not be negative"))
-                self.components.entry(master, 8, 4, ui_state, "tlora_end_step", required=True,
-                                      extra_validate=check_range(lower=0, message="End must not be negative"))
+                self.components.label(master, 7, 3, "T-LoRA Schedule",
+                                      tooltip="Gradient Only: the min rank over the run, as 'epoch:percent of the rank' points, linear in between, e.g. '0:100, 3:80, 10:20': no mask at the start, 80 % at epoch 3, 20 % from epoch 10 on. Replaces T-LoRA Min Rank while set. Empty: T-LoRA Min Rank from the first step.")
+                self.components.entry(master, 7, 4, ui_state, "tlora_schedule", extra_validate=_check_tlora_schedule)
 
         # LoRA and LoHA shared settings
         if peft_type == PeftType.LORA or peft_type == PeftType.LOHA:
