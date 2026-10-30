@@ -153,8 +153,9 @@ class SinkSGDCurvature(SinkSGDAdaptive):
             ratio = slope / (group["last_step"] * curvature) - group["slope_target"]
             target = d * math.exp(group["gain"] * math.tanh(ratio))
         else:
-            # No usable curvature: follow the sign of the remaining slope.
-            target = d * (group["growth_rate"] if slope > 0.0 else group["decay_rate"])
+            # Negative curvature, e.g. at the saddle a LoRA starts in (up = 0): no parabola to step
+            # to, so follow the sign of the remaining slope, as gently as the controller does.
+            target = d * math.exp(group["gain"] if slope > 0.0 else -group["gain"])
         target = min(max(target, group["d_floor"]), group["d_ceiling"])
         group["d"] = min(max(target, d * group["decay_rate"]), d * group["growth_rate"])
 

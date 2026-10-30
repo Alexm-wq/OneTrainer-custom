@@ -20,7 +20,9 @@ model, not yet on real diffusion training.
   worth) and shrinks below it, by at most `Controller Gain` (1 % in log space) per step. With
   momentum, each step keeps acting for about 20 steps; a direct Newton step on the step size
   therefore oscillated, and a slow controller with fast measurements (slope averaged over about
-  20 steps, curvature over 5 measurements) did not.
+  20 steps, curvature over 5 measurements) did not. While the measured curvature is negative,
+  as at the saddle a LoRA starts in (up = 0), the step size follows the sign of the slope at the
+  same rate.
 
 While the loss falls steeply the step size rises; once the remaining slope is gradient noise, it
 falls on its own. Leave the learning rate at 1.0; it multiplies the step. TensorBoard shows the
@@ -32,7 +34,7 @@ step size as `lr/...` and `sinksgd_curvature/step`, `/slope` and `/curvature`.
 |---|---|---|
 | Initial D | 1e-5 | step size until 3 curvature measurements exist |
 | D Floor / D Ceiling | 1e-6 / 1e-2 | limits; keep the ceiling well above where it settles, a ceiling it keeps hitting distorts the control |
-| Growth Rate / Decay Rate | 1.1 / 0.95 | largest change per step |
+| Growth Rate / Decay Rate | 1.1 / 0.95 | outer limits per step; the controller itself changes by at most 1 % |
 | Controller Gain | 0.01 | how fast the step size follows the slope |
 | Slope Target | 0.25 | 0 steps to the bottom of the local parabola |
 | Curvature Interval | 10 | one extra forward and backward pass per measurement: about 10 % more time |
