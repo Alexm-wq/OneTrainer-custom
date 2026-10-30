@@ -108,6 +108,7 @@ class Optimizer(Enum):
             self.ADOPT_ADV,
             self.LION_ADV,
             self.SINKSGD_ADV,
+            self.SINKSGD_ADAPTIVE,
             self.SIGNSGD_ADV,
             self.PRODIGY_ADV,
             self.MUON_ADV,
@@ -130,6 +131,7 @@ class Optimizer(Enum):
             Optimizer.ADAMUON_ADV,
             Optimizer.SIGNSGD_ADV,
             Optimizer.SINKSGD_ADV,
+            Optimizer.SINKSGD_ADAPTIVE,
         ]
 
     # Small helper for adjusting learning rates to adaptive optimizers.

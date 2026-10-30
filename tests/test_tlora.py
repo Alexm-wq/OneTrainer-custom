@@ -14,7 +14,9 @@ from modules.util.config.SampleConfig import SampleConfig
 from modules.util.config.TrainConfig import QuantizationConfig
 from modules.util.enum.DataType import DataType
 from modules.util.enum.ModelType import ModelType, PeftType
+from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TrainingMethod import TrainingMethod
+from modules.util.optimizer_util import change_optimizer
 from modules.util.quantization_util import replace_linear_with_quantized_layers
 from modules.util.TrainProgress import TrainProgress
 
@@ -201,6 +203,23 @@ class TLoRATest(unittest.TestCase):
         config.tlora = False
         model.set_tlora_timestep(torch.tensor([1000.0]))
         self.assertTrue(all(module.rank_mask is None for module in model.transformer_lora.lora_modules.values()))
+
+    def test_sinksgd_adaptive_leaves_the_masked_ranks_untouched(self):
+        model, config, setup = self._setup()
+        config.optimizer.optimizer = Optimizer.SINKSGD_ADAPTIVE
+        config.optimizer = change_optimizer(config)
+        config.learning_rate = 1.0
+        optimizer = create.create_optimizer(setup.create_parameters(model, config), None, config, model)
+        loras = list(model.transformer_lora.lora_modules.values())
+        before = [(m.lora_down.weight.detach().clone(), m.lora_up.weight.detach().clone()) for m in loras]
+        batch = self._batch()
+        output = self._predict(model, config, setup, batch, [999])  # pure noise: only rank 1 is active
+        setup.calculate_loss(model, batch, output, config).backward()
+        optimizer.step()
+        for module, (down, up) in zip(loras, before, strict=True):
+            torch.testing.assert_close(module.lora_down.weight.detach()[1:], down[1:], rtol=0, atol=0)
+            torch.testing.assert_close(module.lora_up.weight.detach()[:, 1:], up[:, 1:], rtol=0, atol=0)
+            self.assertFalse(torch.equal(module.lora_up.weight.detach()[:, 0], up[:, 0]))
 
     def test_rejects_unsupported_combinations(self):
         model = tiny_model()

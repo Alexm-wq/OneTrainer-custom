@@ -10,11 +10,15 @@ from modules.util.config.TrainConfig import TrainConfig
 from modules.util.enum.ConceptType import ConceptType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
-from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive, _sinkhorn
+from modules.util.optimizer.adv_optm_util import load_adv_optimizer_state_dict
+from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive
 from modules.util.optimizer_util import change_optimizer
 
 import torch
 from torch import nn
+
+from adv_optm import SinkSGD_adv
+from adv_optm.util import param_update
 
 
 def _quadratic_steps(optimizer, parameter, target, steps):
@@ -24,14 +28,51 @@ def _quadratic_steps(optimizer, parameter, target, steps):
         optimizer.step()
 
 
+def _fixed_step(**kwargs):
+    # d stays at d0: no growth, no shrinking. The step size is then d0 * lr, as a plain lr would be.
+    return {"d0": 1e-2, "growth_rate": 1.0, "d_shrink": 0.0, "agreement_threshold": 0.0, **kwargs}
+
+
 class SinkSGDAdaptiveTest(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(0)
 
-    def test_sinkhorn_normalizes_to_unit_rms(self):
-        for shape in ((32, 8), (8, 32), (64,)):
-            update = _sinkhorn(torch.randn(shape) * 7, 5)
-            self.assertAlmostEqual(update.square().mean().sqrt().item(), 1.0, delta=0.05)
+    def test_matches_sinksgd_adv_with_a_fixed_step(self):
+        # Every SinkSGD_adv option behaves as in SinkSGD_adv when d is fixed and the extras are off.
+        configs = {
+            "momentum": {"momentum": 0.9},
+            "nesterov": {"momentum": 0.9, "nesterov": True},
+            "normed momentum": {"momentum": 0.9, "normed_momentum": True},
+            "normed nesterov": {"momentum": 0.9, "normed_momentum": True, "nesterov": True, "nesterov_coef": 0.5},
+            "snr": {"momentum": 0.9, "normed_momentum": True, "snr_cond": True},
+            "spectral": {"momentum": 0.9, "spectral_normalization": True},
+            "cautious wd": {"momentum": 0.9, "weight_decay": 0.1, "cautious_wd": True},
+            "geometric wd": {"momentum": 0.9, "normed_momentum": True, "snr_cond": True, "weight_decay": 0.1, "geometric_wd": True},
+            "centered wd": {"momentum": 0.9, "centered_wd": 0.1, "centered_wd_mode": "full"},
+            "orthogonal sinkhorn": {"momentum": 0.9, "orthogonal_sinkhorn": True},
+            "orthograd": {"momentum": 0.9, "orthogonal_gradient": "flattened"},
+            "fp32 states": {"momentum": 0.9, "state_precision": "fp32"},
+            "int8 states": {"momentum": 0.9, "state_precision": "int8_sr"},
+            "factored states": {"momentum": 0.9, "state_precision": "factored"},
+        }
+        grads = [(torch.randn(12, 6), torch.randn(6)) for _ in range(3)]
+        for name, options in configs.items():
+            with self.subTest(name):
+                results = []
+                for optimizer_class, extra in ((SinkSGD_adv, {"lr": 1e-2}),
+                                               (SinkSGDAdaptive, _fixed_step(normed_momentum=False, momentum_renorm=False))):
+                    kwargs = {**extra, **options}
+                    if optimizer_class is SinkSGDAdaptive:
+                        kwargs.setdefault("state_precision", "auto")
+                    torch.manual_seed(1)
+                    weight, bias = nn.Parameter(torch.randn(12, 6)), nn.Parameter(torch.randn(6))
+                    param_update.set_seed(torch.device("cpu"))
+                    optimizer = optimizer_class([weight, bias], **kwargs)
+                    for weight_grad, bias_grad in grads:
+                        weight.grad, bias.grad = weight_grad.clone(), bias_grad.clone()
+                        optimizer.step()
+                    results.append((weight.detach().clone(), bias.detach().clone()))
+                torch.testing.assert_close(results[1], results[0])
 
     def test_distance_estimate_grows_and_converges_without_tuning(self):
         parameter = nn.Parameter(torch.zeros(16, 16))
@@ -69,7 +110,7 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
 
         consistent = [torch.ones(16, 16) + 0.1 * torch.randn(16, 16) for _ in range(50)]
         noise = [torch.randn(16, 16) for _ in range(50)]
-        for precision in ("fp32", "bf16_sr"):
+        for precision in ("fp32", "bf16_sr", "int8_sr", "factored"):
             with self.subTest(precision=precision):
                 self.assertGreater(moved(consistent, precision), 5 * moved(noise, precision))
 
@@ -79,7 +120,7 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         parameter.grad = -torch.ones(8, 8)
         optimizer.step()
         # (1 - beta) * normalized gradient: the agreement computation must not take its absolute value in place.
-        torch.testing.assert_close(optimizer.state[parameter]["momentum"], torch.full((8, 8), -0.1))
+        torch.testing.assert_close(optimizer.state[parameter]["momentum_buffer"], torch.full((8, 8), -0.1))
 
     def test_states_are_sliced_and_bf16_by_default(self):
         parameter = nn.Parameter(torch.zeros(110, 10))
@@ -87,10 +128,10 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         parameter.grad = torch.randn(110, 10)
         optimizer.step()
         state = optimizer.state[parameter]
-        self.assertEqual((state["x0"].numel(), state["s"].numel()), (100, 100))
-        self.assertEqual((state["momentum"].dtype, state["magnitude"].dtype), (torch.bfloat16, torch.bfloat16))
-        with self.assertRaisesRegex(ValueError, "state precisions"):
-            SinkSGDAdaptive([parameter], state_precision="int8_sr")
+        self.assertEqual((state["d_x0"].numel(), state["d_s"].numel()), (100, 100))
+        self.assertEqual((state["momentum_buffer"].dtype, state["magnitude"].dtype), (torch.bfloat16, torch.bfloat16))
+        with self.assertRaisesRegex(ValueError, "state_precision"):
+            SinkSGDAdaptive([parameter], state_precision="int4_sr")
 
     def test_drift_budget_stops_training(self):
         parameter = nn.Parameter(torch.zeros(8, 8))
@@ -139,16 +180,95 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         # The first step moves every entry by about d0 = 1e-3 against the gradient.
         torch.testing.assert_close(parameter.float(), torch.full((8, 8), -1e-3), rtol=0.05, atol=1e-5)
 
-    def test_state_dict_roundtrip_keeps_d_and_states(self):
-        parameter = nn.Parameter(torch.zeros(8, 8))
-        optimizer = SinkSGDAdaptive([parameter], growth_rate=1.05)
-        _quadratic_steps(optimizer, parameter, torch.randn(8, 8), 30)
+    def test_tlora_aware_steps_only_the_active_ranks(self):
+        # T-LoRA leaves ranks 2 and 3 without gradient at this noise level.
+        for tag, shape, active in (("_is_lora_B", (12, 4), (slice(None), slice(0, 2))),
+                                   ("_is_lora_A", (4, 12), (slice(0, 2), slice(None)))):
+            with self.subTest(tag):
+                full = nn.Parameter(torch.randn(shape))
+                setattr(full, tag, True)
+                start = full.detach().clone()
+                sub = nn.Parameter(start[active].clone())
+                setattr(sub, tag, True)
+                options = _fixed_step(agreement_threshold=0.2, state_precision="fp32")
+                optimizers = [SinkSGDAdaptive([full], **options), SinkSGDAdaptive([sub], **options)]
+                for _ in range(3):
+                    grad = torch.zeros(shape)
+                    grad[active] = torch.randn(start[active].shape)
+                    full.grad, sub.grad = grad, grad[active].clone()
+                    for optimizer in optimizers:
+                        optimizer.step()
+                torch.testing.assert_close(full.detach()[active], sub.detach())
+                inactive = torch.ones(shape, dtype=torch.bool)
+                inactive[active] = False
+                torch.testing.assert_close(full.detach()[inactive], start[inactive])
+                momentum = optimizers[0].state[full]["momentum_buffer"]
+                self.assertEqual(momentum[inactive].abs().sum().item(), 0.0)
+                torch.testing.assert_close(momentum[active], optimizers[1].state[sub]["momentum_buffer"])
+
+        # Switched off, the zero ranks dilute the normalization like any other entries.
+        parameter = nn.Parameter(torch.zeros(12, 4))
+        parameter._is_lora_B = True
+        optimizer = SinkSGDAdaptive([parameter], **_fixed_step(tlora_aware=False, state_precision="fp32"))
+        parameter.grad = torch.cat([torch.randn(12, 2), torch.zeros(12, 2)], 1)
+        optimizer.step()
+        self.assertNotAlmostEqual(parameter[:, :2].square().mean().sqrt().item(), 1e-2, delta=1e-4)
+
+    def test_fused_back_pass_uses_the_previous_d(self):
+        def run(fused):
+            torch.manual_seed(3)
+            parameters = [nn.Parameter(torch.randn(8, 8)), nn.Parameter(torch.randn(8, 4))]
+            optimizer = SinkSGDAdaptive(parameters, d0=1e-3, growth_rate=2.0, d_coef=10.0)
+            ds = []
+            for _ in range(4):
+                for p in parameters:
+                    p.grad = p.detach() * 2
+                    if fused:
+                        optimizer.step_parameter(p, optimizer.param_groups[0], 0)
+                        p.grad = None
+                if not fused:
+                    optimizer.step()
+                else:
+                    optimizer.step()  # no gradients left: finishes d
+                ds.append(optimizer.param_groups[0]["d"])
+            return ds, [p.detach().clone() for p in parameters]
+
+        eager_d, eager = run(False)
+        fused_d, fused = run(True)
+        self.assertGreater(eager_d[-1], 1e-3)
+        # The fused path estimates the same distances, one step later in the parameters.
+        self.assertGreater(fused_d[-1], 1e-3)
+        self.assertFalse(torch.allclose(eager[0], fused[0]))
+        self.assertTrue(SinkSGDAdaptive([nn.Parameter(torch.zeros(2))]).supports_fused_back_pass)
+
+    def test_compiled_normalization_matches_eager(self):
+        results = []
+        for compiled in (False, True):
+            torch.manual_seed(4)
+            parameter = nn.Parameter(torch.randn(16, 8))
+            optimizer = SinkSGDAdaptive([parameter], compiled_optimizer=compiled, state_precision="fp32")
+            for size in (16, 16):
+                parameter.grad = torch.randn(size, 8)
+                optimizer.step()
+            results.append(parameter.detach().clone())
+        torch.testing.assert_close(results[1], results[0], rtol=1e-5, atol=1e-7)
+
+    def test_state_dict_roundtrip_keeps_d_and_state_precisions(self):
+        parameter = nn.Parameter(torch.zeros(8, 8, dtype=torch.bfloat16))
+        optimizer = SinkSGDAdaptive([parameter], growth_rate=1.05, state_precision="int8_sr")
+        for _ in range(30):
+            parameter.grad = (parameter.detach().float() - 1).bfloat16()
+            optimizer.step()
         restored_parameter = nn.Parameter(parameter.detach().clone())
-        restored = SinkSGDAdaptive([restored_parameter])
-        restored.load_state_dict(optimizer.state_dict())
+        restored = SinkSGDAdaptive([restored_parameter], state_precision="int8_sr")
+        load_adv_optimizer_state_dict(restored, optimizer.state_dict())
         for key in ("d", "d_max", "d_numerator", "brake"):
             self.assertEqual(restored.param_groups[0][key], optimizer.param_groups[0][key])
-        torch.testing.assert_close(restored.state[restored_parameter]["momentum"], optimizer.state[parameter]["momentum"])
+        state, saved = restored.state[restored_parameter], optimizer.state[parameter]
+        for key in ("d_x0", "d_s", "momentum_buffer", "magnitude"):
+            self.assertEqual(state[key].dtype, saved[key].dtype, key)
+            torch.testing.assert_close(state[key], saved[key])
+        self.assertEqual(state["d_x0"].dtype, torch.float32)
 
     def test_created_from_config_with_defaults_and_reported_lr(self):
         config = TrainConfig.default_values()
@@ -158,15 +278,18 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         parameter = nn.Parameter(torch.zeros(4, 4))
         collection = NamedParameterGroupCollection()
         collection.add_group(NamedParameterGroup("transformer", [parameter], learning_rate=1.0))
-        optimizer = create.create_optimizer(collection, None, config)
+        optimizer = create.create_optimizer(collection, None, config, SimpleNamespace())
         self.assertIsInstance(optimizer, SinkSGDAdaptive)
         group = optimizer.param_groups[0]
         self.assertEqual((group["growth_rate"], group["d_coef"], group["agreement_threshold"]), (1.05, 1.0, 0.2))
         self.assertEqual((group["slice_p"], group["state_precision"]), (11, "bf16_sr"))
+        self.assertEqual((group["normed_momentum"], group["momentum_renorm"], group["tlora_aware"]), (True, True, True))
+        self.assertEqual((group["nesterov"], group["spectral_normalization"], group["orthogonal_gradient"]), (False, False, "disabled"))
         group["d"] = 0.01
         reported = Optimizer.SINKSGD_ADAPTIVE.maybe_adjust_lrs({"transformer": 1.0}, optimizer)
         self.assertAlmostEqual(reported["transformer"], 0.01)
-        self.assertFalse(Optimizer.SINKSGD_ADAPTIVE.supports_fused_back_pass())
+        self.assertTrue(Optimizer.SINKSGD_ADAPTIVE.supports_fused_back_pass())
+        self.assertTrue(Optimizer.SINKSGD_ADAPTIVE.is_adv)
 
     def test_validation_brake_sums_images_spread_over_concepts(self):
         model = nn.Linear(4, 2)

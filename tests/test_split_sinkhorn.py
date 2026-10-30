@@ -8,7 +8,7 @@ from modules.util.enum.ModelType import ModelType
 from modules.util.enum.Optimizer import Optimizer
 from modules.util.enum.TrainingMethod import TrainingMethod
 from modules.util.NamedParameterGroup import NamedParameterGroup, NamedParameterGroupCollection
-from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive, _sinkhorn
+from modules.util.optimizer.SinkSGDAdaptive import SinkSGDAdaptive
 from modules.util.optimizer.split_sinkhorn import (
     SINKHORN_CHUNKS,
     configure_split_sinkhorn,
@@ -100,12 +100,12 @@ class SplitSinkhornTest(unittest.TestCase):
 
                 def normalize(update, parts=parts):
                     if parts:
-                        return torch.cat([_sinkhorn(part.clone(), 5) for part in update.chunk(parts)])
-                    return _sinkhorn(update.clone(), 5)
+                        return torch.cat([apply_sr_sinkhorn(part.clone()) for part in update.chunk(parts)])
+                    return apply_sr_sinkhorn(update.clone())
 
                 # Gradient and momentum are both normalized, each part on its own.
                 momentum = 0.1 * normalize(grad)
-                torch.testing.assert_close(optimizer.state[parameter]["momentum"], momentum)
+                torch.testing.assert_close(optimizer.state[parameter]["momentum_buffer"], momentum)
                 torch.testing.assert_close(parameter.detach(), -1e-3 * normalize(momentum))
 
     def test_created_from_config_and_rejected_without_fused_layers(self):

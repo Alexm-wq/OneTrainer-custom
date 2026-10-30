@@ -158,6 +158,8 @@ class TrainOptimizerConfig(BaseConfig):
     validation_brake_batches: int
     validation_alignment_ref: float
     split_fused_sinkhorn: bool
+    momentum_renorm: bool
+    tlora_aware: bool
 
     def __init__(self, data: list[(str, Any, type, bool)]):
         super().__init__(
@@ -306,6 +308,8 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("validation_brake_batches", None, int, True))
         data.append(("validation_alignment_ref", None, float, True))
         data.append(("split_fused_sinkhorn", False, bool, False))
+        data.append(("momentum_renorm", True, bool, False))
+        data.append(("tlora_aware", True, bool, False))
         data.append(("nesterov_coef", None, float, True))
         data.append(("snr_cond", False, bool, False))
         data.append(("geometric_wd", False, bool, False))
