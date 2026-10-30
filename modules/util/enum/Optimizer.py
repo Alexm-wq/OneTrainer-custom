@@ -43,6 +43,7 @@ class Optimizer(Enum):
     SGD_8BIT = 'SGD_8BIT'
     SINKSGD_ADV = 'SINKSGD_ADV'
     SINKSGD_ADAPTIVE = 'SINKSGD_ADAPTIVE'
+    SINKSGD_CURVATURE = 'SINKSGD_CURVATURE'
     SIGNSGD_ADV = 'SIGNSGD_ADV'
 
     # Schedule-free optimizers
@@ -91,6 +92,7 @@ class Optimizer(Enum):
             self.PRODIGY_PLUS_SCHEDULE_FREE,
             self.PRODIGY_ADV,
             self.SINKSGD_ADAPTIVE,
+            self.SINKSGD_CURVATURE,
         ]
 
     @property
@@ -109,6 +111,7 @@ class Optimizer(Enum):
             self.LION_ADV,
             self.SINKSGD_ADV,
             self.SINKSGD_ADAPTIVE,
+            self.SINKSGD_CURVATURE,
             self.SIGNSGD_ADV,
             self.PRODIGY_ADV,
             self.MUON_ADV,

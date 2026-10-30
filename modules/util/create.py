@@ -743,6 +743,48 @@ def create_optimizer(
                 tlora_aware=optimizer_config.tlora_aware if optimizer_config.tlora_aware is not None else True,
             )
 
+        # SINKSGD_CURVATURE Optimizer (experimental)
+        case Optimizer.SINKSGD_CURVATURE:
+            from modules.util.optimizer.SinkSGDCurvature import SinkSGDCurvature
+            from modules.util.optimizer.split_sinkhorn import configure_split_sinkhorn
+            if optimizer_config.fused_back_pass:
+                raise RuntimeError("SINKSGD_CURVATURE does not support the fused back pass: its curvature probe "
+                                   "needs the gradients of all parameters at the stepped weights.")
+            configure_split_sinkhorn(model, bool(optimizer_config.split_fused_sinkhorn))
+            optimizer = SinkSGDCurvature(
+                params=parameters,
+                lr=config.learning_rate,
+                momentum=optimizer_config.momentum if optimizer_config.momentum is not None else 0.95,
+                weight_decay=optimizer_config.weight_decay if optimizer_config.weight_decay is not None else 0.0,
+                sinkhorn_iterations=optimizer_config.sinkhorn_iterations if optimizer_config.sinkhorn_iterations is not None else 5,
+                orthogonal_sinkhorn=optimizer_config.orthogonal_sinkhorn if optimizer_config.orthogonal_sinkhorn is not None else False,
+                normed_momentum=optimizer_config.normed_momentum if optimizer_config.normed_momentum is not None else True,
+                momentum_renorm=optimizer_config.momentum_renorm if optimizer_config.momentum_renorm is not None else True,
+                snr_cond=optimizer_config.snr_cond if optimizer_config.snr_cond is not None else False,
+                nesterov=optimizer_config.nesterov if optimizer_config.nesterov is not None else True,
+                nesterov_coef=optimizer_config.nesterov_coef,
+                geometric_wd=optimizer_config.geometric_wd if optimizer_config.geometric_wd is not None else False,
+                cautious_wd=optimizer_config.cautious_wd if optimizer_config.cautious_wd is not None else False,
+                stochastic_rounding=optimizer_config.stochastic_rounding,
+                orthogonal_gradient=optimizer_config.orthogonal_gradient if optimizer_config.orthogonal_gradient is not None else 'disabled',
+                spectral_normalization=optimizer_config.spectral_normalization if optimizer_config.spectral_normalization is not None else False,
+                centered_wd=optimizer_config.centered_wd if optimizer_config.centered_wd is not None else 0.0,
+                centered_wd_mode=optimizer_config.centered_wd_mode if optimizer_config.centered_wd_mode is not None else "full",
+                state_precision=optimizer_config.state_precision if optimizer_config.state_precision not in (None, "auto") else "bf16_sr",
+                compiled_optimizer=optimizer_config.compile if optimizer_config.compile is not None else False,
+                d0=optimizer_config.d0 if optimizer_config.d0 is not None else 1e-5,
+                d_floor=optimizer_config.d_floor if optimizer_config.d_floor is not None else 1e-6,
+                d_ceiling=optimizer_config.d_ceiling if optimizer_config.d_ceiling is not None else 1e-2,
+                growth_rate=optimizer_config.growth_rate if optimizer_config.growth_rate is not None else 1.1,
+                decay_rate=optimizer_config.curvature_decay_rate if optimizer_config.curvature_decay_rate is not None else 0.95,
+                gain=optimizer_config.curvature_gain if optimizer_config.curvature_gain is not None else 0.01,
+                slope_target=optimizer_config.curvature_slope_target if optimizer_config.curvature_slope_target is not None else 0.25,
+                curvature_interval=optimizer_config.curvature_interval if optimizer_config.curvature_interval is not None else 10,
+                agreement_threshold=optimizer_config.agreement_threshold if optimizer_config.agreement_threshold is not None else 0.0,
+                slice_p=optimizer_config.slice_p if optimizer_config.slice_p is not None else 11,
+                tlora_aware=optimizer_config.tlora_aware if optimizer_config.tlora_aware is not None else True,
+            )
+
         # ADAMW_ADV Optimizer
         case Optimizer.ADAMW_ADV:
             from adv_optm import AdamW_adv

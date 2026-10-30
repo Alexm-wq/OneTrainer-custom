@@ -152,6 +152,11 @@ class TrainOptimizerConfig(BaseConfig):
     geometric_wd: False
     d_shrink: float
     d_floor: float
+    d_ceiling: float
+    curvature_decay_rate: float
+    curvature_gain: float
+    curvature_slope_target: float
+    curvature_interval: int
     d_min_ratio: float
     agreement_threshold: float
     drift_budget: float
@@ -303,6 +308,11 @@ class TrainOptimizerConfig(BaseConfig):
         data.append(("normed_momentum", False, bool, False))
         data.append(("d_shrink", None, float, True))
         data.append(("d_floor", None, float, True))
+        data.append(("d_ceiling", None, float, True))
+        data.append(("curvature_decay_rate", None, float, True))
+        data.append(("curvature_gain", None, float, True))
+        data.append(("curvature_slope_target", None, float, True))
+        data.append(("curvature_interval", None, int, True))
         data.append(("d_min_ratio", None, float, True))
         data.append(("agreement_threshold", None, float, True))
         data.append(("drift_budget", None, float, True))

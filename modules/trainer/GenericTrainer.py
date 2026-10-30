@@ -1255,6 +1255,36 @@ class GenericTrainer(BaseTrainer):
         self._rlhf_backward_done = True
         return loss_sum
 
+    def __run_curvature_probe(self, window: list, scaler):
+        """Gradient of the step's micro-batches once more, at the new weights, with the same noise.
+
+        predict() seeds noise and timesteps from the progress, so the batch is the same function of
+        the weights; the change of its gradient along the step is SINKSGD_CURVATURE's curvature.
+        """
+        optimizer = self.model.optimizer
+        if not optimizer.wants_curvature_probe():
+            return
+        if scaler is not None or self.config.rlhf_enabled and any(
+                self.__rlhf_dpo_indices(batch) for batch, _ in window):
+            # Scaled fp16 gradients and preference pairs are not repeated; a later probe measures.
+            optimizer.cancel_curvature_probe()
+            return
+        optimizer.zero_grad(set_to_none=True)
+        dropout_context = (
+            self.model_setup.preference_dropout_disabled(self.model)
+            if self.config.rlhf_enabled else contextlib.nullcontext()
+        )
+        with dropout_context:
+            for batch, progress in window:
+                loss = self.__calculate_standard_only_training_loss(batch, progress)
+                if self.config.rlhf_enabled:
+                    loss = self.config.rlhf_normal_weight * loss
+                (loss / self.config.gradient_accumulation_steps).backward()
+        multi.reduce_grads_mean(self.parameters, self.config.gradient_reduce_precision)
+        if self.config.clip_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
+        optimizer.finish_curvature_probe()
+
     def __calculate_mixed_rlhf_training_loss(
             self,
             batch: dict,
@@ -1592,6 +1622,9 @@ class GenericTrainer(BaseTrainer):
         # False if the model gradients are all None, True otherwise
         # This is used to schedule sampling only when the gradients don't take up any space
         has_gradient = False
+        # The micro-batches of the current optimizer step, for SINKSGD_CURVATURE's curvature probe.
+        curvature_window = []
+        records_curvature = hasattr(self.model.optimizer, "finish_curvature_probe")
 
         lr_scheduler = None
         accumulated_loss = torch.tensor(0.0, device=train_device)
@@ -1713,6 +1746,8 @@ class GenericTrainer(BaseTrainer):
                         self.model_setup.preference_dropout_disabled(self.model)
                         if self.config.rlhf_enabled else contextlib.nullcontext()
                     )
+                    if records_curvature:
+                        curvature_window.append((batch, copy.copy(train_progress)))
                     with dropout_context:
                         self.__ot_write_batch_breadcrumb(batch, train_progress)
                         def backward_component(component):
@@ -1763,6 +1798,10 @@ class GenericTrainer(BaseTrainer):
                             if self.config.clip_grad_norm is not None:
                                 nn.utils.clip_grad_norm_(self.parameters, self.config.clip_grad_norm)
                             self.model.optimizer.step()
+
+                        if records_curvature:
+                            self.__run_curvature_probe(curvature_window, scaler)
+                            curvature_window = []
 
                         lr_scheduler.step()  # done before zero_grad, because some lr schedulers need gradients
                         self.model.optimizer.zero_grad(set_to_none=True)
