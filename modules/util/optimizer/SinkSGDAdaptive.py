@@ -169,7 +169,6 @@ class SinkSGDAdaptive(SinkSGD_adv):
             if denominator <= 0.0:
                 continue
             estimate = group["d_coef"] * numerator / denominator
-            group["d_max"] = max(group["d_max"], estimate)
             # d may not grow while held-out gradients no longer agree with the training direction at all.
             growth_allowed = group["alignment"] is None or group["alignment"] > 0
             if estimate > d:
@@ -179,6 +178,9 @@ class SinkSGDAdaptive(SinkSGD_adv):
                 # Shrinking acts as a learning rate decay once progress stalls; the floor keeps training alive.
                 floor = max(group["d_floor"], group["d_min_ratio"] * group["d_max"])
                 group["d"] = max(floor, d - group["d_shrink"] * (d - estimate))
+            # The highest d actually used: a spike of the estimate that d did not follow must not
+            # raise the floor above the current d.
+            group["d_max"] = max(group["d_max"], group["d"])
         self._pending.clear()
         self._stepped.clear()
 

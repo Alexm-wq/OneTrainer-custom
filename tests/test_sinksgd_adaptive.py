@@ -113,6 +113,17 @@ class SinkSGDAdaptiveTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "D Floor"):
             SinkSGDAdaptive([parameter], d0=1e-5, d_floor=1e-4)
 
+    def test_a_spike_of_the_estimate_cannot_raise_d_through_the_floor(self):
+        parameter = nn.Parameter(torch.zeros(4, 4))
+        optimizer = SinkSGDAdaptive([parameter], d0=1e-3, d_floor=1e-3, growth_rate=1.0, d_shrink=0.0)
+        group = optimizer.param_groups[0]
+        # An estimate of 100 that d may not follow, then one below d (the shrink branch).
+        for dot in (100.0, 0.0):
+            optimizer._pending = {0: [torch.tensor([dot, 1.0, 0.0]), 16, 1.0]}
+            optimizer._finish_distance()
+            self.assertEqual(group["d"], 1e-3)
+        self.assertEqual(group["d_max"], 1e-3)
+
     def test_agreement_mask_damps_noise_but_not_consistent_gradients(self):
         def moved(gradients, precision):
             parameter = nn.Parameter(torch.zeros(16, 16))
