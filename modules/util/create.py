@@ -25,6 +25,7 @@ from modules.util.lr_scheduler_util import (
     lr_lambda_cosine,
     lr_lambda_cosine_with_hard_restarts,
     lr_lambda_cosine_with_restarts,
+    lr_lambda_drop_then_cosine,
     lr_lambda_linear,
     lr_lambda_rex,
     lr_lambda_warmup,
@@ -1311,6 +1312,12 @@ def create_lr_scheduler(
         case LearningRateScheduler.REX:
             lr_lambda = lr_lambda_rex(
                 scheduler_steps, min_factor
+            )
+
+        case LearningRateScheduler.DROP_THEN_COSINE:
+            lr_lambda = lr_lambda_drop_then_cosine(
+                int(config.learning_rate_drop_epochs * steps_per_epoch / gradient_accumulation_steps),
+                config.learning_rate_drop_factor, scheduler_steps, min_factor,
             )
 
         case LearningRateScheduler.ADAFACTOR:

@@ -364,31 +364,42 @@ class BaseTrainingTabView(ABC):
                               tooltip="The number of learning rate cycles. This is only applicable if the learning rate scheduler supports cycles")
         self.components.entry(frame, 5, 1, ui_state, "learning_rate_cycles")
 
+        # drop then cosine
+        self.components.label(frame, 6, 0, "Learning Rate Drop Factor",
+                              tooltip="DROP_THEN_COSINE only: the learning rate first falls linearly to this fraction of itself over Learning Rate Drop Epochs (after warmup), then follows a cosine down to Learning Rate Min Factor. Learning rate 3e-3 with 0.33 falls to 1e-3.")
+        self.components.entry(frame, 6, 1, ui_state, "learning_rate_drop_factor",
+                              extra_validate=check_range(lower=0, upper=1, lower_inclusive=False, message="Drop factor must be in (0, 1]"))
+
+        self.components.label(frame, 7, 0, "Learning Rate Drop Epochs",
+                              tooltip="DROP_THEN_COSINE only: epochs of the first, linear phase. Fractions are allowed.")
+        self.components.entry(frame, 7, 1, ui_state, "learning_rate_drop_epochs",
+                              extra_validate=check_range(lower=0, message="Drop epochs must not be negative"))
+
         # epochs
-        self.components.label(frame, 6, 0, "Epochs",
+        self.components.label(frame, 8, 0, "Epochs",
                               tooltip="The number of epochs for a full training run")
-        self.components.entry(frame, 6, 1, ui_state, "epochs", required=True)
+        self.components.entry(frame, 8, 1, ui_state, "epochs", required=True)
 
         # batch size
-        self.components.label(frame, 7, 0, "Local Batch Size",
+        self.components.label(frame, 9, 0, "Local Batch Size",
                               tooltip="The batch size of one training step. If you use multiple GPUs, this is the batch size of each GPU (local batch size).")
-        self.components.entry(frame, 7, 1, ui_state, "batch_size", required=True)
+        self.components.entry(frame, 9, 1, ui_state, "batch_size", required=True)
 
         # accumulation steps
-        self.components.label(frame, 8, 0, "Accumulation Steps",
+        self.components.label(frame, 10, 0, "Accumulation Steps",
                               tooltip="Number of accumulation steps. Increase this number to trade batch size for training speed")
-        self.components.entry(frame, 8, 1, ui_state, "gradient_accumulation_steps", required=True)
+        self.components.entry(frame, 10, 1, ui_state, "gradient_accumulation_steps", required=True)
 
         # Learning Rate Scaler
-        self.components.label(frame, 9, 0, "Learning Rate Scaler",
+        self.components.label(frame, 11, 0, "Learning Rate Scaler",
                               tooltip="Selects the type of learning rate scaling to use during training. Functionally equated as: LR * SQRT(selection)")
-        self.components.options(frame, 9, 1, [str(x) for x in list(LearningRateScaler)], ui_state,
+        self.components.options(frame, 11, 1, [str(x) for x in list(LearningRateScaler)], ui_state,
                                 "learning_rate_scaler")
 
         # clip grad norm
-        self.components.label(frame, 10, 0, "Clip Grad Norm",
+        self.components.label(frame, 12, 0, "Clip Grad Norm",
                               tooltip="Clips the gradient norm. Leave empty to disable gradient clipping.")
-        self.components.entry(frame, 10, 1, ui_state, "clip_grad_norm")
+        self.components.entry(frame, 12, 1, ui_state, "clip_grad_norm")
 
     def __create_base2_frame(self, master, row, controller, ui_state, video_training_enabled: bool = False,
                               supports_circular_padding: bool = False):

@@ -100,5 +100,28 @@ def lr_lambda_rex(
     return lr_lambda
 
 
+def lr_lambda_drop_then_cosine(
+        drop_steps: int,
+        drop_factor: float,
+        scheduler_steps: int,
+        min_factor: float = 0.0,
+):
+    """A fast first phase, then the usual cosine: linear from the full rate to drop_factor of it
+    over drop_steps, then a cosine from there down to min_factor of it at the end."""
+    if not 0.0 < drop_factor <= 1.0:
+        raise ValueError(f"Drop Factor must be in (0, 1], got {drop_factor}.")
+    if min_factor > drop_factor:
+        raise ValueError(f"Min Factor ({min_factor}) must not exceed Drop Factor ({drop_factor}).")
+
+    def lr_lambda(current_step: int):
+        if current_step < drop_steps:
+            return 1.0 - (1.0 - drop_factor) * current_step / drop_steps
+        progress = min(1.0, (current_step - drop_steps) / max(1, scheduler_steps - drop_steps))
+        cos_val = 0.5 * (1.0 + math.cos(progress * math.pi))
+        return min_factor + (drop_factor - min_factor) * cos_val
+
+    return lr_lambda
+
+
 def apply_min_factor(value: float, min_factor: float) -> float:
     return min_factor + (1.0 - min_factor) * value
