@@ -133,6 +133,8 @@ class TLoRATest(unittest.TestCase):
         self.assertEqual(plain.tlora_min_rank(), 3)
         with self.assertRaisesRegex(ValueError, "needs T-LoRA Gradient Only"):
             self._setup(schedule="0:100, 3:20")
+        with self.assertRaisesRegex(ValueError, "switch T-LoRA on"):
+            self._setup(tlora=False, gradient_only=True, schedule="0:100, 3:20")
         for broken in ("0:100, 0:50", "1:0", "3-80"):
             with self.subTest(broken), self.assertRaisesRegex(ValueError, "T-LoRA Schedule"):
                 parse_tlora_schedule(broken)

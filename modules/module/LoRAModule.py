@@ -1032,6 +1032,8 @@ class LoRAModuleWrapper:
                 'train_device': torch.device(config.train_device),
                 'lokr_vec_trick': config.lokr_vec_trick,
             }
+        if not config.tlora and (config.tlora_gradient_only or config.tlora_schedule.strip()):
+            raise ValueError("T-LoRA Gradient Only and T-LoRA Schedule are options of T-LoRA: switch T-LoRA on.")
         if config.tlora:
             if self.peft_type != PeftType.LORA or config.lora_decompose:
                 raise ValueError("T-LoRA needs the LoRA type without DoRA: the rank mask acts between LoRA down and up.")
